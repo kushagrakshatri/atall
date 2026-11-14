@@ -119,6 +119,8 @@ class MainActivity : ComponentActivity() {
             )
             Screen.Agents -> {
                 BackHandler { screen = Screen.Thread }
+                // Prefilled with the ChatGPT first name; what you type is saved as you go (blank falls back to it).
+                var nameField by remember(status.name) { mutableStateOf(app.atall.core.UserName.fieldValue(g.prefs.userName, g.chatGptFirstName())) }
                 AgentsScreen(
                     peers, AccountUi(status.state, status.email), access,
                     onBack = { screen = Screen.Thread }, onOpen = { screen = Screen.Detail(it) },
@@ -126,6 +128,10 @@ class MainActivity : ComponentActivity() {
                     onSignIn = { g.chatGpt.startSignIn(this) }, onSignOut = { g.chatGpt.signOut() },
                     onManageUsage = { startSafely(Intent(Intent.ACTION_VIEW, Uri.parse(ChatGpt.MANAGE_USAGE_URL))) },
                     onTurnOnAccess = ::openAccess, onLicences = { licences = true },
+                    userName = nameField, onUserNameChange = { typed ->
+                        nameField = typed
+                        g.prefs.userName = app.atall.core.UserName.normalize(typed)
+                    },
                 )
             }
             is Screen.AddAgent -> {

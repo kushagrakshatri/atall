@@ -20,6 +20,7 @@ import app.atall.coordinator.JsonLinesScoreLog
 import app.atall.coordinator.adapters.ResponsesLlm
 import app.atall.core.PlainJuno
 import app.atall.core.Router
+import app.atall.core.UserName
 import app.atall.core.ThreadStore
 import app.atall.ui.PeerUi
 import app.atall.ui.hueOf
@@ -52,7 +53,7 @@ class Graph(private val context: Context) {
     val rcs = RcsChannel(context)
     val adapters: Map<ChannelType, ChannelAdapter> = mapOf(ChannelType.RCS to rcs)
 
-    var coordinator: Coordinator = PlainJuno()
+    var coordinator: Coordinator = PlainJuno(userName = ::userName)
     var inbox: Inbox = ShowEverything
 
     val peers = object : PeerDirectory {
@@ -77,8 +78,14 @@ class Graph(private val context: Context) {
         model = { prefs.model }, inbox = { inbox }, juno = { juno }, userName = ::userName,
     )
 
-    /** The user's first name for agents' context ("From Atall (Kush's thread):"): the setting, else the ChatGPT name. */
-    fun userName(): String = prefs.userName.trim().ifEmpty { chatGpt.status.value.name.trim().substringBefore(' ') }
+    /**
+     * What agents and Juno call the user ("From Atall (Kush's thread):"): the "Your name" setting, else the first name
+     * on the ChatGPT account.
+     */
+    fun userName(): String = UserName.effective(prefs.userName, chatGptFirstName())
+
+    /** The first name on the ChatGPT account ("Kushagra Kshatri" -> "Kushagra"); blank when signed out. */
+    fun chatGptFirstName(): String = UserName.firstName(chatGpt.status.value.name)
 
     private val _agents = MutableStateFlow(registry.all())
     val agents: StateFlow<List<AgentProfile>> = _agents

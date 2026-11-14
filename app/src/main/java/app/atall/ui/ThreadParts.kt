@@ -21,7 +21,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.withStyle
@@ -32,6 +36,7 @@ import app.atall.coordinator.MapStatus
 import app.atall.coordinator.ParticipantState
 import app.atall.core.Attribution
 import app.atall.core.Main
+import app.atall.core.Markdown
 import app.atall.core.ReactionChip
 import app.atall.core.SendStatus
 import app.atall.core.ThreadMessage
@@ -49,7 +54,24 @@ fun attributionLabel(peer: PeerUi?, m: ThreadMessage): String? {
     }
 }
 
-/** Tapbacks under the user's bubble: "👍 Nova". */
+/** Juno's and agents' text with its Markdown rendered: bold, italics, inline code, bullet and numbered lists. */
+internal fun markdownText(text: String, codeBackground: Color): AnnotatedString = buildAnnotatedString {
+    Markdown.parse(text).forEachIndexed { i, line ->
+        if (i > 0) append("\n")
+        if (line.prefix.isNotEmpty()) append(line.prefix)
+        for (sp in line.spans) {
+            val style = SpanStyle(
+                fontWeight = if (sp.bold || line.heading) FontWeight(600) else null,
+                fontStyle = if (sp.italic) FontStyle.Italic else null,
+                fontFamily = if (sp.code) FontFamily.Monospace else null,
+                background = if (sp.code) codeBackground else Color.Unspecified,
+            )
+            withStyle(style) { append(sp.text) }
+        }
+    }
+}
+
+/** Tapbacks under the user's bubble ("👍 Nova") or on a sub-task. */
 @Composable
 internal fun ReactionChips(chips: List<ReactionChip>, peers: Map<String, PeerUi>) {
     val c = AppTheme.colors
@@ -105,9 +127,12 @@ private fun labelWithNames(text: String, peers: List<PeerUi>) = buildAnnotatedSt
     }
 }
 
-/** What Juno asked one agent: "→ Nova" and the sub-task, with its status ("Waiting", "Replied in 12s"). */
+/**
+ * What Juno asked one agent: "To Nova" and the sub-task, with its status ("Waiting", "Replied in 12s",
+ * "Reacted 🧳 · waiting") and the agent's tapback as a small chip.
+ */
 @Composable
-internal fun SubTask(m: ThreadMessage, peer: PeerUi?) {
+internal fun SubTask(m: ThreadMessage, peer: PeerUi?, peers: Map<String, PeerUi> = emptyMap()) {
     val c = AppTheme.colors
     Column(Modifier.fillMaxWidth()) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -115,7 +140,9 @@ internal fun SubTask(m: ThreadMessage, peer: PeerUi?) {
             Text(peer?.name ?: "agent", style = AppTheme.type.sender, color = peer?.let { AppTheme.agent(it.hue).solid } ?: c.ink2)
             m.detail?.let { Text(" · $it", style = AppTheme.type.caption, color = c.ink3) }
         }
-        Text(m.text, Modifier.padding(top = 2.dp), style = AppTheme.type.body2, color = c.ink2)
+        val text = remember(m.text) { markdownText(m.text, c.sunken) }
+        Text(text, Modifier.padding(top = 2.dp), style = AppTheme.type.body2, color = c.ink2)
+        if (m.reactions.isNotEmpty()) ReactionChips(m.reactions, peers + listOfNotNull(peer).associateBy { it.id })
     }
 }
 

@@ -52,8 +52,58 @@ class ReactionsAndActionsTest {
       "-> to \"the station\"",
       "I liked “Dune” a lot, you should watch it", // not a whole-line tapback
       "Reacted to your message",
-      "👍 to “first line\nsecond line”",
+      "🎉 to everyone who came!", // no quote marks: text unless it quotes something we sent (see parseUnquoted)
+      "Ok 👍 to “x”", // words before the emoji
+      "👍\nto “x”", // the reaction words never span lines
     )) assertNull(t, Reactions.parse(t))
+  }
+
+  // The exact shape from the 2026-11-14 device test: a tapback on a packed, multi-line text.
+  private val packed = "From Atall (Kushagra's thread):\nJuno needs: Ask Scout for trip dates and a budget. Don't book anything yet.\n" +
+    "Kush asked: \"yup, go ahead\"\nRecent:\n- Juno: Death Valley + Vegas looks good"
+
+  @Test fun multiLineQuoteFromTheDeviceTestIsAReaction() {
+    val r = Reactions.parse("🧳 to “$packed”")!!
+    assertEquals("🧳", r.emoji)
+    assertTrue(r.quoted, r.quoted.startsWith("From Atall (Kushagra's thread):\nJuno needs:"))
+    assertTrue(r.quoted.endsWith("looks good"))
+    assertTrue(Reactions.quotes(r.quoted, packed))
+  }
+
+  @Test fun truncatedAndUnclosedQuotesAreReactions() {
+    val cut = packed.take(60)
+    for (t in listOf(
+      "🧳 to “$cut…”", // truncated, closed
+      "🧳 to “$cut…", // truncated, no closing quote
+      "🧳 to “$cut...", // ASCII ellipsis
+      "🧳 to “$cut", // cut off, no ellipsis, no closing quote
+      "🧳 to \"$cut\"", // straight quotes
+      "Reacted 🧳 to “$cut…”",
+      "Scout reacted 🧳 to “$cut",
+    )) {
+      val r = Reactions.parse(t)
+      assertNotNull(t, r)
+      assertEquals(t, "🧳", r!!.emoji)
+      assertTrue(t, Reactions.quotes(r.quoted, packed))
+      assertFalse(t, r.quoted.endsWith("…"))
+    }
+    assertTrue(Reactions.parse("Removed 🧳 from “$cut…")!!.removed)
+  }
+
+  @Test fun anyEmojiIncludingZwjSequencesAndKeycaps() {
+    for (e in listOf("🧳", "👍🏽", "👨‍👩‍👧‍👦", "🏳️‍🌈", "❤️‍🔥", "🧑🏾‍💻", "🇺🇸", "1️⃣", "‼️", "☕", "🏴󠁧󠁢󠁳󠁣󠁴󠁿")) {
+      val r = Reactions.parse("$e to “first line\nsecond line”")
+      assertNotNull(e, r)
+      assertEquals(e, r!!.emoji)
+      assertEquals("first line\nsecond line", r.quoted)
+    }
+  }
+
+  @Test fun unquotedReactionNeedsAMatchingSentText() {
+    val r = Reactions.parseUnquoted("🧳 to ${packed.take(50)}…")!!
+    assertTrue(Reactions.quotes(r.quoted, packed))
+    assertNull(Reactions.parseUnquoted("🎉 to all")) // too short to be distinctive
+    // The hub only accepts it when it quotes a text it sent (hub test below).
   }
 
   @Test fun quoteMatchesTruncatedAndPackedTexts() {
@@ -95,6 +145,50 @@ class ReactionsAndActionsTest {
     assertEquals(0, answer.correlation!!.part)
     // The log keeps the reaction, so a backfill renders a chip, not text.
     assertNotNull(r.nova.history(10).single { it.text.startsWith("👍") }.reaction)
+  }
+
+  @Test fun multiLineTapbackOnAPackedTextNeverSettlesTheRequest() = runTest {
+    val r = Rig()
+    val got = mutableListOf<AgentMessage>()
+    val closed = mutableListOf<HubEvent>()
+    backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { r.nova.incoming.toList(got) }
+    backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { r.hub.events.toList(closed) }
+    r.clock.advance(sec)
+    r.phone.agentTexts("Nova", "hi")
+    r.clock.advance(10 * sec)
+    assertTrue(r.nova.send(packed, "rabc~a1") is SendResult.Sent)
+    r.clock.advance(8 * sec)
+    r.phone.agentTexts("Nova", "🧳 to “$packed”")
+    r.clock.advance(sec)
+    r.phone.agentTexts("Nova", "🧳 to ${packed.take(70)}…") // quote marks lost: still ours, so still a reaction
+
+    val taps = got.filter { it.reaction != null }
+    assertEquals(2, taps.size)
+    assertTrue(taps.all { it.correlation == null && it.reaction!!.targetCorrelationId == "rabc~a1" })
+    // Still waiting for the real reply.
+    assertEquals(listOf("rabc~a1"), r.nova.outstanding().map { it.correlationId })
+    assertTrue(closed.none { it is RequestClosed })
+
+    r.clock.advance(20 * sec)
+    r.phone.agentTexts("Nova", "Nov 26 to 30 works, about 900 each.")
+    val answer = got.single { it.text.startsWith("Nov 26") }
+    assertEquals("rabc~a1", answer.correlation!!.correlationId)
+    assertEquals(0, answer.correlation!!.part)
+  }
+
+  @Test fun emojiLedTextThatQuotesNothingWeSentIsText() = runTest {
+    val r = Rig()
+    val got = mutableListOf<AgentMessage>()
+    backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { r.nova.incoming.toList(got) }
+    r.clock.advance(sec)
+    r.phone.agentTexts("Nova", "hi")
+    r.clock.advance(10 * sec)
+    assertTrue(r.nova.send("what should we toast at dinner", "c1") is SendResult.Sent)
+    r.clock.advance(5 * sec)
+    r.phone.agentTexts("Nova", "🎉 to the best friends anyone could ask for")
+    val line = got.single { it.text.startsWith("🎉") }
+    assertNull(line.reaction)
+    assertEquals("c1", line.correlation!!.correlationId)
   }
 
   // ------------------------------------------------------------------ hub: reply actions

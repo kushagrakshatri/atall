@@ -98,12 +98,10 @@ class JunoBridgeTest {
         settle()
 
         assertEquals(0, r.plainTurns)
-        // Each agent got Juno's rewritten sub-task, wrapped in compact context, under Juno's ask id.
+        // Each agent got the header, Juno's self-contained sub-task and who else is asked, under Juno's ask id.
         val (cid, text) = r.agents.getValue(r.nova.id).sent.single()
         assertTrue(PeerLines.isJunoCid(cid))
-        assertTrue(text, text.startsWith("From Atall (Kush's thread):\nJuno needs: Which Thanksgiving dates are free?"))
-        assertTrue(text.contains("Kush asked: \"can you all decide on the trip for Thanksgiving\""))
-        assertTrue(text.contains("Also asking: Scout"))
+        assertEquals("From Atall (Kush's thread):\nWhich Thanksgiving dates are free?\nAlso asking: Scout", text)
 
         val l = r.lines()
         val runId = l.first().runId!!
@@ -174,20 +172,117 @@ class JunoBridgeTest {
         advanceTimeBy(10_000); runCurrent()
         val scout = r.agents.getValue(r.scout.id)
         val cid = scout.sent.single().first
-        // A tapback first: a chip on the user's request, never a reply.
+        // A tapback first: a chip on Scout's sub-task, never a reply.
         r.router.onPeerMessage(r.scout.id, AgentMessage("t1", AgentId(r.scout.id), "👍 to “From Atall”", T0 + 11_000, T0 + 11_000, null,
             reaction = Reaction("👍", "From Atall", targetCorrelationId = cid)))
         // Then a reply the transport couldn't correlate: attached to the open ask, flagged uncertain.
         scout.push("Nothing on Saturday")
         settle()
         val l = r.lines()
-        assertEquals(listOf(ReactionChip("👍", r.scout.id)), l.first { it.author == ThreadMessage.USER }.reactions)
+        assertEquals(listOf(ReactionChip("👍", r.scout.id)), l.single { it.kind == MessageKind.SUBTASK }.reactions)
+        assertTrue(l.first { it.author == ThreadMessage.USER }.reactions.isEmpty())
         val reply = l.single { it.author == r.scout.id }
         assertEquals("Nothing on Saturday", reply.text)
         assertEquals(Attribution.JUNO, reply.attribution)
         assertEquals("Might not be an answer to this", reply.detail)
         assertFalse(l.any { it.text.startsWith("👍") })
         assertEquals("Scout says you're free.", l.last().text)
+    }
+
+    // The exact shape from the 2026-11-14 device test: Scout tapbacks the packed multi-line text. The transport of
+    // that build missed it and correlated it to the ask, so it arrives as an ordinary correlated line.
+    private fun deviceTapback(packed: String) = "🧳 to “$packed”"
+
+    @Test fun multiLineTapbackIsAChipOnTheSubTaskAndNeverSettlesTheAsk() = runTest {
+        val r = Rig(this)
+        var juno = 0
+        r.llm.on("juno") { req, n ->
+            juno = n
+            if (n == 0) tools(
+                call("ask_agent", "agent" to "Scout", "text" to "Find **trip dates** and a budget.\nDon't book anything yet.", "why" to "travel", "money_or_account" to false),
+                call("wait", "ask_ids" to emptyList<String>(), "max_seconds" to 180),
+            ) else {
+                val out = FakeLlm.lastToolOutput(req)!!
+                assertFalse("a tapback reached Juno as a reply: $out", out.contains("🧳"))
+                tools(call("reply", "text" to "**Nov 26-30** works.\n- about \$900 each"))
+            }
+        }
+        r.router.send("plan the trip")
+        advanceTimeBy(5_000); runCurrent()
+        val scout = r.agents.getValue(r.scout.id)
+        val (cid, packed) = scout.sent.single()
+        // Header + sub-task only, Markdown stripped, multi-line kept.
+        assertEquals("From Atall (Kush's thread):\nFind trip dates and a budget.\nDon't book anything yet.", packed)
+
+        scout.push(deviceTapback(packed), app.atall.agents.text.Correlation(cid, app.atall.agents.text.Confidence.HIGH, app.atall.agents.text.CorrelationReason.ONLY_OPEN_REQUEST, 0))
+        advanceTimeBy(30_000); runCurrent()
+        var l = r.lines()
+        val sub = l.single { it.kind == MessageKind.SUBTASK }
+        assertEquals(listOf(ReactionChip("🧳", r.scout.id)), sub.reactions)
+        assertEquals("Reacted 🧳 · waiting", sub.detail)
+        assertFalse(l.any { it.author == r.scout.id })
+        assertFalse(l.any { it.text.contains("🧳 to") })
+        assertEquals(0, juno) // Juno is still waiting: the ask is not settled
+
+        // The real reply settles it.
+        scout.push("Nov 26-30, about \$900 each", app.atall.agents.text.Correlation(cid, app.atall.agents.text.Confidence.HIGH, app.atall.agents.text.CorrelationReason.ONLY_OPEN_REQUEST, 0))
+        settle()
+        l = r.lines()
+        val done = l.single { it.kind == MessageKind.SUBTASK }
+        assertTrue(done.detail, done.detail!!.startsWith("Replied in"))
+        assertEquals(listOf(ReactionChip("🧳", r.scout.id)), done.reactions)
+        assertEquals("Nov 26-30, about \$900 each", l.single { it.author == r.scout.id }.text)
+        assertEquals(1, juno)
+    }
+
+    @Test fun truncatedUnclosedTapbackWithoutTransportHelpStillFindsTheAsk() = runTest {
+        val r = Rig(this)
+        r.llm.on("juno") { _, n ->
+            if (n == 0) tools(
+                call("ask_agent", "agent" to "Nova", "text" to "Any plans on Saturday?", "why" to "calendar", "money_or_account" to false),
+                call("wait", "ask_ids" to emptyList<String>(), "max_seconds" to 120),
+            ) else tools(call("reply", "text" to "ok"))
+        }
+        r.router.send("am I free Saturday?")
+        advanceTimeBy(5_000); runCurrent()
+        val nova = r.agents.getValue(r.nova.id)
+        val packed = nova.sent.single().second
+        // Truncated, no closing quote, uncorrelated, and no reaction field: the Router parses it itself.
+        nova.push("👨‍👩‍👧‍👦 to “${packed.take(30)}…")
+        advanceTimeBy(1_000); runCurrent()
+        val sub = r.lines().single { it.kind == MessageKind.SUBTASK }
+        assertEquals("Reacted 👨‍👩‍👧‍👦 · waiting", sub.detail)
+        assertFalse(r.lines().any { it.author == r.nova.id })
+    }
+
+    @Test fun tapbackStoredAsAReplyByAnOlderBuildShowsAsAChip() = runTest {
+        val r = Rig(this)
+        r.llm.on("juno") { _, n ->
+            if (n == 0) tools(
+                call("ask_agent", "agent" to "Scout", "text" to "Trip dates?", "why" to "travel", "money_or_account" to false),
+                call("wait", "ask_ids" to emptyList<String>(), "max_seconds" to 180),
+            ) else tools(call("reply", "text" to "ok"))
+        }
+        r.router.send("plan the trip")
+        advanceTimeBy(5_000); runCurrent()
+        val (cid, packed) = r.agents.getValue(r.scout.id).sent.single()
+        // What 0.1.1 did: the tapback went to Juno as the answer.
+        r.bridge.juno.ingest(app.atall.coordinator.PeerSignal.Message(r.scout.id, "old1", deviceTapback(packed), T0 + 6_000, cid))
+        r.bridge.project(PeerLines.runIdOf(cid))
+        val l = r.lines()
+        val sub = l.single { it.kind == MessageKind.SUBTASK }
+        assertEquals(listOf(ReactionChip("🧳", r.scout.id)), sub.reactions)
+        assertTrue(sub.detail, sub.detail!!.startsWith("Reacted 🧳 ·"))
+        assertFalse(sub.detail!!.contains("Replied"))
+        assertFalse(l.any { it.author == r.scout.id })
+    }
+
+    @Test fun junoIsToldTheUsersName() = runTest {
+        val r = Rig(this)
+        r.llm.on("juno") { _, _ -> tools(call("reply", "text" to "Hi Kush.")) }
+        r.router.send("hello")
+        settle()
+        assertTrue(r.llm.requests.first().instructions.contains("The user's name is Kush."))
     }
 
     @Test fun signedOutAsksToSignInWithoutStartingARun() = runTest {

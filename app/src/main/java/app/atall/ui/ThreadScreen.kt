@@ -204,7 +204,7 @@ private fun MessageRow(row: Row.Msg, peers: Map<String, PeerUi>, names: Map<Stri
         when {
             m.author == ThreadMessage.USER -> UserBubble(m, row.lastInGroup, names, peers, actions.onRetry)
             m.kind == MessageKind.RUN -> RunHead(m, peers.values.toList(), actions.onStopWaiting)
-            m.kind == MessageKind.SUBTASK -> SubTask(m, peers[m.peerId])
+            m.kind == MessageKind.SUBTASK -> SubTask(m, peers[m.peerId], peers)
             m.kind == MessageKind.NEEDS_TAP -> NeedsTap(m, peers[m.peerId], actions.onTapToSend)
             m.kind == MessageKind.NEEDS_APPROVAL -> Approval(m, peers[m.peerId], actions.onApprove)
             m.kind == MessageKind.AGREEMENT -> AgreementCard(m, peers, actions.onChallenge)
@@ -277,7 +277,10 @@ private fun AgentTurn(peer: PeerUi?, m: ThreadMessage, header: Boolean, extra: @
                 }
                 Spacer(Modifier.height(2.dp))
             }
-            if (m.text.isNotBlank()) Text(m.text, style = AppTheme.type.body, color = c.ink)
+            if (m.text.isNotBlank()) {
+                val text = remember(m.text) { markdownText(m.text, c.sunken) }
+                Text(text, style = AppTheme.type.body, color = c.ink)
+            }
             else if (m.streaming) Dot(c.ink3)
             m.detail?.takeIf { m.kind == MessageKind.TEXT && it.isNotBlank() }?.let { Text(it, Modifier.padding(top = 2.dp), style = AppTheme.type.caption, color = c.ink3) }
             extra()

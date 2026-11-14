@@ -225,7 +225,9 @@ class TextAgentHub(
     }
     if (!fresh(id, line)) return false
     val historical = line.time < (meta["reg:$id"] ?: Long.MIN_VALUE)
-    Reactions.parse(line.text)?.let { r ->
+    // A quoted tapback, or "🧳 to <one of our texts>" with the quote marks lost.
+    val parsed = Reactions.parse(line.text) ?: Reactions.parseUnquoted(line.text)?.takeIf { reactionTarget(id, it) != null }
+    parsed?.let { r ->
       // A tapback is not an answer: never attributed to a request (it would swallow the real reply that follows).
       val reaction = r.copy(targetCorrelationId = reactionTarget(id, r))
       store.append(LogEntry(line.id, id, Direction.IN, line.text, line.time, reaction = reaction))

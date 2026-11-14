@@ -97,6 +97,8 @@ class Juno(
   private val clock: () -> Long = System::currentTimeMillis,
   val config: JunoConfig = JunoConfig(),
   private val newId: () -> String = { UUID.randomUUID().toString().take(8) },
+  /** What the user wants to be called ("Kush"); blank when unknown. Read on every model call, so a change applies at once. */
+  private val userName: () -> String = { "" },
 ) {
   constructor(roster: Roster, peers: Map<String, Peer>, llm: Llm, store: RunStore, scores: ScoreLog = InMemoryScoreLog(),
               clock: () -> Long = System::currentTimeMillis, config: JunoConfig = JunoConfig(), newId: () -> String = { UUID.randomUUID().toString().take(8) }) :
@@ -413,6 +415,7 @@ class Juno(
   fun instructions(): String = Prompts.render("juno_system", mapOf(
     "main" to roster.main.name, "roster" to Prompts.rosterBlock(roster),
     "maxAsks" to config.maxAsks.toString(), "maxRounds" to config.maxRounds.toString(),
+    "userLine" to Prompts.userLine(runCatching { userName() }.getOrDefault("")),
   ))
 
   // ============================================================== model turn + calls

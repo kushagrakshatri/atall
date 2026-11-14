@@ -37,19 +37,61 @@ class ContextPackTest {
         assertEquals("From Atall (Kush's thread):\nKush: where's the game?", text)
     }
 
-    @Test fun delegatedLeadsWithWhatJunoNeeds() {
+    @Test fun delegatedIsTheHeaderAndTheSubTaskOnly() {
         val text = ContextPack.pack(ContextPack.Input(
             kind = ContextPack.Kind.DELEGATED, userName = "Kush", recipientId = "p2", recipientName = "Scout",
             request = "can you all decide on the trip for Thanksgiving",
             need = "Which Thanksgiving dates are free on Kush's calendar, and any travel already booked?",
             recent = listOf(line("p1", "I'd pick Tahoe", t0)), names = names, others = listOf("Nova"),
         ))
-        val lines = text.lines()
-        assertEquals("From Atall (Kush's thread):", lines[0])
-        assertTrue(lines[1].startsWith("Juno needs: Which Thanksgiving dates"))
-        assertEquals("Kush asked: \"can you all decide on the trip for Thanksgiving\"", lines[2])
-        assertTrue(text.contains("- Nova: I'd pick Tahoe"))
-        assertTrue(text.endsWith("Also asking: Nova"))
+        assertEquals(
+            "From Atall (Kush's thread):\nWhich Thanksgiving dates are free on Kush's calendar, and any travel already booked?\nAlso asking: Nova",
+            text,
+        )
+    }
+
+    // The 2026-11-14 device test: a follow-up delegation repeated the sub-task, the user's "yup, go ahead" and raw
+    // Markdown from Juno's last answer. Now it is the header and the sub-task, in plain text.
+    @Test fun followUpDelegationDropsTheUsersWordsRecentTurnsAndMarkdown() {
+        val text = ContextPack.pack(ContextPack.Input(
+            kind = ContextPack.Kind.DELEGATED, userName = "Kush", recipientId = "p1", recipientName = "Nova",
+            request = "yup, go ahead",
+            need = "Hold **2 rooms** in Las Vegas for Nov 26-28 and send me the options.\n- under \$200/night\n- Don't book anything yet.",
+            recent = listOf(
+                line(ThreadMessage.USER, "plan a Thanksgiving road trip", t0),
+                line(Main.AUTHOR, "**Death Valley + Vegas** looks best:\n- Day 1: drive\n- Day 2: hike", t0 + 1_000),
+            ),
+            names = names,
+        ))
+        assertEquals(
+            "From Atall (Kush's thread):\nHold 2 rooms in Las Vegas for Nov 26-28 and send me the options.\n- under \$200/night\n- Don't book anything yet.",
+            text,
+        )
+        assertFalse(text.contains("Juno needs"))
+        assertFalse(text.contains("yup, go ahead"))
+        assertFalse(text.contains("Recent:"))
+        assertFalse(text.contains("*"))
+    }
+
+    @Test fun directMentionStripsMarkdownFromRecentTurns() {
+        val text = ContextPack.pack(ContextPack.Input(
+            kind = ContextPack.Kind.DIRECT, userName = "Kush", recipientId = "p1", recipientName = "Nova",
+            request = "@Nova can you hold the **first** one?",
+            recent = listOf(line(Main.AUTHOR, "**Death Valley + Vegas** looks best. See `itinerary` and [the map](https://example.com/map).", t0)),
+            names = names,
+        ))
+        assertTrue(text, text.contains("Kush: can you hold the first one?"))
+        assertTrue(text, text.contains("- Juno: Death Valley + Vegas looks best. See itinerary and the map (https://example.com/map)."))
+        assertFalse(text.contains("**")); assertFalse(text.contains("`"))
+    }
+
+    @Test fun challengeIsJunosTextOnly() {
+        val text = ContextPack.pack(ContextPack.Input(
+            kind = ContextPack.Kind.CHALLENGE, userName = "Kush", recipientId = "p2", recipientName = "Scout",
+            request = "@all best day?", need = "Nova says Saturday is dry. Are you sure about Sunday?",
+            recent = listOf(line(ThreadMessage.USER, "x", t0)), names = names,
+        ))
+        assertEquals("From Atall (Kush's thread):\nNova says Saturday is dry. Are you sure about Sunday?", text)
     }
 
     @Test fun blindAsksHideOtherAgentsAnswers() {
@@ -66,17 +108,42 @@ class ContextPackTest {
         assertEquals(1, text.lines().count { it.contains("best day for the hike?") })
     }
 
-    @Test fun alwaysFitsInOneText() {
-        val long = "word ".repeat(400)
+    @Test fun aLongSubTaskGoesInWholeNeverWithAnEllipsis() {
+        val long = (1..120).joinToString(" ") { "step$it" } // ~1,000 chars, past the context budget
         val text = ContextPack.pack(ContextPack.Input(
             kind = ContextPack.Kind.DELEGATED, userName = "Kush", recipientId = "p1", recipientName = "Nova",
-            request = long, need = long,
-            recent = (0 until 20).map { line(if (it % 2 == 0) ThreadMessage.USER else "p2", long, t0 + it) },
+            request = "go", need = long,
+            recent = (0 until 20).map { line(if (it % 2 == 0) ThreadMessage.USER else "p2", "turn $it", t0 + it) },
             names = names, others = listOf("Scout"),
         ))
+        assertEquals("From Atall (Kush's thread):\n$long\nAlso asking: Scout", text)
+        assertFalse(text.contains("…"))
+    }
+
+    @Test fun directContextDropsWholeTurnsOldestFirstNeverCutsOne() {
+        // Six recent turns of ~150 chars each: only the newest few fit in the context budget.
+        val turns = (0 until 6).map { n -> line(if (n % 2 == 0) ThreadMessage.USER else Main.AUTHOR, "turn$n " + "x".repeat(140) + " end$n", t0 + n) }
+        val request = "@Nova " + "please read this whole request ".repeat(10).trim()
+        val text = ContextPack.pack(ContextPack.Input(
+            kind = ContextPack.Kind.DIRECT, userName = "Kush", recipientId = "p1", recipientName = "Nova",
+            request = request, recent = turns, names = names,
+        ))
+        assertFalse(text, text.contains("…"))
+        // The user's words go in whole.
+        assertTrue(text.contains("Kush: " + "please read this whole request ".repeat(10).trim()))
+        val kept = (0 until 6).filter { text.contains("turn$it ") }
+        // Every kept turn is whole, and the kept ones are the newest, contiguous.
+        kept.forEach { assertTrue(text.contains("end$it")) }
+        assertTrue(kept.isNotEmpty() && kept.size < 6)
+        assertEquals((6 - kept.size until 6).toList(), kept)
         assertTrue(text.length <= ContextPack.MAX_CHARS)
-        assertTrue(text.startsWith("From Atall (Kush's thread):"))
-        assertTrue(text.contains("Juno needs:"))
+
+        // A single turn bigger than the whole budget is dropped, never shortened.
+        val huge = ContextPack.pack(ContextPack.Input(
+            kind = ContextPack.Kind.DIRECT, userName = "Kush", recipientId = "p1", recipientName = "Nova",
+            request = "and now?", recent = listOf(line(Main.AUTHOR, "y".repeat(900), t0)), names = names,
+        ))
+        assertEquals("From Atall (Kush's thread):\nKush: and now?", huge)
     }
 
     @Test fun oldTurnsAreNotRecentAndBlankNameIsNeutral() {

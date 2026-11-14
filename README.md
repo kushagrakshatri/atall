@@ -4,11 +4,23 @@
 phone, and `@mention` any other agent you use to ask it directly. Atall is open source (MIT), runs fully on the
 phone, and has no server.
 
-> Status: **M0.1 (v0.1.1-m01), pre-release.** Juno now coordinates: it asks your agents, waits, and merges
-> their answers; `@all` asks everyone the same question and shows where they agree. Built on the first Pixel
-> test of M0.
+> Status: **M0.2 (v0.1.2-m02), pre-release.** Juno coordinates: it asks your agents, waits, and merges
+> their answers; `@all` asks everyone the same question and shows where they agree. M0.2 fixes what the second
+> Pixel test found.
 
-## New in M0.1 (v0.1.1-m01)
+## New in M0.2 (v0.1.2-m02)
+
+- **A tapback is never an answer.** Reactions on multi-line, truncated or unclosed quotes (and any emoji,
+  including skin tones, ZWJ sequences, flags and keycaps) are recognised. On one of Juno's asks the reaction
+  shows as a chip on that sub-task ("Reacted 🧳 · waiting") and the ask keeps waiting for the real reply.
+- **Shorter texts to agents.** Juno's delegations send only the header and Juno's self-contained sub-task, plus
+  one line naming who else is asked. Direct `@mentions` still carry your words and a few recent turns. Nothing
+  sent to an agent contains Markdown.
+- **Your name.** Settings has a **Your name** field (prefilled with your ChatGPT first name). It is used in the
+  "From Atall (Kush's thread):" header and Juno uses it too.
+- **Formatted answers.** Juno's bold text and lists render in the thread instead of showing `**`.
+
+## M0.1 (v0.1.1-m01)
 
 - **Juno coordinates.** A message you don't address (or `@Juno`) goes through Juno's tool loop: it writes a
   sub-task for each agent it picks, sends them, waits, and answers with what came back. The sub-tasks and each
@@ -16,8 +28,8 @@ phone, and has no server.
   spend money or change an account wait for your **Yes, send it** (enforced in code, not just the prompt).
 - **`@all`.** Everyone gets the same question, blind, and Juno answers too; the **Agreement Map** shows what
   everyone agrees on, where they split (with **Check this** for one targeted recheck) and who said what.
-- **Agents get context.** Every message to an agent starts with "From Atall (Kush's thread):" and carries your
-  request, a few trimmed recent turns, what Juno needs back and who else is being asked, in one text.
+- **Agents get context.** Every message to an agent starts with "From Atall (Kush's thread):" (M0.2: delegations
+  carry only Juno's sub-task; direct @mentions carry your words and a few trimmed recent turns).
 - **Tapbacks are reactions.** "👍 to “…”" from an agent becomes a small chip on your message, not a reply.
 - **Consistent labels.** Every agent line says **replied directly**, **answered Juno** or **messaged you**; the
   "may have answered in Messages" hint disappears once that agent's reply arrives.
@@ -45,7 +57,7 @@ phone, and has no server.
 
 ## Install (Pixel / Android 8+)
 
-1. Download `atall-0.1.1-m01-arm64.apk` from the [latest release](https://github.com/kushagrakshatri/atall/releases) and open it. Allow installs from your browser if asked.
+1. Download `atall-0.1.2-m02-arm64.apk` from the [latest release](https://github.com/kushagrakshatri/atall/releases) and open it. Allow installs from your browser if asked.
 2. Open Atall. **Continue with ChatGPT** signs you in on OpenAI's page, or tap **Set up later**.
 3. **Open settings** and switch Atall on. If the switch is greyed out (sideloaded apps on Android 13+): App
    info → ⋮ → **Allow restricted settings**, then try again.

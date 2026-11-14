@@ -28,7 +28,11 @@ import kotlinx.serialization.json.put
  * M0 stand-in for `app.atall.coordinator`: Juno answers with one plain ChatGPT Responses call (no delegation).
  * Signed out → one line asking to sign in. Replace by binding the real coordinator in [app.atall.Graph].
  */
-class PlainJuno(private val now: () -> Long = System::currentTimeMillis) : Coordinator {
+class PlainJuno(
+    private val now: () -> Long = System::currentTimeMillis,
+    /** What the user wants to be called (Settings, else the ChatGPT first name); blank when unknown. */
+    private val userName: () -> String = { "" },
+) : Coordinator {
 
     override suspend fun onTurn(turn: MainTurn, context: MainContext) {
         val client = context.responses
@@ -46,7 +50,7 @@ class PlainJuno(private val now: () -> Long = System::currentTimeMillis) : Coord
         }.ifEmpty { listOf(Items.user(turn.text)) }
         val body = buildJsonObject {
             put("model", context.model)
-            put("instructions", instructions(context.mainName, names.values.toList()))
+            put("instructions", instructions(context.mainName, names.values.toList(), runCatching { userName() }.getOrDefault("")))
             put("input", JsonArray(input))
         }
         val cancel = Cancellation()
@@ -87,8 +91,9 @@ class PlainJuno(private val now: () -> Long = System::currentTimeMillis) : Coord
         const val STREAM_TICK_MS = 150L
         const val SIGN_IN_COPY = "Sign in with ChatGPT to talk to Juno."
 
-        fun instructions(name: String, peers: List<String>) = buildString {
+        fun instructions(name: String, peers: List<String>, userName: String = "") = buildString {
             append("You are $name, the main agent in Atall, a single chat thread on the user's Android phone. ")
+            userName.trim().takeIf { it.isNotEmpty() }?.let { append("The user's name is $it; call them $it, never by a longer or more formal name. ") }
             append("Answer briefly and plainly, in sentence case, with no markdown headings. ")
             if (peers.isNotEmpty()) {
                 append("The user also has these agents in the thread: ${peers.joinToString(", ")}. ")

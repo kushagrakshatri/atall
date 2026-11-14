@@ -3,33 +3,39 @@ package app.atall.core
 import app.atall.api.ThreadLine
 
 /**
- * The compact context an agent receives with every message from Atall, so it can act without asking "which deets?".
- * One text message: a header, what is being asked, the user's words, a few trimmed recent turns, and who else is
- * being asked. Pure; the result never exceeds [MAX_CHARS].
+ * What an agent receives from Atall: one plain text (no Markdown, which SMS shows raw). Nothing is ever cut off
+ * with "…": Juno's sub-task and the user's words always go in whole. Only a direct @mention's (and an @all
+ * question's) recent turns are trimmed to keep the text near [MAX_CHARS], and only by dropping whole turns,
+ * oldest first.
  *
+ * Juno's delegations (and rechecks) carry only the header and Juno's rewritten sub-task, which is already
+ * self-contained, plus one line naming who else is asked:
  * ```
  * From Atall (Kush's thread):
- * Juno needs: Your pick of dates and a budget for the Thanksgiving trip.
- * Kush asked: "can you all decide on the trip for Thanksgiving"
+ * Your pick of dates and a budget for the Thanksgiving trip. Don't book anything yet.
+ * Also asking: Scout
+ * ```
+ * A direct @mention (and an @all question, which is the user's raw line too) carries the context the raw line lacks:
+ * ```
+ * From Atall (Kush's thread):
+ * Kush: i think Nova and Scout know the deets
  * Recent:
- * - Kush: thinking Tahoe or Big Sur
- * - Juno: Want me to check what Nova and Scout know?
+ * - Kush: can you all decide on the trip for Thanksgiving
+ * - Juno: Happy to. Tahoe or the coast?
  * Also asking: Scout
  * ```
  */
 object ContextPack {
+    /** Budget for the recent-turns context. The sub-task and the user's words may take a text past it. */
     const val MAX_CHARS = 700
     const val MAX_RECENT = 6
-    const val RECENT_LINE_CHARS = 140
-    const val REQUEST_CHARS = 200
-    const val NEED_CHARS = 300
     /** Turns older than this (relative to the newest) are not "recent". */
     const val RECENT_WINDOW_MS = 6 * 3_600_000L
 
     enum class Kind {
         /** The user @mentioned the agent: it gets the user's words. */
         DIRECT,
-        /** Juno delegated: it gets Juno's rewritten sub-task first. */
+        /** Juno delegated: it gets Juno's rewritten sub-task only (it is self-contained). */
         DELEGATED,
         /** @all: the same question to everyone, answered independently (no other agents' lines are shown). */
         BLIND,
@@ -55,17 +61,32 @@ object ContextPack {
         val others: List<String> = emptyList(),
     )
 
+    /** Every text from Atall starts with this; a tapback quoting it reacts to one of our texts. */
+    const val HEADER_PREFIX = "From Atall ("
+
     fun header(userName: String): String =
         if (userName.isBlank()) "From Atall (your user's thread):" else "From Atall (${possessive(userName.trim())} thread):"
 
     fun pack(i: Input): String {
         val user = i.userName.trim().ifBlank { "The user" }
-        val request = squash(stripMentions(i.request, i.recipientName, i.names.values)).let { trim(it, REQUEST_CHARS) }
-        val need = i.need?.let { squash(stripMentions(it, i.recipientName, i.names.values)) }?.let { trim(it, NEED_CHARS) }
         val head = header(i.userName)
+        val tail = buildList {
+            if (i.others.isNotEmpty()) {
+                val who = joinNames(i.others.distinct())
+                add(if (i.kind == Kind.BLIND) "Also asking: $who (answer on your own)" else "Also asking: $who")
+            }
+        }
 
-        if (i.kind == Kind.CHALLENGE) return fit(listOfNotNull(head, need?.let { "$MAIN_NAME needs: $it" }))
+        if (i.kind == Kind.DELEGATED || i.kind == Kind.CHALLENGE) {
+            // Juno's sub-task is self-contained: no "needs:" label, no repeat of the user's words, no recent turns.
+            // It goes in whole, never shortened.
+            val need = i.need?.let { prose(stripMentions(Markdown.plain(it), i.recipientName, i.names.values)) }.orEmpty()
+                .ifBlank { prose(stripMentions(Markdown.plain(i.request), i.recipientName, i.names.values)) }
+            return (listOf(head) + listOfNotNull(need.ifBlank { null }) + tail).joinToString("\n")
+        }
 
+        val request = squash(stripMentions(Markdown.plain(i.request), i.recipientName, i.names.values))
+        val need = i.need?.let { squash(stripMentions(Markdown.plain(it), i.recipientName, i.names.values)) }
         val core = buildList {
             add(head)
             when (i.kind) {
@@ -76,20 +97,14 @@ object ContextPack {
                 }
             }
         }
-        val tail = buildList {
-            if (i.others.isNotEmpty()) {
-                val who = joinNames(i.others.distinct())
-                add(if (i.kind == Kind.BLIND) "Also asking: $who (answer on your own)" else "Also asking: $who")
-            }
-        }
         val recent = recentLines(i, user)
-        // Drop the oldest recent turns until the whole thing fits in one text.
+        // Keep the newest whole turns that fit; drop the rest, oldest first. A turn is never cut partway.
         for (n in recent.size downTo 0) {
             val block = if (n == 0) emptyList() else listOf("Recent:") + recent.takeLast(n)
             val text = (core + block + tail).joinToString("\n")
-            if (text.length <= MAX_CHARS) return text
+            if (n == 0 || text.length <= MAX_CHARS) return text
         }
-        return fit(core + tail)
+        return (core + tail).joinToString("\n")
     }
 
     private fun recentLines(i: Input, user: String): List<String> {
@@ -106,7 +121,7 @@ object ContextPack {
                     i.recipientId -> "You"
                     else -> i.names[l.author] ?: "Another agent"
                 }
-                "- $who: " + trim(squash(stripMentions(l.text, i.recipientName, i.names.values)), RECENT_LINE_CHARS)
+                "- $who: " + squash(stripMentions(Markdown.plain(l.text), i.recipientName, i.names.values))
             }
     }
 
@@ -128,14 +143,10 @@ object ContextPack {
         return t.trim().ifEmpty { text.trim() }
     }
 
-    private fun fit(lines: List<String>): String {
-        val text = lines.joinToString("\n")
-        return if (text.length <= MAX_CHARS) text else text.take(MAX_CHARS - 1).trimEnd() + "…"
-    }
-
     private fun squash(s: String) = s.replace(Regex("\\s+"), " ").trim()
 
-    private fun trim(s: String, max: Int) = if (s.length <= max) s else s.take(max - 1).trimEnd() + "…"
+    /** Spaces squashed within each line; blank lines dropped (a sub-task may be a short list). */
+    private fun prose(s: String) = s.lines().map { squash(it) }.filter { it.isNotEmpty() }.joinToString("\n")
 
     private fun possessive(name: String) = if (name.endsWith("s", ignoreCase = true)) "$name'" else "$name's"
 

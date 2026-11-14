@@ -2,6 +2,8 @@ package app.atall.core
 
 import app.atall.agents.text.AgentMessage
 import app.atall.agents.text.Confidence
+import app.atall.agents.text.Reaction
+import app.atall.agents.text.Reactions
 import app.atall.agents.text.RequestClosed
 import app.atall.api.PeerDirectory
 import app.atall.coordinator.AgentKind
@@ -55,7 +57,9 @@ import app.atall.coordinator.ThreadLine as JunoLine
  *   [onRequestClosed]. Juno's state is persisted ([RunStore]) and re-read; [project] turns it into thread lines:
  *   the request, a strip (RUN), one SUBTASK per ask with the agent's replies under it, needs-you lines, the answer
  *   (or the Agreement Map), all with the run's id so the thread keeps them together.
- * - Agents receive [ContextPack]ed text: Juno's sub-task plus the user's words and a few recent turns.
+ * - Agents receive [ContextPack]ed text: the header and Juno's self-contained sub-task (plain text), plus who else
+ *   is asked. @all questions (the user's raw line) also carry the user's words and a few recent turns.
+ * - A tapback on one of Juno's asks is a chip on that sub-task ("Reacted 🧳 · waiting"); it never settles the ask.
  *
  * Pure Kotlin (no Android): tested with fakes in `JunoBridgeTest`.
  */
@@ -73,7 +77,7 @@ class JunoBridge(
     /** Off in tests that step the run by hand. */
     private val autoDrive: Boolean = true,
 ) {
-    val juno = Juno({ roster() }, ::peerFor, SignedInLlm(llm), store, scores, clock, config)
+    val juno = Juno({ roster() }, ::peerFor, SignedInLlm(llm), store, scores, clock, config, userName = userName)
     private val projectLock = Mutex()
     private val liveRuns = ConcurrentHashMap.newKeySet<String>()
     private var jobs: List<Job> = emptyList()
@@ -217,9 +221,12 @@ class JunoBridge(
 
     /**
      * A message from agent [peerId]. Returns true when it belongs to one of Juno's runs (it is then shown under that
-     * run), false when the app should show it on its own. Reactions never come here.
+     * run), false when the app should show it on its own. A tapback is never an answer: it becomes a chip on the
+     * sub-task it reacts to ([react]); it is claimed either way so it can never become reply text.
      */
     suspend fun claim(peerId: String, m: AgentMessage): Boolean {
+        // The Router turns tapbacks into chips before calling this; a tapback that still gets here is never shown as text.
+        (m.reaction ?: Reactions.parse(m.text))?.let { react(peerId, it); return true }
         val cid = m.correlation?.correlationId
         val ask: AskState? = when {
             PeerLines.isJunoCid(cid) -> safe { juno.state(PeerLines.runIdOf(cid!!)) }?.ask(cid!!)?.takeIf { it.agentId == peerId }
@@ -237,6 +244,42 @@ class JunoBridge(
         ))
         project(PeerLines.runIdOf(ask.id))
         return true
+    }
+
+    /**
+     * A tapback from [peerId]. When it reacts to one of Juno's asks to that agent, it becomes (or, "Removed …",
+     * stops being) a chip on that sub-task and the ask keeps waiting for the real reply. Returns whether it was taken.
+     */
+    suspend fun react(peerId: String, r: Reaction): Boolean {
+        val ask = reactionAsk(peerId, r) ?: return false
+        val runId = PeerLines.runIdOf(ask.id)
+        projectLock.withLock {
+            thread.get("ask:${ask.id}")?.let { sub ->
+                val next = PeerLines.applyReaction(sub, peerId, r)
+                if (next !== sub) thread.upsert(next)
+            }
+        }
+        project(runId)
+        return true
+    }
+
+    /**
+     * The ask a tapback from [peerId] reacts to: the one the transport matched by its quote; else the newest ask to
+     * that agent in a live run whose sent text (or sub-task) the quote matches, or whose quote starts with our header.
+     */
+    private suspend fun reactionAsk(peerId: String, r: Reaction): AskState? {
+        r.targetCorrelationId?.takeIf { PeerLines.isJunoCid(it) }?.let { cid ->
+            return safe { juno.state(PeerLines.runIdOf(cid)) }?.ask(cid)?.takeIf { it.agentId == peerId }
+        }
+        if (r.targetCorrelationId != null) return null // a direct send's text: the app puts the chip on that message
+        val asks = liveRuns.mapNotNull { safe { juno.state(it) } }
+            .flatMap { s -> s.asks.filter { it.agentId == peerId && it.status != AskStatus.CANCELLED } }
+            .sortedByDescending { it.sentAt ?: it.createdAt }
+        asks.firstOrNull { a ->
+            Reactions.quotes(r.quoted, a.draftText ?: "") || Reactions.quotes(r.quoted, a.text) ||
+                Reactions.quotes(r.quoted, Markdown.plain(a.text))
+        }?.let { return it }
+        return if (r.quoted.trim().startsWith(ContextPack.HEADER_PREFIX, ignoreCase = true)) asks.firstOrNull() else null
     }
 
     /** A transport closure for one of Juno's asks (timeouts, "may have answered in Messages"). */
@@ -296,10 +339,19 @@ class JunoBridge(
                 continue
             }
             val subId = "ask:${a.id}"
-            put(ThreadMessage(subId, thread.get(subId)?.at ?: at(a.createdAt), Main.AUTHOR, a.text, kind = MessageKind.SUBTASK,
-                peerId = a.agentId, askId = a.id, correlationId = a.id, detail = statusWord(a, st)))
+            val sub = thread.get(subId)
+            // A tapback stored as a reply by an older build: a chip, never a reply line (and never "Replied").
+            val (tapbacks, replies) = a.replies.partition { Reactions.parse(it.text) != null }
+            var chips = sub?.reactions.orEmpty()
+            for (p in tapbacks) {
+                Reactions.parse(p.text)?.let { chips = PeerLines.applyReaction(ThreadMessage("", 0, "", "", reactions = chips), a.agentId, it).reactions }
+                thread.get("in:${p.messageId}")?.let { if (!it.hidden) thread.upsert(it.copy(hidden = true)) }
+            }
+            put(ThreadMessage(subId, sub?.at ?: at(a.createdAt), Main.AUTHOR, a.text, kind = MessageKind.SUBTASK,
+                peerId = a.agentId, askId = a.id, correlationId = a.id, reactions = chips,
+                detail = statusWord(a.copy(replies = replies), st, chips)))
             projectNeeds(a, ::put, ::at)
-            for (p in a.replies) {
+            for (p in replies) {
                 val id = "in:${p.messageId}"
                 put(ThreadMessage(id, thread.get(id)?.at ?: at(p.at), a.agentId, p.text, attribution = Attribution.JUNO,
                     askId = a.id, sourceId = p.messageId, detail = replyNote(p.certainty, p.late)))
@@ -410,7 +462,25 @@ class JunoBridge(
             else -> (listOf(s.timer) + s.notes).filter { it.isNotBlank() }.joinToString(" · ")
         }
 
-        fun statusWord(a: AskState, st: RunState): String = when (a.status) {
+        /**
+         * The sub-task's status. A tapback alone never reads as "Replied": with [reactions] and no real reply it is
+         * "Reacted 🧳 · waiting" (or "· no reply yet" / "· didn't answer" once the run or the ask is over).
+         */
+        fun statusWord(a: AskState, st: RunState, reactions: List<ReactionChip> = emptyList()): String {
+            val emoji = reactions.lastOrNull { it.by == a.agentId }?.emoji
+            if (emoji != null && a.replies.isEmpty()) {
+                val tail = when (a.status) {
+                    AskStatus.PENDING, AskStatus.REPLYING, AskStatus.ANSWERED, AskStatus.DRAFTED, AskStatus.LIKELY_MISSED ->
+                        if (st.phase.terminal) "no reply yet" else "waiting"
+                    AskStatus.TIMED_OUT -> "didn't answer"
+                    else -> null
+                }
+                if (tail != null) return "Reacted $emoji · $tail"
+            }
+            return baseStatus(a, st)
+        }
+
+        private fun baseStatus(a: AskState, st: RunState): String = when (a.status) {
             AskStatus.QUEUED -> "Queued"
             AskStatus.SENDING -> "Sending"
             AskStatus.PENDING -> if (st.phase.terminal) "Didn't answer yet" else "Waiting"
@@ -418,7 +488,8 @@ class JunoBridge(
             AskStatus.NEEDS_TAP -> "Needs a tap"
             AskStatus.AWAITING_APPROVAL -> "Waiting for your OK"
             AskStatus.REPLYING -> "Replying"
-            AskStatus.ANSWERED -> a.sentAt?.let { s -> a.replies.firstOrNull()?.let { "Replied in " + short(it.at - s) } } ?: "Replied"
+            AskStatus.ANSWERED -> if (a.replies.isEmpty()) (if (st.phase.terminal) "Didn't answer yet" else "Waiting")
+                else a.sentAt?.let { s -> "Replied in " + short(a.replies.first().at - s) } ?: "Replied"
             AskStatus.TIMED_OUT -> "Didn't answer"
             AskStatus.LIKELY_MISSED -> "May have answered in Messages"
             AskStatus.DECLINED -> "You said no"

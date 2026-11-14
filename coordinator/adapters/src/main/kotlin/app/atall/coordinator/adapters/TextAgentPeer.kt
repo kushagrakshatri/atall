@@ -11,6 +11,7 @@ import app.atall.coordinator.PeerSignal
 import app.atall.agents.text.Agent
 import app.atall.agents.text.AgentMessage
 import app.atall.agents.text.Confidence
+import app.atall.agents.text.Reactions
 import app.atall.agents.text.HubEvent
 import app.atall.agents.text.RequestClosed
 import app.atall.agents.text.SendOptions
@@ -54,7 +55,8 @@ class TextAgentPeer(
  */
 object TextAgentPump {
   fun start(scope: CoroutineScope, juno: Juno, agents: List<Agent>, hubEvents: Flow<HubEvent>): List<Job> =
-    agents.map { a -> scope.launch { a.incoming.collect { juno.ingest(toSignal(it)) } } } +
+    // A tapback is never an answer: it must not reach Juno as a reply.
+    agents.map { a -> scope.launch { a.incoming.collect { if (it.reaction == null && Reactions.parse(it.text) == null) juno.ingest(toSignal(it)) } } } +
       scope.launch {
         hubEvents.collect { e ->
           // Other hub events (ThreadOpened, UserLine) are already folded into correlation confidence and

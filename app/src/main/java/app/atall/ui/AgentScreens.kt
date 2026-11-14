@@ -65,9 +65,11 @@ fun AgentsScreen(
     peers: List<PeerUi>, account: AccountUi, notificationAccess: Boolean,
     onBack: () -> Unit, onOpen: (String) -> Unit, onAdd: () -> Unit,
     onSignIn: () -> Unit, onSignOut: () -> Unit, onManageUsage: () -> Unit, onTurnOnAccess: () -> Unit, onLicences: () -> Unit,
+    /** "Your name": what agents and Juno call you. Prefilled with the ChatGPT first name until you change it. */
+    userName: String = "", onUserNameChange: (String) -> Unit = {},
 ) {
     val c = AppTheme.colors
-    Column(Modifier.fillMaxSize().background(c.bg).statusBarsPadding().navigationBarsPadding()) {
+    Column(Modifier.fillMaxSize().background(c.bg).statusBarsPadding().navigationBarsPadding().imePadding()) {
         TopBar("Agents", onBack)
         Column(Modifier.verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 8.dp)) {
             Card {
@@ -110,6 +112,11 @@ fun AgentsScreen(
                     }
                 }
             }
+            SectionLabel("Your name")
+            Field(
+                "Your name", userName, onUserNameChange,
+                helper = "What ${Main.NAME} and your agents call you, as in \"From Atall (${possessive(userName.trim().ifBlank { "Your" }) } thread)\".",
+            )
             SectionLabel("ChatGPT account")
             Card {
                 Column(Modifier.padding(14.dp)) {
@@ -248,3 +255,10 @@ private fun AgentDetailPreview() = PreviewTheme {
 @Preview(name = "Add agent", widthDp = 412, heightDp = 900)
 @Composable
 private fun AddAgentScreenPreview() = PreviewTheme { AddAgentScreen(AgentFormState(), emptyList(), {}, {}) }
+
+/** "Kush" -> "Kush's", "James" -> "James'", blank stays "Your". */
+private fun possessive(name: String) = when {
+    name == "Your" -> "your"
+    name.endsWith("s", ignoreCase = true) -> "$name'"
+    else -> "$name's"
+}

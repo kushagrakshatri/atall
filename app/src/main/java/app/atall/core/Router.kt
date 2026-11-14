@@ -5,6 +5,7 @@ import app.atall.agents.text.Direction
 import app.atall.agents.text.FailReason
 import app.atall.agents.text.LogEntry
 import app.atall.agents.text.Reaction
+import app.atall.agents.text.Reactions
 import app.atall.agents.text.RequestClosed
 import app.atall.agents.text.SendOptions
 import app.atall.agents.text.SendResult
@@ -167,7 +168,8 @@ class Router(
     suspend fun onPeerMessage(peerId: String, m: AgentMessage) {
         val p = registry.get(peerId) ?: return
         if (m.historical || thread.hasSource(m.id)) return
-        m.reaction?.let { react(p.id, it); return }
+        // A tapback (including one the transport didn't recognise) is a chip, never a reply.
+        (m.reaction ?: Reactions.parse(m.text))?.let { react(p.id, it); return }
         if (runCatching { juno()?.claim(p.id, m) }.getOrNull() == true) { dropStaleHints(p.id); return }
         val cid = m.correlation?.correlationId
         val attribution = PeerLines.attribution(p.id, cid, m.sentAt, thread.chronological())
@@ -206,8 +208,9 @@ class Router(
         ))
     }
 
-    /** A tapback: a chip on the user's message it reacts to; never agent text. */
-    private fun react(peerId: String, r: Reaction) {
+    /** A tapback: a chip on the Juno sub-task or the user's message it reacts to; never agent text, never an answer. */
+    private suspend fun react(peerId: String, r: Reaction) {
+        if (runCatching { juno()?.react(peerId, r) }.getOrNull() == true) return
         val target = PeerLines.reactionTarget(peerId, r, thread.chronological()) ?: return
         val next = PeerLines.applyReaction(target, peerId, r)
         if (next !== target) thread.upsert(next)

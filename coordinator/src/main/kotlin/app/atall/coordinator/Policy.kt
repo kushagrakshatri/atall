@@ -10,8 +10,21 @@ object Prompts {
       ?: error("missing prompt resource $path")
   }
 
+  /** Substitutes [vars]. A line that is only an unset or empty placeholder (an optional line like `{{userLine}}`) is dropped. */
   fun render(name: String, vars: Map<String, String> = emptyMap()): String =
-    vars.entries.fold(raw(name)) { acc, (k, v) -> acc.replace("{{$k}}", v) }.trim()
+    vars.entries.fold(raw(name)) { acc, (k, v) -> acc.replace("{{$k}}", v) }
+      .replace(OPTIONAL_LINE, "")
+      .replace(Regex("\\n{3,}"), "\n\n")
+      .trim()
+
+  /** A line holding only a placeholder no var filled. */
+  private val OPTIONAL_LINE = Regex("(?m)^[ \\t]*\\{\\{\\w+\\}\\}[ \\t]*\\n?")
+
+  /** The line naming the user in Juno's prompt; empty when the name is unknown. */
+  fun userLine(name: String): String {
+    val n = name.trim().replace(Regex("\\s+"), " ").take(40)
+    return if (n.isEmpty()) "" else "The user's name is $n. Call them $n, never by a longer or more formal name, and use $n (not \"the user\") in messages you write for agents."
+  }
 
   /** The roster block in Juno's system prompt: one line per active peer with its tags and how it's reached. */
   fun rosterBlock(roster: Roster): String {
