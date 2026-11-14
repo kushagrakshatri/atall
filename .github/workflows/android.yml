@@ -1,0 +1,42 @@
+# Builds and tests Atall on x86-64 (the stock Maven aapt2 works here, so no shim).
+# No repository secrets are used: CI APKs are unsigned or debug-signed. Signed releases are built locally.
+name: android
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: "platforms;android-37.0 platforms;android-36 build-tools;36.0.0 platform-tools"
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Unit tests (app, text-agents, chatgpt-auth)
+        run: ./gradlew --console=plain -Porg.gradle.jvmargs="-Xmx3g -XX:MaxMetaspaceSize=1g" :app:testDebugUnitTest :text-agents:core:test :chatgpt-auth:test
+      - name: Debug + release APKs (release is unsigned in CI)
+        run: ./gradlew --console=plain -Porg.gradle.jvmargs="-Xmx3g -XX:MaxMetaspaceSize=1g" assembleDebug assembleRelease
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apks
+          path: app/build/outputs/apk/**/*.apk
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-reports
+          path: |
+            app/build/reports/tests/
+            text-agents/core/build/reports/tests/
+            chatgpt-auth/build/reports/tests/

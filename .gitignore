@@ -1,0 +1,27 @@
+# Build outputs
+.gradle/
+build/
+*/build/
+**/build/
+.kotlin/
+out/
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# Machine-specific
+local.properties
+.idea/
+*.iml
+.DS_Store
+
+# Secrets: never commit signing material or credentials
+.secrets/
+*.jks
+*.keystore
+*.p12
+*.pem
+signing.properties
+*signing*.properties
+*-release.properties

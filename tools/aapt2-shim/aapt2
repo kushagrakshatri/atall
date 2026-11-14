@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# aapt2 shim for AGP 9.x on aarch64: AGP passes "--opt=value" to `aapt2 optimize`, which the
+# aarch64 aapt2 2.19 (build-tools 35.0.2) rejects ("unknown option") and AGP then silently
+# packages an APK with no AndroidManifest.xml/resources.arsc. Split "--opt=value" into two args.
+REAL=${AAPT2_REAL:-/workspace/work/sdk/tools/build-tools/aapt2}
+args=()
+for a in "$@"; do
+  if [[ "$a" == --*=* ]]; then args+=("${a%%=*}" "${a#*=}"); else args+=("$a"); fi
+done
+exec "$REAL" "${args[@]}"
