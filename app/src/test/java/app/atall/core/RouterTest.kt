@@ -70,7 +70,8 @@ class RouterTest {
         val fake = FakeAgent(AgentId(nova.id), "Nova") { listOf("pong") }
         agents[nova.id] = fake
         r.send("@Nova ping")
-        assertEquals("ping", fake.sent.single().second)
+        // The agent gets the user's words with a context header (no thread yet, no one else asked).
+        assertEquals("From Atall (your user's thread):\nThe user: ping", fake.sent.single().second)
         assertTrue(fake.sent.single().first.startsWith(Router.DIRECT))
         assertTrue(turns.isEmpty())
         // The fake answers synchronously on its flow; deliver it like the app's collector does.
@@ -80,6 +81,7 @@ class RouterTest {
         assertEquals("pong", shown.text)
         assertEquals(nova.id, shown.author)
         assertTrue(shown.direct)
+        assertEquals(Attribution.DIRECT, shown.attribution)
         // Same message again (notification re-post / backfill) is not duplicated.
         r.backfill(nova.id, fake.history(10))
         assertEquals(1, thread.all().count { it.text == "pong" })
@@ -99,7 +101,7 @@ class RouterTest {
         r.send("@Scout book it")
         val tap = thread.all().single { it.kind == MessageKind.NEEDS_TAP }
         assertEquals("Tap to send to Scout", tap.text)
-        assertEquals("book it", tap.draftText)
+        assertEquals("From Atall (your user's thread):\nThe user: book it", tap.draftText)
         assertEquals(false, allowDraftSeen)
         assertTrue(r.tapToSend(tap.id))
         assertEquals(true, allowDraftSeen)
@@ -121,6 +123,7 @@ class RouterTest {
         val p = registry.add("Nova", ChannelType.RCS, "+14085550101")
         r.onPeerMessage(p.id, AgentMessage("m1", AgentId(p.id), "report ready", 5, 5, null))
         assertEquals(false, thread.all().single().direct)
+        assertEquals(Attribution.UNPROMPTED, thread.all().single().attribution)
         held = true
         r.onPeerMessage(p.id, AgentMessage("m2", AgentId(p.id), "spam", 6, 6, null))
         assertEquals(1, thread.all().size)
@@ -144,5 +147,43 @@ class RouterTest {
         val r = router()
         r.send("hello")
         assertEquals(listOf("hello", "Juno couldn't answer just now."), thread.all().map { it.text })
+    }
+
+    @Test fun tapbackBecomesAChipNotText() = runTest {
+        val r = router()
+        val nova = registry.add("Nova", ChannelType.RCS, "+14085550101")
+        agents[nova.id] = FakeAgent(AgentId(nova.id), "Nova") { emptyList() }
+        r.send("@Nova how are my projects going")
+        val reaction = app.atall.agents.text.Reactions.parse("👍 to “how are my projects going”")
+        val t = System.currentTimeMillis() + 1_000
+        r.onPeerMessage(nova.id, AgentMessage("m1", AgentId(nova.id), "👍 to “how are my projects going”", t, t, null, reaction = reaction))
+        r.onPeerMessage(nova.id, AgentMessage("m2", AgentId(nova.id), "Two on track", t + 1, t + 1, null))
+        val msgs = thread.all()
+        assertEquals(listOf(ReactionChip("👍", nova.id)), msgs.first().reactions)
+        // The real reply is its own line, attributed as the direct answer (it lost its correlation in transit).
+        assertEquals(listOf("@Nova how are my projects going", "Two on track"), msgs.map { it.text })
+        assertEquals(Attribution.DIRECT, msgs.last().attribution)
+    }
+
+    @Test fun missedHintIsDroppedOnceTheAgentReplied() = runTest {
+        val r = router()
+        val nova = registry.add("Nova", ChannelType.RCS, "+14085550101")
+        agents[nova.id] = FakeAgent(AgentId(nova.id), "Nova") { emptyList() }
+        r.send("@Nova where's the game?")
+        val req = app.atall.agents.text.OutstandingRequest("d:x:${nova.id}:0", AgentId(nova.id), "q", "q", 10,
+            app.atall.agents.text.Via.DRAFT, app.atall.agents.text.RequestState.WAITING, 20, threadOpenedAt = 11)
+        r.onRequestClosed(app.atall.agents.text.RequestClosed(req, app.atall.agents.text.RequestClosed.Outcome.LIKELY_MISSED))
+        assertEquals("Nova may have answered in Messages", thread.all().last().text)
+        r.onPeerMessage(nova.id, AgentMessage("m1", AgentId(nova.id), "Watson Park at 3", 30, 30, null))
+        assertTrue(thread.all().none { it.kind == MessageKind.NOTICE })
+        // And a closure for a request that was already answered never shows a hint.
+        r.onRequestClosed(app.atall.agents.text.RequestClosed(req.copy(correlationId = "d:y:${nova.id}:0"), app.atall.agents.text.RequestClosed.Outcome.LIKELY_MISSED))
+        assertTrue(thread.all().none { it.kind == MessageKind.NOTICE })
+    }
+
+    @Test fun atAllWithNobodyToAskFallsBackToPlainChat() = runTest {
+        val r = router()
+        r.send("@all what's up")
+        assertEquals(listOf("what's up"), turns.map { it.text })
     }
 }

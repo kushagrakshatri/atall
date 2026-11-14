@@ -45,13 +45,14 @@ import app.atall.core.Mentions
 import app.atall.core.Route
 import app.atall.ui.theme.AppTheme
 
-/** One entry in the "Send to" picker. [peer] null = the main agent. */
-data class PickerEntry(val name: String, val peer: PeerUi?)
+/** One entry in the "Send to" picker. [peer] null = the main agent (or everyone, when [everyone]). */
+data class PickerEntry(val name: String, val peer: PeerUi?, val everyone: Boolean = false)
 
 /** Who the picker offers for [query]: Juno first, then peers (paused or unreachable ones are hidden). */
 fun pickerEntries(query: String, peers: List<PeerUi>): List<PickerEntry> {
     val visible = peers.filter { !it.paused && it.channel.implemented }
-    val all = listOf(PickerEntry(Main.NAME, null)) + visible.map { PickerEntry(it.name, it) }
+    val all = listOf(PickerEntry(Main.NAME, null)) + visible.map { PickerEntry(it.name, it) } +
+        (if (visible.size >= 2) listOf(PickerEntry("all", null, everyone = true)) else emptyList())
     val order = Mentions.filter(query, all.map { it.name })
     return order.mapNotNull { n -> all.firstOrNull { it.name == n } }
 }
@@ -86,6 +87,9 @@ fun Composer(peers: List<PeerUi>, onSend: (String) -> Unit, onAddAgent: () -> Un
                 onAddAgent = { dismissedAt = token.second; onAddAgent() },
             )
             Spacer(Modifier.size(8.dp))
+        }
+        if (route is Route.All && token == null) {
+            Text("To everyone · each answers on its own, ${Main.NAME} compares", Modifier.padding(start = 16.dp, bottom = 6.dp), style = AppTheme.type.caption, color = c.ink3)
         }
         if (addressed != null && token == null) {
             Row(Modifier.padding(start = 16.dp, bottom = 6.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -169,7 +173,11 @@ fun MentionPicker(query: String, entries: List<PickerEntry>, onPick: (PickerEntr
                     Spacer(Modifier.width(12.dp))
                     Column {
                         Text(e.name, style = AppTheme.type.headline.copy(fontSize = AppTheme.type.body.fontSize), color = c.ink)
-                        Text(if (e.peer == null) "Default · picks who to ask" else Copy.descriptor(e.peer.channel), style = AppTheme.type.label, color = c.ink3)
+                        Text(when {
+                            e.everyone -> "Everyone answers on their own"
+                            e.peer == null -> "Default · picks who to ask"
+                            else -> Copy.descriptor(e.peer.channel)
+                        }, style = AppTheme.type.label, color = c.ink3)
                     }
                 }
             }

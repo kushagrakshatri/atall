@@ -48,6 +48,8 @@ data class AgentMessage(
   val correlation: Correlation?,
   /** True when the line was already in the notification's history before the agent was registered. */
   val historical: Boolean = false,
+  /** Set when the line is a tapback ("👍 to “…”"): show it as a reaction chip, not as text. Never correlated. */
+  val reaction: Reaction? = null,
 )
 
 @Serializable

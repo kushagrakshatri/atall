@@ -26,6 +26,10 @@ data class NotificationSnapshot(
   /** MessagingStyle history, oldest first, as Messages posted it. */
   val lines: List<SnapshotLine> = emptyList(),
   val reply: ReplyHandle? = null,
+  /** How many actions the notification carried, and where [reply] came from ("actions", "wearable", "car").
+   *  Diagnostics only: lets the fallback log say why no live reply action existed. */
+  val actionCount: Int = 0,
+  val replySource: String? = null,
 )
 
 /** One MessagingStyle message. [sender] null or blank is how MessagingStyle marks the user's own lines. */
@@ -35,6 +39,9 @@ data class SnapshotLine(val text: String, val time: Long, val sender: String?)
 interface ReplyHandle {
   /** Fill the RemoteInput(s) with [text] and fire the PendingIntent. */
   fun fire(text: String): FireResult
+
+  /** Equal for two handles that wrap the same PendingIntent (a re-post of the same notification). Null: unknown. */
+  val identity: Any? get() = null
 }
 
 enum class FireResult { OK, CANCELED, ERROR }

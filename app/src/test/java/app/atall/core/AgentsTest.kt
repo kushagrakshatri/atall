@@ -29,7 +29,7 @@ class AgentsTest {
         assertEquals("Use a full number, like (408) 555-0142.", AgentValidation.addressError(ChannelType.RCS, "555-01", existing))
         assertEquals("That number is already Nova.", AgentValidation.addressError(ChannelType.RCS, "(408) 555-0101", existing))
         assertNull(AgentValidation.addressError(ChannelType.RCS, "(408) 555-0102", existing))
-        assertNull(AgentValidation.addressError(ChannelType.RCS, "22395", existing)) // short code
+        assertNull(AgentValidation.addressError(ChannelType.RCS, "55501", existing)) // short code
         assertEquals("This kind of agent isn't available yet.", AgentValidation.addressError(ChannelType.WHATSAPP, "Muse", existing))
     }
 

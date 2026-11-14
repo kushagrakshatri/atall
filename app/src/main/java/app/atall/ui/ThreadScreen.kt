@@ -30,6 +30,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -66,6 +67,12 @@ class ThreadActions(
     val onOpenAgents: () -> Unit = {},
     val onAddAgent: () -> Unit = {},
     val onTurnOnAccess: () -> Unit = {},
+    /** Yes / No on "Okay to have X do this?" (message id, yes). */
+    val onApprove: (String, Boolean) -> Unit = { _, _ -> },
+    /** "Stop waiting" on a slow Juno turn (run id). */
+    val onStopWaiting: (String) -> Unit = {},
+    /** "Check this" on a disputed claim of an Agreement Map (run id, dispute id). */
+    val onChallenge: (String, String) -> Unit = { _, _ -> },
 )
 
 private sealed interface Row {
@@ -84,13 +91,17 @@ private fun rows(messages: List<ThreadMessage>, zone: ZoneId, today: LocalDate):
         if (day != lastDay) { out += Row.Day(dayLabel(day, today)); lastDay = day }
         val prev = messages.getOrNull(i - 1)
         val next = messages.getOrNull(i + 1)
-        val sameAsPrev = prev != null && prev.author == m.author && m.at - prev.at < GROUP_MS && prev.kind == MessageKind.TEXT &&
-            Instant.ofEpochMilli(prev.at).atZone(zone).toLocalDate() == day
-        val sameAsNext = next != null && next.author == m.author && next.at - m.at < GROUP_MS
+        val sameAsPrev = prev != null && sameTurn(prev, m) && Instant.ofEpochMilli(prev.at).atZone(zone).toLocalDate() == day
+        val sameAsNext = next != null && sameTurn(m, next)
         out += Row.Msg(m, header = !sameAsPrev, lastInGroup = !sameAsNext)
     }
     return out
 }
+
+/** Consecutive lines that share one header: same sender, same kind of line, same attribution, same Juno turn. */
+internal fun sameTurn(a: ThreadMessage, b: ThreadMessage): Boolean =
+    a.author == b.author && b.at - a.at < GROUP_MS && a.kind == MessageKind.TEXT && b.kind == MessageKind.TEXT &&
+        a.shownAttribution == b.shownAttribution && a.runId == b.runId && a.detail == null && b.detail == null
 
 fun dayLabel(day: LocalDate, today: LocalDate): String = when (day) {
     today -> "Today"
@@ -105,6 +116,7 @@ fun ThreadScreen(state: ThreadUi, actions: ThreadActions, zone: ZoneId = ZoneId.
     val names = remember(state.peers) { Mentions.nameMap(state.peers.map { app.atall.core.AgentProfile(it.id, it.name) }) }
     val today = LocalDate.now(zone)
     val list = remember(state.messages, today) { rows(state.messages, zone, today) }
+    val railRuns = remember(state.messages) { state.messages.filter { it.kind == MessageKind.RUN }.mapNotNull { it.runId }.toSet() }
     val listState = rememberLazyListState()
     LaunchedEffect(list.size, state.messages.lastOrNull()?.text?.length) {
         if (list.isNotEmpty()) listState.animateScrollToItem(list.size - 1)
@@ -122,7 +134,7 @@ fun ThreadScreen(state: ThreadUi, actions: ThreadActions, zone: ZoneId = ZoneId.
                 items(list, key = { it.key }) { row ->
                     when (row) {
                         is Row.Day -> DayDivider(row.label)
-                        is Row.Msg -> MessageRow(row, peersById, names, actions)
+                        is Row.Msg -> MessageRow(row, peersById, names, actions, railRuns)
                     }
                 }
             }
@@ -182,19 +194,31 @@ private fun DayDivider(label: String) {
 }
 
 @Composable
-private fun MessageRow(row: Row.Msg, peers: Map<String, PeerUi>, names: Map<String, String>, actions: ThreadActions) {
+private fun MessageRow(row: Row.Msg, peers: Map<String, PeerUi>, names: Map<String, String>, actions: ThreadActions, railRuns: Set<String>) {
     val m = row.m
     val top = if (row.header) AppTheme.spacing.turnGap / 2 else AppTheme.spacing.groupGap
-    Box(Modifier.fillMaxWidth().padding(top = top)) {
+    // Lines of a Juno turn (strip, sub-tasks, agent replies, answer) sit on one rail under it.
+    val child = m.runId != null && m.runId in railRuns && m.author != ThreadMessage.USER && m.kind != MessageKind.RUN
+    val rail = if (child) Modifier.padding(start = 14.dp).railStart(AppTheme.colors.hairlineStrong).padding(start = 10.dp) else Modifier
+    Box(Modifier.fillMaxWidth().padding(top = if (child) AppTheme.spacing.groupGap * 2 else top).then(rail)) {
         when {
             m.author == ThreadMessage.USER -> UserBubble(m, row.lastInGroup, names, peers, actions.onRetry)
+            m.kind == MessageKind.RUN -> RunHead(m, peers.values.toList(), actions.onStopWaiting)
+            m.kind == MessageKind.SUBTASK -> SubTask(m, peers[m.peerId])
             m.kind == MessageKind.NEEDS_TAP -> NeedsTap(m, peers[m.peerId], actions.onTapToSend)
+            m.kind == MessageKind.NEEDS_APPROVAL -> Approval(m, peers[m.peerId], actions.onApprove)
+            m.kind == MessageKind.AGREEMENT -> AgreementCard(m, peers, actions.onChallenge)
             m.kind == MessageKind.NEEDS_SIGN_IN -> AgentTurn(null, m, row.header) { Spacer(Modifier.height(8.dp)); Chip("Sign in", actions.onSignIn, filled = true) }
-            m.kind == MessageKind.NOTICE -> Notice(m.text)
-            m.author == Main.AUTHOR -> AgentTurn(null, m, row.header)
+            m.kind == MessageKind.NOTICE -> Notice(m.text, indent = !child)
+            m.author == Main.AUTHOR -> AgentTurn(null, m, row.header || child)
             else -> AgentTurn(peers[m.author] ?: PeerUi(m.author, "Removed agent", AgentHue.Slate, ChannelType.RCS, ""), m, row.header)
         }
     }
+}
+
+/** A 2dp line down the start edge (the rail that groups a Juno turn). */
+private fun Modifier.railStart(color: androidx.compose.ui.graphics.Color): Modifier = drawBehind {
+    drawRect(color, size = androidx.compose.ui.geometry.Size(2.dp.toPx(), size.height))
 }
 
 @Composable
@@ -209,6 +233,7 @@ private fun UserBubble(m: ThreadMessage, last: Boolean, names: Map<String, Strin
         ) {
             Text(mentionText(m.text, names, peers, c.onUserBubble.copy(alpha = 0.14f)), style = AppTheme.type.body, color = c.onUserBubble)
         }
+        if (m.reactions.isNotEmpty()) ReactionChips(m.reactions, peers)
         if (m.status == SendStatus.NOT_SENT) {
             Text(
                 listOfNotNull("Not sent", m.statusNote, "Tap to retry").joinToString(" · "),
@@ -245,15 +270,16 @@ private fun AgentTurn(peer: PeerUi?, m: ThreadMessage, header: Boolean, extra: @
             if (header) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(peer?.name ?: Main.NAME, style = AppTheme.type.sender, color = if (peer == null) c.ink else AppTheme.agent(peer.hue).solid)
-                    if (peer != null && m.direct) {
+                    attributionLabel(peer, m)?.let {
                         Spacer(Modifier.width(6.dp))
-                        Text("replied directly", style = AppTheme.type.caption, color = c.ink3)
+                        Text(it, style = AppTheme.type.caption, color = c.ink3)
                     }
                 }
                 Spacer(Modifier.height(2.dp))
             }
             if (m.text.isNotBlank()) Text(m.text, style = AppTheme.type.body, color = c.ink)
             else if (m.streaming) Dot(c.ink3)
+            m.detail?.takeIf { m.kind == MessageKind.TEXT && it.isNotBlank() }?.let { Text(it, Modifier.padding(top = 2.dp), style = AppTheme.type.caption, color = c.ink3) }
             extra()
         }
     }
@@ -263,7 +289,7 @@ private fun AgentTurn(peer: PeerUi?, m: ThreadMessage, header: Boolean, extra: @
 private fun NeedsTap(m: ThreadMessage, peer: PeerUi?, onTap: (String) -> Unit) {
     val c = AppTheme.colors
     val name = peer?.name ?: "agent"
-    Row(Modifier.fillMaxWidth().padding(start = 38.dp), verticalAlignment = Alignment.CenterVertically) {
+    Row(Modifier.fillMaxWidth().padding(start = if (m.runId != null) 0.dp else 38.dp), verticalAlignment = Alignment.CenterVertically) {
         when (m.status) {
             SendStatus.DRAFTED -> Text("Opened in Messages. Tap Send there.", style = AppTheme.type.body2, color = c.ink2)
             SendStatus.SENT -> Text("Sent to $name", style = AppTheme.type.body2, color = c.ink2)
@@ -276,8 +302,8 @@ private fun NeedsTap(m: ThreadMessage, peer: PeerUi?, onTap: (String) -> Unit) {
 }
 
 @Composable
-private fun Notice(text: String) {
-    Text(text, Modifier.fillMaxWidth().padding(start = 38.dp), style = AppTheme.type.body2, color = AppTheme.colors.ink3)
+private fun Notice(text: String, indent: Boolean = true) {
+    Text(text, Modifier.fillMaxWidth().padding(start = if (indent) 38.dp else 0.dp), style = AppTheme.type.body2, color = AppTheme.colors.ink3)
 }
 
 // ------------------------------------------------------------------------------------------------ previews

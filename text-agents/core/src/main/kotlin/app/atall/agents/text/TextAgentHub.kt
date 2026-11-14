@@ -48,8 +48,15 @@ class TextAgentHub(
   val config: TextAgentConfig = TextAgentConfig(),
   private val random: java.util.Random = java.security.SecureRandom(),
   private val io: CoroutineDispatcher = Dispatchers.IO,
+  /**
+   * Debug diagnostics (on-device log only). Called with one line per capture/fallback decision. Lines carry agent
+   * ids, reasons and ages, never message text or numbers.
+   */
+  private val diagnostics: (String) -> Unit = {},
 ) {
-  private class Live(val handle: ReplyHandle, val key: String, val capturedAt: Long, var removedAt: Long = 0)
+  private class Live(val handle: ReplyHandle, val key: String, var capturedAt: Long, val source: String?, var removedAt: Long = 0)
+  /** What the listener last saw for an agent's conversation; diagnostics only. */
+  private class Seen(var at: Long = 0, var hadReply: Boolean = false, var actions: Int = 0, var source: String? = null)
   private data class Recent(val text: String, val at: Long)
 
   private val lock = Any()
@@ -57,7 +64,10 @@ class TextAgentHub(
   private var requests: MutableList<OutstandingRequest> = store.requests().toMutableList()
   private val keys: LinkedHashMap<String, Long> = store.keys()
   private val meta: MutableMap<String, Long> = store.meta().toMutableMap()
-  private val live = HashMap<AgentId, Live>()
+  /** Captured reply actions per agent conversation, newest first. Older ones are kept as fallbacks (a re-post may
+   *  carry a fresh PendingIntent while the old one still works, or the new one may be cancelled). */
+  private val live = HashMap<AgentId, ArrayDeque<Live>>()
+  private val seen = HashMap<AgentId, Seen>()
   private val lastOwnReplyAt = HashMap<AgentId, Long>()
   private val recentOut = HashMap<AgentId, ArrayDeque<Recent>>()
   private val recentIn = HashMap<AgentId, ArrayDeque<Recent>>()
@@ -100,6 +110,7 @@ class TextAgentHub(
     agents = agents.filter { it.id != id }
     store.saveAgents(agents)
     live.remove(id)
+    seen.remove(id)
     if (requests.removeAll { it.agentId == id }) store.saveRequests(requests)
     handles.remove(id)
     meta.keys.removeAll { it.endsWith(":$id") }
@@ -111,11 +122,40 @@ class TextAgentHub(
   private fun handleFor(id: AgentId) = handles.getOrPut(id) { TextAgent(id, this) }
 
   fun liveStatus(id: AgentId): LiveStatus = synchronized(lock) {
-    val l = live[id] ?: return LiveStatus(false, false, 0, 0)
-    LiveStatus(true, usable(l, clock.now()), l.capturedAt, l.removedAt)
+    val all = live[id]?.takeIf { it.isNotEmpty() } ?: return LiveStatus(false, false, 0, 0)
+    val now = clock.now()
+    val l = all.firstOrNull { usable(it, now) } ?: all.first()
+    LiveStatus(true, usable(l, now), l.capturedAt, l.removedAt)
   }
 
+  private fun capture(id: AgentId, s: NotificationSnapshot, now: Long) {
+    val sn = seen.getOrPut(id) { Seen() }
+    sn.at = now; sn.hadReply = s.reply != null; sn.actions = s.actionCount; sn.source = s.replySource
+    val handle = s.reply
+    if (handle == null) {
+      // A MessagingStyle update without an action (e.g. Messages' own "sending…" re-post) never drops what we hold.
+      diag("capture agent=$id reply=absent actions=${s.actionCount} kept=${live[id]?.size ?: 0}")
+      return
+    }
+    val q = live.getOrPut(id) { ArrayDeque() }
+    val ident = handle.identity
+    val same = if (ident != null) q.firstOrNull { it.handle.identity == ident } else null
+    if (same != null) {
+      q.remove(same)
+      // Same PendingIntent re-posted: it is showing again, so its age restarts.
+      q.addFirst(Live(handle, s.key, now, s.replySource))
+    } else {
+      q.addFirst(Live(handle, s.key, now, s.replySource))
+    }
+    while (q.size > MAX_HANDLES) q.removeLast()
+    diag("capture agent=$id reply=${s.replySource ?: "yes"} actions=${s.actionCount} held=${q.size}")
+  }
+
+  private fun diag(line: String) { runCatching { diagnostics(line) } }
+
   private fun usable(l: Live, now: Long) = l.removedAt == 0L || now - l.removedAt <= config.actionGraceMs
+
+  private companion object { const val MAX_HANDLES = 3 }
 
   // ================================================================== listener side
 
@@ -123,7 +163,7 @@ class TextAgentHub(
   fun onPosted(s: NotificationSnapshot) = synchronized(lock) {
     val agent = Parsing.route(s, agents) ?: return@synchronized
     val now = clock.now()
-    s.reply?.let { live[agent.id] = Live(it, s.key, now) }
+    capture(agent.id, s, now)
     var changed = false
     for (line in Parsing.lines(s, agent.id)) {
       changed = (if (line.self) selfLine(agent.id, line, now) else agentLine(agent.id, line, now)) || changed
@@ -136,9 +176,10 @@ class TextAgentHub(
 
   fun onRemoved(key: String, reason: RemovalReason) = synchronized(lock) {
     val now = clock.now()
-    val entry = live.entries.firstOrNull { it.value.key == key && it.value.removedAt == 0L } ?: return@synchronized
-    entry.value.removedAt = now
-    val id = entry.key
+    var id: AgentId? = null
+    for ((agent, q) in live) for (l in q) if (l.key == key && l.removedAt == 0L) { l.removedAt = now; id = agent }
+    if (id == null) return@synchronized
+    diag("removed agent=$id reason=$reason")
     val opened = reason == RemovalReason.APP_CANCEL || reason == RemovalReason.CLICK
     val ownReply = lastOwnReplyAt[id]?.let { now - it <= config.ownReplyCancelGuardMs } ?: false
     if (opened && !ownReply) {
@@ -153,6 +194,8 @@ class TextAgentHub(
   /** The user's own line (or our echo). Returns whether requests changed. */
   private fun selfLine(id: AgentId, line: ParsedLine, now: Long): Boolean {
     if (!fresh(id, line)) return false
+    // The user's own tapback in Messages is neither our echo nor the user typing to the agent.
+    if (Reactions.parse(line.text) != null) return false
     val skew = config.correlation.clockSkewMs
     // Our own request coming back: confirms it reached the thread; for a draft, that the user tapped Send.
     val idx = requests.indexOfFirst {
@@ -182,6 +225,13 @@ class TextAgentHub(
     }
     if (!fresh(id, line)) return false
     val historical = line.time < (meta["reg:$id"] ?: Long.MIN_VALUE)
+    Reactions.parse(line.text)?.let { r ->
+      // A tapback is not an answer: never attributed to a request (it would swallow the real reply that follows).
+      val reaction = r.copy(targetCorrelationId = reactionTarget(id, r))
+      store.append(LogEntry(line.id, id, Direction.IN, line.text, line.time, reaction = reaction))
+      handleFor(id).emit(AgentMessage(line.id, id, line.text, line.time, now, null, historical, reaction))
+      return false
+    }
     var correlation: Correlation? = null
     var changed = false
     if (!historical) {
@@ -199,6 +249,14 @@ class TextAgentHub(
     remember(recentIn, id, line.text, if (line.timeReliable) line.time else now)
     handleFor(id).emit(AgentMessage(line.id, id, line.text, line.time, now, correlation, historical))
     return changed
+  }
+
+  /** The request whose sent text the reaction quotes, newest first (open, recently closed, then the log). */
+  private fun reactionTarget(id: AgentId, r: Reaction): String? {
+    requests.filter { it.agentId == id }.sortedByDescending { it.sentAt }
+      .firstOrNull { Reactions.quotes(r.quoted, it.sentText) }?.let { return it.correlationId }
+    return store.log(id, 100).asReversed()
+      .firstOrNull { it.dir == Direction.OUT && it.correlationId != null && Reactions.quotes(r.quoted, it.text) }?.correlationId
   }
 
   /** Not seen before and not ancient history; records the key and watermark. */
@@ -270,31 +328,40 @@ class TextAgentHub(
     val tag = if (options.tag && options.expectReply) Correlator.newTag(requests.mapNotNull { it.tag }.toSet(), random) else null
     val sentText = if (tag != null) Correlator.withTag(text, tag) else text
 
-    val l = live[id]
     var draftReason = DraftReason.NO_LIVE_ACTION
-    if (l != null) {
-      if (!usable(l, now)) {
-        draftReason = DraftReason.ACTION_EXPIRED
-      } else {
+    val held = live[id]
+    if (held != null && held.isNotEmpty()) {
+      draftReason = DraftReason.ACTION_EXPIRED
+      for (l in held.toList()) {
+        if (!usable(l, now)) continue
         // Record the request and the echo before firing: Messages may re-post (and we may hear our own line)
         // before fire() returns, re-entering this hub on the same thread.
         val provisional = newRequest(id, cid, text, sentText, now, Via.ACTION, tag, options)
         provisional?.let { requests.add(it) }
         remember(recentOut, id, sentText, now)
         lastOwnReplyAt[id] = now
-        when (runCatching { l.handle.fire(sentText) }.getOrDefault(FireResult.ERROR)) {
-          FireResult.OK -> {
-            accept(id, cid, sentText, now, Via.ACTION, null)
-            return SendResult.Sent(cid, now, now - l.capturedAt, sentText)
-          }
-          FireResult.CANCELED -> draftReason = DraftReason.ACTION_CANCELED
-          FireResult.ERROR -> draftReason = DraftReason.ACTION_FAILED
+        val fired = runCatching { l.handle.fire(sentText) }.getOrDefault(FireResult.ERROR)
+        if (fired == FireResult.OK) {
+          accept(id, cid, sentText, now, Via.ACTION, null)
+          diag("send agent=$id via=action age=${(now - l.capturedAt) / 1000}s removed=${if (l.removedAt == 0L) "no" else "${(now - l.removedAt) / 1000}s"} source=${l.source}")
+          return SendResult.Sent(cid, now, now - l.capturedAt, sentText)
         }
-        live.remove(id)
+        draftReason = if (fired == FireResult.CANCELED) DraftReason.ACTION_CANCELED else DraftReason.ACTION_FAILED
+        diag("action unusable agent=$id result=$fired age=${(now - l.capturedAt) / 1000}s; trying older")
+        held.remove(l)
         lastOwnReplyAt.remove(id)
         provisional?.let { p -> requests.removeAll { it.correlationId == p.correlationId } }
         recentOut[id]?.removeLastOrNull()
       }
+    }
+    if (draftReason == DraftReason.ACTION_EXPIRED || draftReason == DraftReason.NO_LIVE_ACTION || held.isNullOrEmpty()) {
+      val sn = seen[id]
+      val newest = held?.firstOrNull()
+      diag("fallback agent=$id reason=$draftReason allowDraft=${options.allowDraft} held=${held?.size ?: 0}" +
+        (newest?.let { " newestAge=${(now - it.capturedAt) / 1000}s removedFor=${if (it.removedAt == 0L) 0 else (now - it.removedAt) / 1000}s" } ?: "") +
+        (sn?.let { " lastNotif=${(now - it.at) / 1000}s ago hadReply=${it.hadReply} actions=${it.actions}" } ?: " lastNotif=never"))
+    } else {
+      diag("fallback agent=$id reason=$draftReason allowDraft=${options.allowDraft}")
     }
     if (agent.number.isEmpty()) return SendResult.Failed(cid, FailReason.NO_NUMBER)
     val draft = DraftRequest(agent.number, sentText)

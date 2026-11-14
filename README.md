@@ -4,11 +4,29 @@
 phone, and `@mention` any other agent you use to ask it directly. Atall is open source (MIT), runs fully on the
 phone, and has no server.
 
-> Status: **M0 (v0.1.0-m0), pre-release.** The thread, `@mentions`, texting agents and onboarding work. Juno
-> answers with a plain ChatGPT call; delegation (Juno asking your agents and merging their answers) lands with
-> the coordinator in a later milestone.
+> Status: **M0.1 (v0.1.1-m01), pre-release.** Juno now coordinates: it asks your agents, waits, and merges
+> their answers; `@all` asks everyone the same question and shows where they agree. Built on the first Pixel
+> test of M0.
 
-## What it does today (M0)
+## New in M0.1 (v0.1.1-m01)
+
+- **Juno coordinates.** A message you don't address (or `@Juno`) goes through Juno's tool loop: it writes a
+  sub-task for each agent it picks, sends them, waits, and answers with what came back. The sub-tasks and each
+  agent's replies show under Juno's turn ("Asking Nova and Scout" → "Asked Nova and Scout · 18s"). Asks that
+  spend money or change an account wait for your **Yes, send it** (enforced in code, not just the prompt).
+- **`@all`.** Everyone gets the same question, blind, and Juno answers too; the **Agreement Map** shows what
+  everyone agrees on, where they split (with **Check this** for one targeted recheck) and who said what.
+- **Agents get context.** Every message to an agent starts with "From Atall (Kush's thread):" and carries your
+  request, a few trimmed recent turns, what Juno needs back and who else is being asked, in one text.
+- **Tapbacks are reactions.** "👍 to “…”" from an agent becomes a small chip on your message, not a reply.
+- **Consistent labels.** Every agent line says **replied directly**, **answered Juno** or **messaged you**; the
+  "may have answered in Messages" hint disappears once that agent's reply arrives.
+- **Fewer Messages drafts.** Reply buttons are captured from every agent notification (including Wear and Auto
+  variants), kept per conversation (the newest few), reused after the chat is read, and a cancelled one falls
+  back to an older one. A draft opens only when no live reply button exists; each fallback's reason is logged
+  on the device (`adb logcat -s TextAgents:D`, no message text).
+
+## What it does (M0)
 
 - **One thread, saved on the phone.** Your messages, Juno's answers and agent replies, in order, kept across restarts.
 - **`@mention` picker.** Type `@` (or tap the @ button) to pick Juno or any agent you added; matching is by
@@ -27,7 +45,7 @@ phone, and has no server.
 
 ## Install (Pixel / Android 8+)
 
-1. Download `atall-0.1.0-m0-arm64.apk` from the [latest release](https://github.com/kushagrakshatri/atall/releases) and open it. Allow installs from your browser if asked.
+1. Download `atall-0.1.1-m01-arm64.apk` from the [latest release](https://github.com/kushagrakshatri/atall/releases) and open it. Allow installs from your browser if asked.
 2. Open Atall. **Continue with ChatGPT** signs you in on OpenAI's page, or tap **Set up later**.
 3. **Open settings** and switch Atall on. If the switch is greyed out (sideloaded apps on Android 13+): App
    info → ⋮ → **Allow restricted settings**, then try again.
@@ -44,11 +62,17 @@ Kotlin + Jetpack Compose (Material 3), no NDK, no Play Services, no Firebase.
 | `:text-agents:core` | Pure-Kotlin texting transport: matching, dedupe, correlation, rate limits, durable store |
 | `:text-agents:android` | Notification listener, reply-action firing, Messages draft intents |
 | `:chatgpt-auth` | Pure-Kotlin Sign in with ChatGPT (PKCE + loopback) and a streaming Responses client |
+| `:coordinator` | Pure-Kotlin Juno: routing, the plan → ask → wait → merge tool loop, approval gate, `@all` Agreement Map, scoreboard |
+| `:coordinator:adapters` | Glue: Responses client → Juno's model, text-agents → Juno's peers, text-agents → inbox |
+| `:inbox` | Pure-Kotlin Agent Inbox (dedupe, triage, digest, code redaction); built and tested, not wired into the thread yet |
+
+In the app, `core/JunoBridge.kt` runs Juno against the thread: it starts runs, feeds agent replies and transport
+closures in, and projects each run into thread lines (`RUN`, `SUBTASK`, replies, approvals, the answer or the
+map). `core/ContextPack.kt` builds what agents receive; `core/PeerLines.kt` holds attribution and reaction rules.
+With no agent to ask, `PlainJuno` answers with one streaming Responses call.
 
 Seams for work in progress:
-- **Coordinator** (`app.atall.coordinator`): implement `app.atall.api.Coordinator` and bind it in `Graph.coordinator`.
-  Until then `PlainJuno` answers with one Responses call.
-- **Inbox** (`app.atall.inbox`): implement `app.atall.api.Inbox` and bind it in `Graph.inbox`.
+- **Inbox** (`app.atall.inbox`): implement `app.atall.api.Inbox` with `AgentInbox` and bind it in `Graph.inbox`.
 - **More channels** (WhatsApp, app notifications): implement `app.atall.api.ChannelAdapter` (each returns the
   same `Agent` interface as the texting transport), add it to `Graph.adapters`, and flip `ChannelType.implemented`.
 
@@ -58,14 +82,15 @@ Seams for work in progress:
   you add, and ignores the rest.
 - The thread, agents and the ChatGPT sign-in stay in app-private storage and are excluded from backups. The
   sign-in is encrypted with a key in the Android Keystore.
-- What you send to Juno goes to OpenAI. Agents only get what you `@mention` them with.
+- What you send to Juno goes to OpenAI. An agent gets what you `@mention` it with, or Juno's sub-task, plus a
+  compact context block (your request, a few recent lines of the thread, who else is being asked).
 - Sign in with ChatGPT uses OpenAI's route for open-source, locally hosted apps; usage counts against your
   ChatGPT plan and you can cap it in ChatGPT → Settings → Usage.
 
 ## Build
 
 ```bash
-./gradlew :app:testDebugUnitTest :text-agents:core:test :chatgpt-auth:test assembleRelease
+./gradlew :app:testDebugUnitTest :text-agents:core:test :chatgpt-auth:test :coordinator:test :inbox:test assembleRelease
 ```
 
 JDK 17, Android SDK platform 37. Release signing reads a properties file kept outside the repo

@@ -186,7 +186,7 @@ class FakeAgent(
   /** Push an unsolicited message. */
   fun push(text: String, correlation: Correlation? = null) {
     val now = clock.now()
-    val m = AgentMessage("fake|${log.size}", id, text, now, now, correlation)
+    val m = AgentMessage("fake|$id|${log.size}", id, text, now, now, correlation)
     log += LogEntry(m.id, id, Direction.IN, text, now, correlation = correlation)
     flow.tryEmit(m)
   }

@@ -112,6 +112,9 @@ class MainActivity : ComponentActivity() {
                     onOpenAgents = { screen = Screen.Agents },
                     onAddAgent = { screen = Screen.AddAgent(Screen.Thread) },
                     onTurnOnAccess = ::openAccess,
+                    onApprove = { id, yes -> g.scope.launch { g.router.approve(id, yes) } },
+                    onStopWaiting = { runId -> g.scope.launch { g.juno.stopWaiting(runId) } },
+                    onChallenge = { runId, dispute -> g.scope.launch { g.juno.challenge(runId, dispute) } },
                 ),
             )
             Screen.Agents -> {

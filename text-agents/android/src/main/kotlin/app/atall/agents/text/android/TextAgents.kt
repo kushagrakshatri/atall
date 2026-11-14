@@ -39,6 +39,13 @@ object TextAgents {
   private const val SWEEP_MS = 30_000L
 
   @Volatile private var hub: TextAgentHub? = null
+
+  /**
+   * Debug diagnostics for reply-action capture and draft fallbacks: one line per decision to logcat at DEBUG under
+   * [TAG], on the device only. Lines carry agent ids, reasons and ages, never message text or phone numbers.
+   * Off unless the app turns it on.
+   */
+  @Volatile var diagnostics: Boolean = false
   @Volatile internal var listener: TextAgentListenerService? = null
   private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
@@ -51,6 +58,7 @@ object TextAgents {
       store = FileTextAgentStore(File(app.filesDir, "text-agents")),
       drafts = IntentDraftLauncher(app, isForeground ?: { processInForeground() }),
       config = config,
+      diagnostics = { line -> if (diagnostics) Log.d(TAG, line) },
     )
     hub = h
     // Expiry is evaluated on every event; this tick makes RequestClosed arrive on time when nothing happens.

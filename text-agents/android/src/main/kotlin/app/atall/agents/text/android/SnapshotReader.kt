@@ -23,6 +23,7 @@ object SnapshotReader {
     if (sbn.packageName != Rules.MESSAGES_PACKAGE) return null
     val n = sbn.notification ?: return null
     val x = n.extras ?: return null
+    val found = findReply(n)
     return NotificationSnapshot(
       packageName = sbn.packageName,
       key = sbn.key,
@@ -34,7 +35,9 @@ object SnapshotReader {
       isGroupConversation = Build.VERSION.SDK_INT >= 28 && x.getBoolean(Notification.EXTRA_IS_GROUP_CONVERSATION, false),
       selfName = selfName(x),
       lines = lines(x, sbn.postTime),
-      reply = replyAction(n)?.let { ActionReplyHandle(context.applicationContext, it) },
+      reply = found?.let { ActionReplyHandle(context.applicationContext, it.inputs, it.intent) },
+      actionCount = n.actions?.size ?: 0,
+      replySource = found?.source,
     )
   }
 
@@ -62,10 +65,33 @@ object SnapshotReader {
     }
   }
 
+  /** A reply route found on a notification: the RemoteInputs to fill and the PendingIntent to fire. */
+  class Found(val inputs: Array<RemoteInput>, val intent: android.app.PendingIntent, val source: String)
+
+  /**
+   * The reply route, wherever Messages put it: the notification's own actions first, then the Wear extender's
+   * actions, then the (deprecated, still populated by some versions) Android Auto unread conversation.
+   */
+  @Suppress("DEPRECATION")
+  fun findReply(n: Notification): Found? {
+    replyAction(n.actions)?.let { return Found(it.remoteInputs, it.actionIntent, "actions") }
+    runCatching { replyAction(Notification.WearableExtender(n).actions.toTypedArray()) }.getOrNull()
+      ?.let { return Found(it.remoteInputs, it.actionIntent, "wearable") }
+    runCatching {
+      val uc = Notification.CarExtender(n).unreadConversation
+      val ri = uc?.remoteInput
+      val pi = uc?.replyPendingIntent
+      if (ri != null && pi != null && ri.allowFreeFormInput) Found(arrayOf(ri), pi, "car") else null
+    }.getOrNull()?.let { return it }
+    return null
+  }
+
   /** The action with a free-form RemoteInput; SEMANTIC_ACTION_REPLY wins when several qualify. */
-  fun replyAction(n: Notification): Notification.Action? {
+  fun replyAction(n: Notification): Notification.Action? = replyAction(n.actions)
+
+  private fun replyAction(actions: Array<Notification.Action>?): Notification.Action? {
     var best: Notification.Action? = null
-    for (a in n.actions ?: return null) {
+    for (a in actions ?: return null) {
       val inputs = a.remoteInputs ?: continue
       if (inputs.isEmpty() || a.actionIntent == null || inputs.none { it.allowFreeFormInput }) continue
       if (best == null || (Build.VERSION.SDK_INT >= 28 && a.semanticAction == Notification.Action.SEMANTIC_ACTION_REPLY)) best = a
@@ -77,14 +103,22 @@ object SnapshotReader {
 }
 
 /** Fills the RemoteInput(s) and fires Messages' PendingIntent, as the spike's reply-probe proved on a Pixel 9 Pro. */
-class ActionReplyHandle(private val context: Context, private val action: Notification.Action) : ReplyHandle {
+class ActionReplyHandle(
+  private val context: Context,
+  private val inputs: Array<RemoteInput>,
+  private val intent: android.app.PendingIntent,
+) : ReplyHandle {
+  constructor(context: Context, action: Notification.Action) : this(context, action.remoteInputs, action.actionIntent)
+
+  /** PendingIntent equality is by the underlying token: a re-post of the same action compares equal. */
+  override val identity: Any get() = intent
+
   override fun fire(text: String): FireResult = try {
-    val inputs = action.remoteInputs
     val results = Bundle().apply { for (ri in inputs) putCharSequence(ri.resultKey, text) }
     val fill = Intent()
     RemoteInput.addResultsToIntent(inputs, fill, results)
     if (Build.VERSION.SDK_INT >= 28) RemoteInput.setResultsSource(fill, RemoteInput.SOURCE_FREE_FORM_INPUT)
-    action.actionIntent.send(context, 0, fill)
+    intent.send(context, 0, fill)
     FireResult.OK
   } catch (e: android.app.PendingIntent.CanceledException) {
     FireResult.CANCELED

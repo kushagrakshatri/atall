@@ -9,6 +9,8 @@ sealed interface Route {
     data class ToMain(val text: String, val mentionedPeers: List<String>) : Route
     /** Only peers were mentioned: each gets [text] directly, the main agent stays quiet. */
     data class Direct(val peerIds: List<String>, val text: String) : Route
+    /** `@all` / `@everyone`: the same question to every active agent, blind, then the Agreement Map. */
+    data class All(val text: String) : Route
 }
 
 /**
@@ -43,7 +45,14 @@ object Mentions {
         agents.associate { it.name.lowercase() to it.id } + (Main.NAME.lowercase() to Main.AUTHOR)
 
     fun route(text: String, agents: List<AgentProfile>): Route {
-        val mentions = find(text, nameMap(agents))
+        val names = nameMap(agents)
+        val all = allMentions(text, names)
+        if (all.isNotEmpty()) {
+            val rest = find(text, names).filter { it.target == Main.AUTHOR }
+            val body = remove(text, all + rest)
+            if (body.isNotBlank()) return Route.All(body)
+        }
+        val mentions = find(text, names)
         val peers = mentions.map { it.target }.filter { it != Main.AUTHOR }.distinct()
         val main = mentions.any { it.target == Main.AUTHOR }
         return if (peers.isEmpty() || main) Route.ToMain(text.trim(), peers)
@@ -68,6 +77,37 @@ object Mentions {
         val out = sb.toString().trim().trimStart(',', ':', ' ').trim()
         return out.ifEmpty { text.trim() }
     }
+
+    /** `@all` / `@everyone` tokens, unless an agent is actually called that. */
+    fun allMentions(text: String, names: Map<String, String>): List<Mention> {
+        val out = ArrayList<Mention>()
+        for (m in ALL.findAll(text)) {
+            val word = m.groupValues[1]
+            if (names.containsKey(word.lowercase())) continue
+            out += Mention(ALL_TARGET, m.range.first..(m.range.first + word.length))
+        }
+        return out
+    }
+
+    /** The text with [mentions] removed entirely (and the punctuation right after a leading one). */
+    fun remove(text: String, mentions: List<Mention>): String {
+        val sb = StringBuilder()
+        var pos = 0
+        for (m in mentions.sortedBy { it.range.first }) {
+            if (m.range.first < pos) continue
+            sb.append(text, pos, m.range.first)
+            pos = m.range.last + 1
+            if (sb.isBlank()) while (pos < text.length && (text[pos] == ',' || text[pos] == ':')) pos++
+        }
+        sb.append(text.substring(pos))
+        return sb.toString().replace(Regex("[ \t]{2,}"), " ").trim()
+    }
+
+    /** The text with every "@" of a mention dropped ("@Nova where" -> "Nova where"), for matching quotes. */
+    fun plain(text: String): String = text.replace(Regex("(?<![\\p{L}\\p{N}_.])@(?=\\p{L})"), "")
+
+    const val ALL_TARGET = "*all"
+    private val ALL = Regex("(?<![\\p{L}\\p{N}_.@-])@(all|everyone)(?![\\p{L}\\p{N}_-])", RegexOption.IGNORE_CASE)
 
     /**
      * The "@prefix" being typed right before [cursor], for the picker. Returns the prefix (without '@') and

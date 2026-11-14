@@ -31,12 +31,12 @@ class RulesAndParsingTest {
   }
 
   @Test fun shortCodesNeedExactDigits() {
-    val sc = agent("sc", "Bot", "22395")
-    assertTrue(Rules.matches(sc, "22395"))
-    assertFalse(Rules.matches(sc, "122395"))
-    assertFalse(Rules.matches(sc, "2239"))
+    val sc = agent("sc", "Bot", "55501")
+    assertTrue(Rules.matches(sc, "55501"))
+    assertFalse(Rules.matches(sc, "155501"))
+    assertFalse(Rules.matches(sc, "5550"))
     // A full number never matches a short code by its tail.
-    assertFalse(Rules.matches(sc, "+1 650 552 2395"))
+    assertFalse(Rules.matches(sc, "+1 408 555 5501"))
   }
 
   @Test fun findsTheFirstMatch() {
@@ -51,7 +51,7 @@ class RulesAndParsingTest {
     assertEquals("4085550101", Rules.normalizeNumber("408.555.0101"))
     assertEquals("", Rules.normalizeNumber("none"))
     assertEquals("", Rules.normalizeNumber(null))
-    val n = AgentConfig(AgentId("a"), " A ", "(650) 1", listOf(" x ", "X", "", "y")).normalized()
+    val n = AgentConfig(AgentId("a"), " A ", "(408) 1", listOf(" x ", "X", "", "y")).normalized()
     assertEquals("A", n.name)
     assertEquals(listOf("x", "y"), n.aliases)
   }

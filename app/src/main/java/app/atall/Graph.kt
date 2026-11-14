@@ -14,6 +14,10 @@ import app.atall.api.PeerInfo
 import app.atall.api.ShowEverything
 import app.atall.core.AgentProfile
 import app.atall.core.AgentRegistry
+import app.atall.core.JunoBridge
+import app.atall.coordinator.FileRunStore
+import app.atall.coordinator.JsonLinesScoreLog
+import app.atall.coordinator.adapters.ResponsesLlm
 import app.atall.core.PlainJuno
 import app.atall.core.Router
 import app.atall.core.ThreadStore
@@ -31,7 +35,8 @@ import java.io.File
 
 /**
  * Manual DI: one of each per process. Seams:
- *  - [coordinator]: bind `app.atall.coordinator`'s implementation here when that module lands (PlainJuno until then).
+ *  - [juno]: Juno's coordinator (`app.atall.coordinator`): plan, ask agents, wait, merge; `@all` Agreement Map.
+ *  - [coordinator]: the plain streaming chat, used when there is no agent to ask.
  *  - [inbox]: bind `app.atall.inbox` here (shows everything until then).
  *  - [adapters]: add the `app-agents` WhatsApp / app-notification adapters here; RCS is built in.
  */
@@ -58,20 +63,35 @@ class Graph(private val context: Context) {
         }
     }
 
+    val juno = JunoBridge(
+        thread = thread, registry = registry, peers = peers,
+        llm = { chatGpt.responsesOrNull()?.let { client -> ResponsesLlm(client, model = { prefs.model }) } },
+        store = FileRunStore(File(dataDir, "runs").apply { mkdirs() }),
+        scores = JsonLinesScoreLog(File(dataDir.apply { mkdirs() }, "scores.jsonl")),
+        scope = scope, userName = ::userName,
+    )
+
     val router = Router(
         thread = thread, registry = registry, peers = peers,
         coordinator = { coordinator }, responses = { chatGpt.responsesOrNull() },
-        model = { prefs.model }, inbox = { inbox },
+        model = { prefs.model }, inbox = { inbox }, juno = { juno }, userName = ::userName,
     )
+
+    /** The user's first name for agents' context ("From Atall (Kush's thread):"): the setting, else the ChatGPT name. */
+    fun userName(): String = prefs.userName.trim().ifEmpty { chatGpt.status.value.name.trim().substringBefore(' ') }
 
     private val _agents = MutableStateFlow(registry.all())
     val agents: StateFlow<List<AgentProfile>> = _agents
     private val collectors = HashMap<String, Pair<Agent, Job>>()
 
     init {
+        // Reply-action capture and every draft fallback with its reason go to logcat (DEBUG, tag TextAgents) on the
+        // device only; no message text or numbers.
+        TextAgents.diagnostics = true
         TextAgents.init(context)
-        scope.launch { rcs.hub.events.collect { if (it is RequestClosed) router.onRequestClosed(it) } }
+        scope.launch { rcs.hub.events.collect { if (it is RequestClosed) runCatching { router.onRequestClosed(it) } } }
         sync()
+        juno.start()
         chatGpt.refresh()
         // The listener may deliver before our collectors subscribe; the durable log covers the gap.
         scope.launch { delay(1_500); backfill() }
@@ -150,4 +170,8 @@ class Prefs(context: Context) {
     var model: String
         get() = sp.getString("model", Router.DEFAULT_MODEL) ?: Router.DEFAULT_MODEL
         set(v) { sp.edit().putString("model", v).apply() }
+    /** What agents call the user in context headers. Blank: the first name on the ChatGPT account. */
+    var userName: String
+        get() = sp.getString("user_name", "") ?: ""
+        set(v) { sp.edit().putString("user_name", v).apply() }
 }

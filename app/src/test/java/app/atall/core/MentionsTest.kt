@@ -69,4 +69,16 @@ class MentionsTest {
         assertEquals(4..8, m[0].range)
         assertTrue(Mentions.find("no mentions", Mentions.nameMap(agents)).isEmpty())
     }
+
+    @Test fun atAllFansOutUnlessAnAgentIsCalledThat() {
+        val agents = listOf(AgentProfile("p1", "Nova"), AgentProfile("p2", "Scout"))
+        assertEquals(Route.All("best day for the hike?"), Mentions.route("@all best day for the hike?", agents))
+        assertEquals(Route.All("which is right?"), Mentions.route("@Juno @Everyone, which is right?", agents))
+        assertEquals(Route.All("ask nova too"), Mentions.route("ask nova too @all", agents))
+        // Only "@all" with nothing else is not a question.
+        assertTrue(Mentions.route("@all", agents) is Route.ToMain)
+        // An agent really named "All" wins.
+        assertTrue(Mentions.route("@all hi", agents + AgentProfile("p3", "All")) is Route.Direct)
+        assertEquals("Nova where", Mentions.plain("@Nova where"))
+    }
 }

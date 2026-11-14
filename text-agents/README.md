@@ -142,6 +142,21 @@ Sliding windows per agent (min interval 3 s, 6/min, 60/h) and global (20/min), c
   and healed), no schema migrations to own.
 - `TextAgentStore` is an interface; a Room implementation can replace it if the log ever needs search/paging.
 
+## M0.1 changes (after the first Pixel test)
+- **Reply actions.** Captured from every agent notification post and re-post (MessagingStyle updates included),
+  from the notification's own actions, else the Wear extender's, else Android Auto's unread conversation. Kept per
+  agent conversation, newest first (up to 3, a re-post of the same PendingIntent refreshes it); a post without an
+  action never drops what is held. A send tries the newest usable one and falls back to older ones on
+  CANCELED/ERROR; the draft is used only when none is usable. Usable = showing, or removed less than
+  `actionGraceMs` (15 min) ago (the Route C probe delivered 40 s after the chat was read).
+- **Diagnostics.** `TextAgentHub(diagnostics = …)` gets one line per capture, removal, send and fallback (agent id,
+  reason, ages, action counts; never message text or numbers). On Android, `TextAgents.diagnostics = true` sends
+  them to logcat at DEBUG under `TextAgents`.
+- **Reactions.** Tapback lines ("👍 to “…”", "Reacted 👍 to “…”", "Removed 👍 from “…”", iMessage-style
+  "Liked “…”") are parsed by `Reactions.parse`, never correlated to a request (so they can't swallow the real reply
+  that follows) and arrive as `AgentMessage.reaction` with the matching request's correlation id when the quote
+  matches something we sent. The user's own tapbacks in Messages are ignored.
+
 ## Tests
 `./gradlew :text-agents:core:test` (originally verified with a plain-kotlinc harness: **59 tests, all pass**);
 it also fails if `core` imports `android.*`, and type-checks `android/` against `android-34/android.jar`.

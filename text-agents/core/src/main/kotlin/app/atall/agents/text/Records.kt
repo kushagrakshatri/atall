@@ -14,6 +14,8 @@ data class LogEntry(
   val correlation: Correlation? = null,
   /** For OUT: the request this line was sent for. */
   val correlationId: String? = null,
+  /** For IN: the line was a tapback/reaction, not text (never correlated). */
+  val reaction: Reaction? = null,
 )
 
 @Serializable

@@ -19,6 +19,8 @@ data class AuthStatus(
     val planUsage: Boolean,
     val endedReason: String,
     val accounts: List<Pair<String, String>>, // clientId to email
+    /** The account holder's name from the ID token (may be blank). Used for "Kush's thread"-style labels. */
+    val name: String = "",
 )
 
 data class SignOutResult(val revoked: Boolean)
@@ -61,7 +63,7 @@ class ChatGptAuth(
             else -> "signed_out"
         }
         return AuthStatus(state, a?.email ?: "", a?.clientId, a?.planUsage == true && state == "signed_in", a?.endedReason ?: "",
-            v.accounts.values.map { it.clientId to it.email })
+            v.accounts.values.map { it.clientId to it.email }, a?.name ?: "")
     }
 
     /**
