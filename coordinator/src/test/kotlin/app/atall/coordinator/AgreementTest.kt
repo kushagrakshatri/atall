@@ -106,7 +106,8 @@ class AgreementTest {
     assertEquals(0, dispute.majority)
     assertEquals("Mission Peak", map.unique.single().value)
     assertEquals(VerdictLevel.MAJORITY, map.verdict!!.level)
-    assertEquals(map.verdict!!.line, done.view.answer)
+    // M0.4: Juno posts one merged answer; with no "merge" model here it falls back to the verdict + each agent's lead.
+    assertTrue(done.view.answer!!.startsWith(map.verdict!!.line) && done.view.answer!!.contains("**Nova:**"), done.view.answer)
     assertEquals(3, map.raw.size)
     assertEquals(StripPhase.DONE, done.view.strip!!.phase)
 

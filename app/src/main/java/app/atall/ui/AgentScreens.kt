@@ -60,6 +60,18 @@ private fun Card(content: @Composable () -> Unit) {
     Column(Modifier.fillMaxWidth().clip(AppTheme.radii.card).background(AppTheme.colors.surface).hairlineBorder(AppTheme.radii.card, strong = false)) { content() }
 }
 
+/** Settings → Debugging: the message-text switch, Copy debug log, the version, the hidden Sentry DSN field. */
+data class DebugUi(
+    val sendText: Boolean = true,
+    val onSendText: (Boolean) -> Unit = {},
+    val onCopyLog: () -> Unit = {},
+    val copiedNote: String? = null,
+    val version: String = "",
+    val dsn: String = "",
+    val onDsn: (String) -> Unit = {},
+    val dsnNote: String = "",
+)
+
 @Composable
 fun AgentsScreen(
     peers: List<PeerUi>, account: AccountUi, notificationAccess: Boolean,
@@ -67,6 +79,7 @@ fun AgentsScreen(
     onSignIn: () -> Unit, onSignOut: () -> Unit, onManageUsage: () -> Unit, onTurnOnAccess: () -> Unit, onLicences: () -> Unit,
     /** "Your name": what agents and Juno call you. Prefilled with the ChatGPT first name until you change it. */
     userName: String = "", onUserNameChange: (String) -> Unit = {},
+    debug: DebugUi = DebugUi(),
 ) {
     val c = AppTheme.colors
     Column(Modifier.fillMaxSize().background(c.bg).statusBarsPadding().navigationBarsPadding().imePadding()) {
@@ -140,11 +153,44 @@ fun AgentsScreen(
                     }
                 }
             }
+            SectionLabel("Debugging")
+            Card {
+                Row(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Send message text with debug logs", style = AppTheme.type.body, color = c.ink)
+                        Text("Phone numbers, codes and keys are always removed", style = AppTheme.type.caption, color = c.ink3)
+                    }
+                    Switch(
+                        checked = debug.sendText, onCheckedChange = debug.onSendText,
+                        colors = SwitchDefaults.colors(checkedTrackColor = c.ink, checkedThumbColor = c.onInk, uncheckedTrackColor = c.sunken, uncheckedBorderColor = c.hairlineStrong, uncheckedThumbColor = c.ink3),
+                    )
+                }
+                HorizontalDivider(color = c.hairline)
+                Row(Modifier.fillMaxWidth().clickable(onClick = debug.onCopyLog).padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Copy debug log", style = AppTheme.type.body, color = c.ink)
+                        Text(debug.copiedNote ?: "The last 500 lines, ready to paste", style = AppTheme.type.caption, color = c.ink3)
+                    }
+                }
+            }
             SectionLabel("About")
+            var taps by remember { mutableStateOf(0) }
             Card {
                 Row(Modifier.fillMaxWidth().clickable(onClick = onLicences).padding(14.dp)) {
                     Text("Open-source licences", style = AppTheme.type.body, color = c.ink)
                 }
+                HorizontalDivider(color = c.hairline)
+                // Five taps on the version show the hidden Sentry DSN field (for a build that has none).
+                Row(Modifier.fillMaxWidth().clickable { taps++ }.padding(14.dp)) {
+                    Text("Version ${debug.version}", style = AppTheme.type.body, color = c.ink)
+                }
+            }
+            if (taps >= 5 || debug.dsn.isNotBlank()) {
+                SectionLabel("Debug: Sentry DSN")
+                Field(
+                    "Debug: Sentry DSN", debug.dsn, debug.onDsn,
+                    helper = debug.dsnNote,
+                )
             }
             Spacer(Modifier.height(24.dp))
         }

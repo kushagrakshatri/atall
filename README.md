@@ -4,11 +4,26 @@
 phone, and `@mention` any other agent you use to ask it directly. Atall is open source (MIT), runs fully on the
 phone, and has no server.
 
-> Status: **M0.3 (v0.1.3-m03), pre-release.** Juno coordinates: it asks your agents, waits, and merges
+> Status: **M0.4 (v0.1.4-m04), pre-release.** Juno coordinates: it asks your agents, waits, and merges
 > their answers; `@all` asks everyone the same question and shows where they agree; and now your agents can
 > **talk it over**.
 
-## New in M0.3 (v0.1.3-m03): Talk it over
+## New in M0.4 (v0.1.4-m04): fixes from the first device test
+
+- **`@all` always finishes.** Every model call now has a 90-second limit; a merge step that stalls or fails falls back
+  instead of leaving the card at "Collecting answers".
+- **One merged answer.** After everyone answers, Juno posts one answer that keeps the agents' specifics and asks
+  nothing an agent already knows. Anything still open is folded into one short question at the end. Juno's own first
+  take is folded in (and under **Show every answer**), never posted on its own.
+- **Real disagreements start the talk.** The comparison now names the one thing being decided and each answer's pick
+  (specific products vs "an experience instead"), so a split like that shows on the Agreement Map and the talk starts
+  by itself, including the **Share with …?** tap for private agents.
+- **Debugging.** Settings → **Copy debug log** (the last 500 lines: run steps, sends and transport fallbacks, model
+  errors; phone numbers, codes and keys removed) and **Send message text with debug logs** (on for now). Optional
+  Sentry (crashes, ANRs, run steps, stuck runs) when a DSN is set at build time (`SENTRY_DSN` / `.secrets/sentry.properties`,
+  never committed) or in the hidden **Debug: Sentry DSN** field (tap the version five times). No DSN, nothing is sent.
+
+## M0.3 (v0.1.3-m03): Talk it over
 
 - **Talk it over.** With `@all` in the composer (or when you write "talk it over"), a **Talk it over** chip asks
   your agents to answer on their own first, then each one sees the others' answers and can reply once. A second

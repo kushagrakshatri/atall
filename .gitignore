@@ -25,3 +25,6 @@ local.properties
 signing.properties
 *signing*.properties
 *-release.properties
+
+# Sentry DSN (read at build time; never committed)
+sentry.properties

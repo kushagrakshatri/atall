@@ -27,6 +27,8 @@
         android:label="@string/app_name"
         android:supportsRtl="true"
         android:theme="@style/Theme.Atall">
+        <!-- Sentry starts from AtallApp only when a DSN exists (build-time or the hidden Settings field). -->
+        <meta-data android:name="io.sentry.auto-init" android:value="false" />
         <activity
             android:name=".MainActivity"
             android:exported="true"

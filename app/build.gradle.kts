@@ -16,6 +16,18 @@ val signingProps: Properties? = signingPropsPath?.let { p ->
     if (f.isFile) Properties().apply { f.inputStream().use { load(it) } } else null
 }
 
+// Sentry DSN, never committed (the repo is public). In order: -PsentryDsn, env SENTRY_DSN (the CI secret), the `dsn`
+// key of a properties file (-PsentryProps / env SENTRY_PROPS, else ../../.secrets/sentry.properties beside the repo).
+// Empty means no build-time DSN: Sentry stays off unless one is entered in Settings (hidden debug field).
+val sentryDsn: String = run {
+    (findProperty("sentryDsn") as String?)?.takeIf { it.isNotBlank() }
+        ?: System.getenv("SENTRY_DSN")?.takeIf { it.isNotBlank() }
+        ?: listOfNotNull((findProperty("sentryProps") as String?) ?: System.getenv("SENTRY_PROPS"), rootProject.file("../../.secrets/sentry.properties").path)
+            .map { file(it) }.firstOrNull { it.isFile }
+            ?.let { f -> Properties().apply { f.inputStream().use { load(it) } }.getProperty("dsn")?.trim() }
+        ?: ""
+}
+
 android {
     namespace = "app.atall"
     compileSdk = 37
@@ -24,8 +36,9 @@ android {
         applicationId = "app.atall"
         minSdk = 26
         targetSdk = 36
-        versionCode = 4
-        versionName = "0.1.3-m03"
+        versionCode = 5
+        versionName = "0.1.4-m04"
+        buildConfigField("String", "SENTRY_DSN", "\"" + sentryDsn.replace("\\", "").replace("\"", "") + "\"")
         ndk { abiFilters += "arm64-v8a" }
     }
 
@@ -56,6 +69,7 @@ android {
 
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 
     packaging {
@@ -76,6 +90,8 @@ dependencies {
     implementation(libs.androidx.browser)
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.kotlinx.serialization.json)
+    // Crashes, ANRs and run steps (off without a DSN). Core only: no NDK, no session replay.
+    implementation(libs.sentry.android.core)
     implementation(platform(libs.compose.bom))
     implementation(libs.compose.ui)
     implementation(libs.compose.material3)

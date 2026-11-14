@@ -46,6 +46,8 @@ object TextAgents {
    * Off unless the app turns it on.
    */
   @Volatile var diagnostics: Boolean = false
+  /** Also hands each diagnostics line to the app (its "Copy debug log" and telemetry). Same content as logcat. */
+  @Volatile var diagnosticsSink: ((String) -> Unit)? = null
   @Volatile internal var listener: TextAgentListenerService? = null
   private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
@@ -58,7 +60,7 @@ object TextAgents {
       store = FileTextAgentStore(File(app.filesDir, "text-agents")),
       drafts = IntentDraftLauncher(app, isForeground ?: { processInForeground() }),
       config = config,
-      diagnostics = { line -> if (diagnostics) Log.d(TAG, line) },
+      diagnostics = { line -> if (diagnostics) Log.d(TAG, line); diagnosticsSink?.let { runCatching { it(line) } } },
     )
     hub = h
     // Expiry is evaluated on every event; this tick makes RequestClosed arrive on time when nothing happens.

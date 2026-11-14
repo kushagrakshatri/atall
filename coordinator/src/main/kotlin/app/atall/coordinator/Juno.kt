@@ -15,6 +15,12 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlin.coroutines.AbstractCoroutineContextElement
+import kotlin.coroutines.CoroutineContext
+import kotlin.coroutines.coroutineContext
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -53,7 +59,26 @@ data class JunoConfig(
   val talk: TalkLimits = TalkLimits(),
   /** @all: when the first answers clash, Juno starts a talk on the first disagreement by itself (once per message). */
   val autoTalk: Boolean = false,
+  /**
+   * Longest any one model call may take. Before M0.4 there was none: a stalled merge-step call (the claims call with
+   * strict json_schema streams until OkHttp's 10-minute read timeout) left an @all at "Collecting answers".
+   */
+  val modelTimeoutMs: Long = 90_000,
+  /** @all: after the map, Juno writes one merged answer from every answer (its own folded in). */
+  val mergeAnswer: Boolean = true,
 )
+
+/**
+ * Juno's own log: state transitions, sends and transport fallbacks, replies, merge/map/talk steps, model call errors.
+ * [text] carries message text (the app drops or redacts it); [detail] never does.
+ */
+fun interface JunoTrace {
+  fun event(runId: String?, name: String, detail: String, text: String?)
+  companion object { val NONE = JunoTrace { _, _, _, _ -> } }
+}
+
+/** The run a coroutine works for, so model-call errors are logged with it. */
+internal class RunTag(val runId: String) : AbstractCoroutineContextElement(Key) { companion object Key : CoroutineContext.Key<RunTag> }
 
 /** A recent thread line given to Juno as context (author display name, text). */
 data class ThreadLine(val author: String, val text: String)
@@ -106,6 +131,7 @@ class Juno(
   private val newId: () -> String = { UUID.randomUUID().toString().take(8) },
   /** What the user wants to be called ("Kush"); blank when unknown. Read on every model call, so a change applies at once. */
   private val userName: () -> String = { "" },
+  private val trace: JunoTrace = JunoTrace.NONE,
 ) {
   constructor(roster: Roster, peers: Map<String, Peer>, llm: Llm, store: RunStore, scores: ScoreLog = InMemoryScoreLog(),
               clock: () -> Long = System::currentTimeMillis, config: JunoConfig = JunoConfig(), newId: () -> String = { UUID.randomUUID().toString().take(8) }) :
@@ -194,7 +220,9 @@ class Juno(
    * events and deadlines (never polling the model). With inline=false it returns [DriveResult.Suspended] instead of
    * waiting: use that from a WorkManager job, which reschedules itself at wakeAt.
    */
-  suspend fun drive(runId: String, inline: Boolean = true): DriveResult {
+  suspend fun drive(runId: String, inline: Boolean = true): DriveResult = withContext(RunTag(runId)) { driveIn(runId, inline) }
+
+  private suspend fun driveIn(runId: String, inline: Boolean): DriveResult {
     mutex.withLock {
       if (getL(runId) == null) return DriveResult.Failed(null)
       if (!driving.add(runId)) return DriveResult.Busy
@@ -244,6 +272,7 @@ class Juno(
           val s = cid?.let { getL(runIdOf(it)) }
           val ask = s?.ask(cid)
           if (s == null || ask == null || ask.agentId != signal.agentId || ask.status == AskStatus.CANCELLED || ask.status == AskStatus.DECLINED) {
+            trace.event(s?.runId, "ingest.unclaimed", "${roster.nameOf(signal.agentId)} cid=${cid ?: "none"}", signal.text)
             events += ScoreEvent.Unsolicited(signal.agentId, now)
             updates += RunUpdate.Unsolicited(signal.agentId, signal.text, signal.at)
             return@withLock
@@ -262,6 +291,7 @@ class Juno(
         is PeerSignal.Closed -> {
           val s = getL(runIdOf(signal.correlationId)) ?: return@withLock
           val ask = s.ask(signal.correlationId) ?: return@withLock
+          trace.event(s.runId, "transport.closed", "${ask.id} ${roster.nameOf(ask.agentId)} ${signal.outcome} while ${ask.status}", null)
           val next = when (signal.outcome) {
             CloseOutcome.COMPLETED -> if (ask.status == AskStatus.REPLYING) AskStatus.ANSWERED else null
             CloseOutcome.EXPIRED -> if (!ask.status.settled && ask.replies.isEmpty() && ask.status != AskStatus.AWAITING_APPROVAL) AskStatus.TIMED_OUT else null
@@ -402,7 +432,7 @@ class Juno(
       flushSends(id)
       closePeers(mutex.withLock { sweepRunL(id) })
       val s = mutex.withLock { getL(id) } ?: continue
-      if (s.phase == Phase.DONE && id !in mutex.withLock { driving.toSet() }) lateWork(s)
+      if (s.phase == Phase.DONE && id !in mutex.withLock { driving.toSet() }) withContext(RunTag(id)) { lateWork(s) }
     }
   }
 
@@ -462,12 +492,30 @@ class Juno(
     }
   }
 
+  /** Every model call: a time limit (a timeout is a TRANSIENT failure, never a silent hang) and errors logged. */
+  private suspend fun model(req: LlmRequest): LlmResponse {
+    val runId = coroutineContext[RunTag]?.runId
+    val t0 = clock()
+    try {
+      return withTimeout(config.modelTimeoutMs) { llm.respond(req) }
+    } catch (e: TimeoutCancellationException) {
+      trace.event(runId, "model.error", "${req.purpose} timeout after ${config.modelTimeoutMs / 1000}s", null)
+      throw LlmException(LlmException.Kind.TRANSIENT, "timeout")
+    } catch (e: CancellationException) {
+      throw e
+    } catch (e: Exception) {
+      val kind = (e as? LlmException)?.kind ?: LlmException.Kind.OTHER
+      trace.event(runId, "model.error", "${req.purpose} $kind ${e.message ?: e.javaClass.simpleName} after ${(clock() - t0) / 1000}s", null)
+      throw e
+    }
+  }
+
   /** One model call with one retry on a transient error. Null when it failed (the run is finished or failed). */
   private suspend fun callModel(runId: String, req: LlmRequest): LlmResponse? {
     var attempt = 0
     while (true) {
       try {
-        return llm.respond(req)
+        return model(req)
       } catch (e: CancellationException) {
         throw e
       } catch (e: Exception) {
@@ -693,6 +741,10 @@ class Juno(
           is PeerSend.RateLimited -> settle(a.copy(failReason = "rate_limited"), AskStatus.FAILED, now, events)
           is PeerSend.Failed -> settle(a.copy(failReason = r.reason), AskStatus.FAILED, now, events)
         }
+        trace.event(runId, "send", "${a.id} ${roster.nameOf(a.agentId)} " + when (r) {
+          is PeerSend.Failed -> "failed:${r.reason}"; is PeerSend.RateLimited -> "rate_limited"; is PeerSend.NeedsUser -> "needs_tap (no live reply action)"
+          is PeerSend.Drafted -> "drafted"; is PeerSend.Duplicate -> "duplicate"; is PeerSend.Sent -> "sent"
+        }, null)
         if (r !is PeerSend.Duplicate) events += ScoreEvent.AskSent(a.agentId, now, a.id, viaOf(r), a.purpose)
         if (r is PeerSend.NeedsUser) {
           events += ScoreEvent.NeededUser(a.agentId, now, a.id, "tap_to_send")
@@ -838,7 +890,7 @@ class Juno(
         Items.developer("Your earlier answer:\n${s.answer.orEmpty()}"),
         Items.user("The user's message: ${s.userText}\n\n$name was asked: ${a.text}\n\n$name's late reply:\n${a.replyText}"),
       ))
-      val text = try { llm.respond(req).text.trim().ifEmpty { null } } catch (e: CancellationException) { throw e } catch (_: Exception) { null }
+      val text = try { model(req).text.trim().ifEmpty { null } } catch (e: CancellationException) { throw e } catch (_: Exception) { null }
         ?: "$name's answer is in: ${Views.preview(a.replyText)}"
       mutex.withLock {
         val cur = getL(s.runId) ?: return
@@ -851,7 +903,7 @@ class Juno(
   /** @all and challenge: Juno answers the question (or the challenge) itself, blind, with no tools. */
   private suspend fun answerAsMain(runId: String, ask: AskState) {
     val req = LlmRequest("blind", Prompts.render("juno_blind", mapOf("main" to roster.main.name)), listOf(Items.user(ask.text)))
-    val text = try { llm.respond(req).text.trim() } catch (e: CancellationException) { throw e } catch (_: Exception) { "" }
+    val text = try { model(req).text.trim() } catch (e: CancellationException) { throw e } catch (_: Exception) { "" }
     mutex.withLock {
       val s = getL(runId) ?: return
       val a = s.ask(ask.id) ?: return
@@ -866,10 +918,13 @@ class Juno(
   private suspend fun merge(runId: String) {
     val s = mutex.withLock { getL(runId) } ?: return
     val challenged = s.agreement?.disputed?.firstOrNull { it.challenge == ChallengeState.ASKED }
-    val map = if (challenged != null) resolveChallenge(s, challenged) else compare(s)
+    val map0 = if (challenged != null) resolveChallenge(s, challenged) else compare(s)
+    val map = if (challenged != null && map0.asked.isEmpty()) map0.copy(asked = s.agreement?.asked.orEmpty()) else map0
+    // One merged answer from every answer (Juno's own blind answer is folded in, never shown on its own).
+    val merged = if (config.mergeAnswer) mergedAnswer(s, map) else null
     mutex.withLock {
       val cur = getL(runId) ?: return
-      putL(cur.copy(agreement = map, phase = Phase.DONE, answer = map.verdict?.line, answeredAt = cur.answeredAt ?: clock()))
+      putL(cur.copy(agreement = map, phase = Phase.DONE, answer = merged ?: map.verdict?.line, fallback = config.mergeAnswer && merged == null, answeredAt = clock()))
     }
     _updates.tryEmit(RunUpdate.MapUpdated(runId, map))
     if (challenged == null && config.autoTalk && s.mode == RunMode.ALL && s.room == null) {
@@ -877,6 +932,56 @@ class Juno(
     }
     if (challenged == null && config.autoChallenge) map.disputed.firstOrNull()?.let { challenge(runId, it.id) }
   }
+
+  /**
+   * @all's final answer: the question, every answer word for word (Juno's own labelled as its first take), the
+   * comparison, and the questions they asked the user. Juno keeps the agents' specifics, asks nothing an agent already
+   * knows, and ends with at most one short combined question. Null when the model fails (the fallback is used).
+   */
+  private suspend fun mergedAnswer(s: RunState, map: AgreementMap): String? {
+    val answers = s.asks.filter { (it.purpose == AskPurpose.BLIND || it.purpose == AskPurpose.CHALLENGE) && it.replies.isNotEmpty() }
+    if (answers.isEmpty()) return null
+    val input = buildString {
+      append("Question: ").append(s.userText).append("\n")
+      answers.groupBy { it.agentId }.forEach { (agent, asks) ->
+        val who = if (agent == roster.main.id) "Your own first take (${roster.main.name}, written without the agents' context)" else roster.nameOf(agent)
+        append("\n").append(who).append(":\n")
+        asks.forEach { append(it.replyText.trim()).append("\n") }
+      }
+      val c = Agreement.Clusters(map.agreed, map.disputed, map.unique)
+      append("\nComparison:\n").append(Agreement.describe(s.userText, c, roster::nameOf)).append("\n")
+      if (map.asked.isNotEmpty()) {
+        append("\nQuestions the agents asked Kush (combine the ones still open into one short question at the end; drop any an agent's answer already settles):\n")
+        map.asked.forEach { (agent, qs) -> qs.forEach { q -> append("- ").append(roster.nameOf(agent)).append(": ").append(q).append("\n") } }
+      }
+    }
+    trace.event(s.runId, "merge", "answers=${answers.size} asked=${map.asked.values.sumOf { it.size }}", null)
+    return try {
+      model(LlmRequest("merge", Prompts.render("juno_merge", mapOf("main" to roster.main.name, "userLine" to Prompts.userLine(userNameNow()))), listOf(Items.user(input))))
+        .text.trim().ifEmpty { null }
+    } catch (e: CancellationException) { throw e } catch (_: Exception) { null }
+      ?: fallbackMerge(s, map, answers)
+  }
+
+  /** The merge without the model: the verdict line, each agent's opening line, and one combined question. */
+  private fun fallbackMerge(s: RunState, map: AgreementMap, answers: List<AskState>): String {
+    val peers = answers.filter { it.agentId != roster.main.id }.distinctBy { it.agentId }
+    return buildString {
+      map.verdict?.line?.let { append(it).append("\n\n") }
+      peers.forEach { a -> append("**").append(roster.nameOf(a.agentId)).append(":** ").append(Relay.trim(firstSentence(a.replyText), 220)).append("\n") }
+      combinedQuestion(map)?.let { append("\n").append(it) }
+    }.trim().ifEmpty { "Here's what came back. Tap Show every answer to read them." }
+  }
+
+  private fun firstSentence(t: String): String {
+    val one = t.trim().lines().firstOrNull { it.isNotBlank() }.orEmpty()
+    val m = Regex("^(.+?[.!])\\s").find(one + " ")
+    return (m?.groupValues?.get(1) ?: one).trim()
+  }
+
+  /** Up to two still-open things the agents asked about, as one short question. Peers' questions first. */
+  internal fun combinedQuestion(map: AgreementMap): String? =
+    Questions.combine(map.asked.filterKeys { it != roster.main.id }.values.flatten() + map.asked[roster.main.id].orEmpty())
 
   private suspend fun compare(s: RunState): AgreementMap {
     val answers = s.asks.filter { it.purpose == AskPurpose.BLIND && it.replies.isNotEmpty() }
@@ -895,10 +1000,14 @@ class Juno(
       raw.forEachIndexed { i, a -> append("\nAnswer ").append(Agreement.label(i)).append(":\n").append(a.text.trim()).append("\n") }
     }
     val parsed = try {
-      Agreement.parseClaims(llm.respond(LlmRequest("claims", Prompts.render("claims_extract"), listOf(Items.user(input)), jsonSchema = Agreement.claimsSchema, schemaName = "claims")).text, labels)
+      Agreement.parse(model(LlmRequest("claims", Prompts.render("claims_extract"), listOf(Items.user(input)), jsonSchema = Agreement.claimsSchema, schemaName = "claims")).text, labels)
     } catch (e: CancellationException) { throw e } catch (_: Exception) { null }
-    val clusters = parsed?.let { Agreement.cluster(it) }
-    return withVerdict(base.copy(agreed = clusters?.agreed.orEmpty(), disputed = clusters?.disputed.orEmpty(), unique = clusters?.unique.orEmpty()), raw.size, clusters == null, verdictCall)
+    val clusters = parsed?.let { Agreement.clusterWithPicks(it) }
+    if (parsed == null) trace.event(s.runId, "map.claims", "unusable: comparing raw answers only", null)
+    else trace.event(s.runId, "map.claims", "decision='${parsed.decision}' picks=" + parsed.answers.joinToString { "${roster.nameOf(it.agentId)}:${it.pickKind}" } +
+      " disputed=${clusters?.disputed?.size}", null)
+    val asked = parsed?.answers.orEmpty().filter { it.asks.isNotEmpty() }.associate { it.agentId to it.asks }
+    return withVerdict(base.copy(agreed = clusters?.agreed.orEmpty(), disputed = clusters?.disputed.orEmpty(), unique = clusters?.unique.orEmpty(), asked = asked), raw.size, clusters == null, verdictCall)
   }
 
   private suspend fun withVerdict(map: AgreementMap, answered: Int, unclear: Boolean, verdictCall: Boolean = true): AgreementMap {
@@ -906,7 +1015,7 @@ class Juno(
     val level = Agreement.level(answered, c)
     val line = if (!verdictCall || c == null || level == VerdictLevel.TOO_FEW || level == VerdictLevel.UNCLEAR) Agreement.fallbackLine(level, c, roster::nameOf)
     else try {
-      llm.respond(LlmRequest("verdict", Prompts.render("verdict", mapOf("main" to roster.main.name)), listOf(Items.user(Agreement.describe(map.question, c, roster::nameOf))))).text.trim()
+      model(LlmRequest("verdict", Prompts.render("verdict", mapOf("main" to roster.main.name)), listOf(Items.user(Agreement.describe(map.question, c, roster::nameOf))))).text.trim()
         .ifEmpty { Agreement.fallbackLine(level, c, roster::nameOf) }
     } catch (e: CancellationException) { throw e } catch (_: Exception) { Agreement.fallbackLine(level, c, roster::nameOf) }
     return map.copy(status = MapStatus.READY, verdict = Verdict(level, line, map.agreed.size, map.disputed.size, map.unique.size))
@@ -928,7 +1037,7 @@ class Juno(
         }
       }
       try {
-        val o = parseJsonObject(llm.respond(LlmRequest("challenge", Prompts.render("challenge_resolve"), listOf(Items.user(input)), jsonSchema = Agreement.challengeSchema, schemaName = "positions")).text)
+        val o = parseJsonObject(model(LlmRequest("challenge", Prompts.render("challenge_resolve"), listOf(Items.user(input)), jsonSchema = Agreement.challengeSchema, schemaName = "positions")).text)
         (o?.get("positions") as? JsonArray).orEmpty().mapNotNull { el ->
           val p = el as? JsonObject ?: return@mapNotNull null
           val agent = labels[p.str("agent")?.trim()?.uppercase()] ?: return@mapNotNull null
@@ -1011,7 +1120,9 @@ class Juno(
     room = appendEntriesL(s, room, now, closingRound = 0).first
     room = room.copy(rounds = listOf(RoomRound(0, participants, s.asks.filter { it.purpose == AskPurpose.BLIND }.map { it.id }, s.createdAt, s.createdAt, s.answeredAt ?: now, "all_in")))
     val m2 = map.copy(status = MapStatus.CHALLENGING, disputed = map.disputed.map { it.copy(challenge = ChallengeState.ASKED) })
-    putL(s.copy(mode = RunMode.ROOM, phase = Phase.PLANNING, room = room, agreement = m2, answer = null, answeredAt = null, pending = emptyList(), unprocessed = emptyList()))
+    // The merged answer stays up while they talk; the wrap-up replaces it.
+    putL(s.copy(mode = RunMode.ROOM, phase = Phase.PLANNING, room = room, agreement = m2, answeredAt = null, pending = emptyList(), unprocessed = emptyList()))
+    trace.event(runId, "talk.start", "$trigger on '${d.topic}' with ${Views.names(participants.map { roster.nameOf(it) })}", null)
     true
   }
 
@@ -1217,7 +1328,7 @@ class Juno(
     val floor = defaultFloor(s, r, n)
     val calls = try {
       if (s.modelCalls >= config.maxModelCalls) null
-      else llm.respond(LlmRequest("room", Prompts.render("room_moderator", mapOf("main" to roster.main.name, "userLine" to Prompts.userLine(userNameNow()))),
+      else model(LlmRequest("room", Prompts.render("room_moderator", mapOf("main" to roster.main.name, "userLine" to Prompts.userLine(userNameNow()))),
         listOf(Items.user(moderatorBrief(s, r, n, floor))), roomTools(r))).toolCalls.takeIf { it.isNotEmpty() }
     } catch (e: CancellationException) { throw e } catch (_: Exception) { null }
     // The model failed or said nothing useful: the deterministic floor, as if Juno had opened it.
@@ -1386,7 +1497,7 @@ class Juno(
         }
       }
       try {
-        val o = parseJsonObject(llm.respond(LlmRequest("positions", Prompts.render("room_positions"), listOf(Items.user(input)), jsonSchema = positionsSchema, schemaName = "positions")).text)
+        val o = parseJsonObject(model(LlmRequest("positions", Prompts.render("room_positions"), listOf(Items.user(input)), jsonSchema = positionsSchema, schemaName = "positions")).text)
         (o?.get("positions") as? JsonArray).orEmpty().mapNotNull { el ->
           val p = el as? JsonObject ?: return@mapNotNull null
           val agent = labels[p.str("agent")?.trim()?.uppercase()] ?: return@mapNotNull null
@@ -1417,11 +1528,12 @@ class Juno(
         if (disputes.isNotEmpty()) append("\nStill split on: ").append(disputes.joinToString("; ") { d -> d.topic + " (" + d.sides.joinToString(" vs ") { side -> side.value + ": " + side.agentIds.joinToString { roster.nameOf(it) } } + ")" }).append("\n")
         val user = r.entries.filter { it.kind == EntryKind.USER }
         if (user.isNotEmpty()) append("\nThe user added: ").append(user.joinToString(" / ") { it.text }).append("\n")
+        s.agreement?.let { m -> combinedQuestion(m)?.let { q -> append("\nStill open for the user (end with this as one short question unless an agent already answered it): ").append(q).append("\n") } }
         val silent = r.participants.filter { it !in byAgent.keys }.map { roster.nameOf(it) }
         if (silent.isNotEmpty()) append("Didn't answer: ").append(silent.joinToString()).append("\n")
       }
       try {
-        val o = parseJsonObject(llm.respond(LlmRequest("wrap", Prompts.render("room_wrap", mapOf("main" to roster.main.name, "userLine" to Prompts.userLine(userNameNow()))),
+        val o = parseJsonObject(model(LlmRequest("wrap", Prompts.render("room_wrap", mapOf("main" to roster.main.name, "userLine" to Prompts.userLine(userNameNow()))),
           listOf(Items.user(input)), jsonSchema = wrapSchema, schemaName = "wrap")).text)
         answer = o?.str("answer")?.trim()?.takeIf { it.isNotEmpty() }
         choices = o?.strings("choices").orEmpty().map { it.trim().take(40) }.filter { it.isNotEmpty() }.distinct().take(2)
@@ -1534,11 +1646,37 @@ class Juno(
   private suspend fun getL(runId: String): RunState? = cache[runId] ?: store.load(runId)?.also { cache[runId] = it }
 
   private suspend fun putL(s: RunState) {
-    val v = s.copy(version = (cache[s.runId]?.version ?: s.version) + 1)
+    val old = cache[s.runId]
+    val v = s.copy(version = (old?.version ?: s.version) + 1)
     store.save(v)
     cache[v.runId] = v
+    runCatching { traceDiff(old, v) }
     version.value++
     _updates.tryEmit(RunUpdate.Changed(v.runId))
+  }
+
+  /** One log line per change that matters: phase, mode, each ask's status and new reply parts, the map, the talk's stage. */
+  private fun traceDiff(old: RunState?, s: RunState) {
+    val id = s.runId
+    if (old == null) { trace.event(id, "run.start", "${s.mode} ${s.phase} asks=${s.asks.size}", s.userText); }
+    else {
+      if (old.mode != s.mode) trace.event(id, "run.mode", "${old.mode} -> ${s.mode}", null)
+      if (old.phase != s.phase) trace.event(id, "run.phase", "${old.phase} -> ${s.phase}" + (s.error?.let { " error=$it" } ?: ""), null)
+    }
+    for (a in s.asks) {
+      val o = old?.ask(a.id)
+      val who = roster.nameOf(a.agentId)
+      if (o == null) trace.event(id, "ask.new", "${a.id} $who ${a.purpose} ${a.status}", a.text)
+      else if (o.status != a.status) trace.event(id, "ask.status", "${a.id} $who ${o.status} -> ${a.status}" + (a.failReason?.let { " ($it)" } ?: ""), null)
+      for (p in a.replies.drop(o?.replies?.size ?: 0)) trace.event(id, "reply", "${a.id} $who ${p.certainty}" + (if (p.late) " late" else ""), p.text)
+    }
+    val om = old?.agreement; val m = s.agreement
+    if (m != null && (om == null || om.status != m.status || om.disputed.size != m.disputed.size || om.verdict != m.verdict))
+      trace.event(id, "map", "${m.status} agreed=${m.agreed.size} disputed=${m.disputed.size} unique=${m.unique.size} level=${m.verdict?.level}", null)
+    val or = old?.room; val r = s.room
+    if (r != null && (or == null || or.stage != r.stage || or.rounds.size != r.rounds.size))
+      trace.event(id, "talk", "stage=${r.stage} rounds=${r.rounds.size} trigger=${r.trigger}" + (r.endReason?.let { " end=$it" } ?: ""), null)
+    if (s.answer != null && s.answer != old?.answer) trace.event(id, "answer", if (s.fallback) "fallback" else "model", s.answer)
   }
 
   private fun RunState.replaceAsk(a: AskState) = copy(asks = asks.map { if (it.id == a.id) a else it })

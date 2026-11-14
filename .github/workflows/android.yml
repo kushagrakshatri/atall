@@ -1,5 +1,6 @@
 # Builds and tests Atall on x86-64 (the stock Maven aapt2 works here, so no shim).
-# No repository secrets are used: CI APKs are unsigned or debug-signed. Signed releases are built locally.
+# CI APKs are unsigned or debug-signed; signed releases are signed locally. The one optional secret is SENTRY_DSN
+# (baked into the APK's BuildConfig when present; without it Sentry stays off unless a DSN is entered in Settings).
 name: android
 on:
   push:
@@ -27,6 +28,8 @@ jobs:
       - name: Unit tests (app, text-agents, chatgpt-auth, coordinator, inbox)
         run: ./gradlew --console=plain -Porg.gradle.jvmargs="-Xmx3g -XX:MaxMetaspaceSize=1g" :app:testDebugUnitTest :text-agents:core:test :chatgpt-auth:test :coordinator:test :inbox:test
       - name: Debug + release APKs (release is unsigned in CI)
+        env:
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         run: ./gradlew --console=plain -Porg.gradle.jvmargs="-Xmx3g -XX:MaxMetaspaceSize=1g" assembleDebug assembleRelease
       - uses: actions/upload-artifact@v4
         with:

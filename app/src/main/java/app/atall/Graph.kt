@@ -51,6 +51,10 @@ class Graph(private val context: Context) {
     val prefs = Prefs(context)
     private val talkNotifier = TalkNotifier(context)
 
+    /** The app's own debug log (Settings → Copy debug log) and Sentry (off without a DSN). */
+    val debugLog = app.atall.core.DebugLog(File(dataDir, "debug-log.jsonl"))
+    val telemetry = SentryTelemetry(context) { prefs.sendMessageText }
+
     val rcs = RcsChannel(context)
     val adapters: Map<ChannelType, ChannelAdapter> = mapOf(ChannelType.RCS to rcs)
 
@@ -72,6 +76,7 @@ class Graph(private val context: Context) {
         scores = JsonLinesScoreLog(File(dataDir.apply { mkdirs() }, "scores.jsonl")),
         scope = scope, userName = ::userName,
         onTalkDone = { runId, text -> talkNotifier.talkDone(runId, text) },
+        log = debugLog, telemetry = telemetry,
     )
 
     val router = Router(
@@ -97,6 +102,11 @@ class Graph(private val context: Context) {
         // Reply-action capture and every draft fallback with its reason go to logcat (DEBUG, tag TextAgents) on the
         // device only; no message text or numbers.
         TextAgents.diagnostics = true
+        // Transport decisions (reply action captured, draft fallback and why) go to the debug log too.
+        TextAgents.diagnosticsSink = { line -> debugLog.add("transport", line.substringBefore(' '), null, line.substringAfter(' ', "")) }
+        debugLog.addSink { e -> telemetry.breadcrumb(e, includeText = prefs.sendMessageText) }
+        startTelemetry()
+        debugLog.add("app", "start", null, "${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE}) sentry=${if (telemetry.enabled) "on" else "off"}")
         TextAgents.init(context)
         scope.launch { rcs.hub.events.collect { if (it is RequestClosed) runCatching { router.onRequestClosed(it) } } }
         sync()
@@ -137,6 +147,17 @@ class Graph(private val context: Context) {
             runCatching { router.backfill(p.id, a.history(200)) }
         }
     }
+
+    /** Sentry with the build-time DSN, else the one saved in Settings (hidden debug field). No DSN: nothing is sent. */
+    fun startTelemetry(): Boolean = telemetry.start(BuildConfig.SENTRY_DSN.ifBlank { prefs.sentryDsn })
+
+    /** Whether a build-time DSN exists (then the Settings field is ignored). */
+    val buildTimeDsn: Boolean get() = BuildConfig.SENTRY_DSN.isNotBlank()
+
+    /** Settings → Copy debug log: the last ~500 lines, redacted, with message text only if the switch is on. */
+    fun debugLogText(): String = debugLog.export(prefs.sendMessageText,
+        header = "Atall ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE}) · Android ${android.os.Build.VERSION.RELEASE} · sentry ${if (telemetry.enabled) "on" else "off"} · " +
+            "message text ${if (prefs.sendMessageText) "included" else "left out"}")
 
     fun peerUi(): List<PeerUi> = _agents.value.map { p ->
         PeerUi(p.id, p.name, hueOf(p.hue), p.channel, p.address, p.paused, statusOf(p))
@@ -183,4 +204,12 @@ class Prefs(context: Context) {
     var userName: String
         get() = sp.getString("user_name", "") ?: ""
         set(v) { sp.edit().putString("user_name", v).apply() }
+    /** "Send message text with debug logs" (Copy debug log and Sentry). On by default for the M0.4 debugging round. */
+    var sendMessageText: Boolean
+        get() = sp.getBoolean("send_message_text", true)
+        set(v) { sp.edit().putBoolean("send_message_text", v).apply() }
+    /** Hidden Settings → "Debug: Sentry DSN": used only when the build has no DSN. Stored on the phone only. */
+    var sentryDsn: String
+        get() = sp.getString("sentry_dsn", "") ?: ""
+        set(v) { sp.edit().putString("sentry_dsn", v.trim()).apply() }
 }

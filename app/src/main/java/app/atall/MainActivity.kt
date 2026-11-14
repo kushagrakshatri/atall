@@ -149,6 +149,7 @@ class MainActivity : ComponentActivity() {
                         nameField = typed
                         g.prefs.userName = app.atall.core.UserName.normalize(typed)
                     },
+                    debug = debugUi(),
                 )
             }
             is Screen.AddAgent -> {
@@ -185,6 +186,41 @@ class MainActivity : ComponentActivity() {
             val text = remember { runCatching { assets.open("licenses/OFL-Geist.txt").bufferedReader().readText() }.getOrDefault("") }
             LicencesDialog(text) { licences = false }
         }
+    }
+
+    /** Settings → Debugging. State lives here so the switch and the DSN field update as you use them. */
+    @Composable
+    private fun debugUi(): app.atall.ui.DebugUi {
+        val g = graph
+        var sendText by remember { mutableStateOf(g.prefs.sendMessageText) }
+        var dsn by remember { mutableStateOf(g.prefs.sentryDsn) }
+        var copied by remember { mutableStateOf<String?>(null) }
+        var sentryOn by remember { mutableStateOf(g.telemetry.enabled) }
+        val dsnNote = when {
+            g.buildTimeDsn -> "This build has its own DSN; this field is ignored."
+            dsn.isBlank() -> "Paste a DSN to turn Sentry on. Stored on this phone only."
+            !SentryTelemetry.looksLikeDsn(dsn) -> "That doesn't look like a DSN (https://key@host/123)."
+            sentryOn -> "Sentry is on."
+            else -> "Saved. Sentry starts with it."
+        }
+        return app.atall.ui.DebugUi(
+            sendText = sendText,
+            onSendText = { v -> sendText = v; g.prefs.sendMessageText = v; g.debugLog.add("app", "setting", null, "send_message_text=$v") },
+            onCopyLog = {
+                val cm = getSystemService(android.content.ClipboardManager::class.java)
+                runCatching { cm?.setPrimaryClip(android.content.ClipData.newPlainText("Atall debug log", g.debugLogText())) }
+                copied = "Copied ${g.debugLog.entries().size} lines"
+            },
+            copiedNote = copied,
+            version = "${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})",
+            dsn = dsn,
+            onDsn = { typed ->
+                dsn = typed
+                g.prefs.sentryDsn = typed
+                if (!g.buildTimeDsn && SentryTelemetry.looksLikeDsn(typed)) sentryOn = g.startTelemetry()
+            },
+            dsnNote = dsnNote,
+        )
     }
 
     private fun startSafely(intent: Intent) {

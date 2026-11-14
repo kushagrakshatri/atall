@@ -85,8 +85,23 @@ class JunoBridge(
     private val autoDrive: Boolean = true,
     /** A talk ended with Juno's wrap-up (once per talk): the app's one notification for it. */
     private val onTalkDone: (runId: String, text: String) -> Unit = { _, _ -> },
+    /** The app's debug log ("Copy debug log"); every run step lands here. */
+    val log: DebugLog = DebugLog(null, clock),
+    private val telemetry: Telemetry = Telemetry.NONE,
+    /** A run is reported as stuck when nothing changed for this long while every reply is in. */
+    private val stuckAfterMs: Long = 60_000L,
 ) {
-    val juno = Juno({ roster() }, ::peerFor, SignedInLlm(llm), store, scores, clock, config, userName = userName)
+    val juno = Juno({ roster() }, ::peerFor, SignedInLlm(llm), store, scores, clock, config, userName = userName, trace = { runId, name, detail, text ->
+        log.add("juno", name, runId, detail, text)
+        when {
+            name == "model.error" -> telemetry.capture("Model call failed: ${detail.substringBefore(' ')}", Telemetry.Level.WARNING, runId, mapOf("detail" to Redact.text(detail)))
+            name == "run.phase" && (detail.endsWith("-> DONE") || detail.contains("-> FAILED")) ->
+                telemetry.capture("Run ${detail.substringAfter("-> ").substringBefore(' ')}", if (detail.contains("FAILED")) Telemetry.Level.WARNING else Telemetry.Level.INFO, runId, mapOf("transition" to detail))
+        }
+    })
+    /** runId -> (state version, when it was first seen at that version): the stuck check. */
+    private val lastSeen = ConcurrentHashMap<String, Pair<Long, Long>>()
+    private val stuckReported = ConcurrentHashMap.newKeySet<String>()
     private val projectLock = Mutex()
     private val liveRuns = ConcurrentHashMap.newKeySet<String>()
     private var jobs: List<Job> = emptyList()
@@ -97,15 +112,17 @@ class JunoBridge(
         jobs = listOf(
             scope.launch { juno.updates.collect { u ->
                 if (u is RunUpdate.TalkDone) runCatching { onTalkDone(u.runId, u.text) }
-                runIdOf(u)?.let { project(it) }
+                // A projection that throws must never end this collector (the thread would freeze for every later run).
+                runIdOf(u)?.let { projectSafely(it) }
             } },
             scope.launch {
-                for (id in safe { juno.recover() }.orEmpty()) { liveRuns += id; project(id); if (autoDrive) launch { drive(id) } }
+                for (id in safe { juno.recover() }.orEmpty()) { liveRuns += id; projectSafely(id); if (autoDrive) launch { drive(id) } }
                 while (isActive) {
                     delay(sweepEveryMs)
                     safe { juno.sweep() }
                     for (id in liveRuns.toList()) {
-                        project(id)
+                        projectSafely(id)
+                        checkStuck(id)
                         // A talk's round can end on the clock while nobody drives it (12-minute cap, deadlines).
                         val ph = safe { juno.state(id) }?.phase
                         if (autoDrive && (ph == Phase.PLANNING || ph == Phase.MERGING || ph == Phase.WAITING)) launch { drive(id) }
@@ -268,8 +285,40 @@ class JunoBridge(
     }
 
     suspend fun drive(runId: String) {
-        try { juno.drive(runId) } catch (e: CancellationException) { throw e } catch (_: Exception) { }
-        project(runId)
+        try { juno.drive(runId) } catch (e: CancellationException) { throw e } catch (e: Exception) {
+            log.add("bridge", "drive.error", runId, "${e.javaClass.simpleName}: ${e.message}")
+            telemetry.capture("Run drive failed: ${e.javaClass.simpleName}", Telemetry.Level.ERROR, runId, mapOf("message" to Redact.text(e.message ?: "")))
+        }
+        projectSafely(runId)
+    }
+
+    private suspend fun projectSafely(runId: String) {
+        try { project(runId) } catch (e: CancellationException) { throw e } catch (e: Exception) {
+            log.add("bridge", "project.error", runId, "${e.javaClass.simpleName}: ${e.message}")
+            telemetry.capture("Thread projection failed: ${e.javaClass.simpleName}", Telemetry.Level.ERROR, runId, mapOf("message" to Redact.text(e.message ?: "")))
+        }
+    }
+
+    /**
+     * A run is stuck when nothing changed for [stuckAfterMs] while every reply it waits on is in and it isn't waiting
+     * on the user. Reported once per run (log + telemetry event) with what it was doing.
+     */
+    suspend fun checkStuck(runId: String): Boolean {
+        val st = safe { juno.state(runId) } ?: return false
+        val now = clock()
+        val seen = lastSeen[runId]
+        if (seen == null || seen.first != st.version) { lastSeen[runId] = st.version to now; return false }
+        if (st.phase.terminal || st.phase == Phase.AWAITING_USER || runId in stuckReported) return false
+        val asks = st.asks.filter { it.agentId != Main.AUTHOR && it.status != AskStatus.CANCELLED && it.status != AskStatus.DECLINED }
+        val allIn = asks.isNotEmpty() && asks.all { it.replies.isNotEmpty() || it.status.settled }
+        if (!allIn || now - seen.second < stuckAfterMs) return false
+        stuckReported += runId
+        val talkStage = st.room?.stage
+        val detail = "phase=${st.phase} mode=${st.mode} for ${(now - seen.second) / 1000}s; asks=" + asks.joinToString { "${it.id.substringAfter('~')}:${it.status}:${it.replies.size}" } +
+            " pending=" + st.pending.joinToString { "${it.kind}:${if (it.output == null) "open" else "done"}" } + " map=${st.agreement?.status} talk=$talkStage"
+        log.add("bridge", "run.stuck", runId, detail)
+        telemetry.capture("Run stuck: no transition for ${stuckAfterMs / 1000}s with every reply in", Telemetry.Level.ERROR, runId, mapOf("state" to detail))
+        return true
     }
 
     // ------------------------------------------------------------------ agent side
@@ -401,10 +450,9 @@ class JunoBridge(
                 continue
             }
             if (a.agentId == Main.AUTHOR) {
-                // @all: Juno's own blind answer, shown like the others.
-                a.replies.firstOrNull()?.let { p ->
-                    put(ThreadMessage("blind:${a.id}", at(p.at), Main.AUTHOR, p.text, askId = a.id, detail = "My own answer"))
-                }
+                // @all: Juno's own blind answer is folded into the merged answer (and under "Show every answer"),
+                // never shown on its own. Lines an older build projected are hidden.
+                thread.get("blind:${a.id}")?.let { if (!it.hidden) thread.upsert(it.copy(hidden = true)) }
                 continue
             }
             val subId = "ask:${a.id}"
@@ -440,10 +488,16 @@ class JunoBridge(
             put(ThreadMessage(id, thread.get(id)?.at ?: at(null), Main.AUTHOR, map!!.verdict?.line ?: "Waiting for answers",
                 kind = MessageKind.AGREEMENT, detail = Json.encodeToString(AgreementMap.serializer(), map)))
         }
-        if (st.answer != null && (!mapShown || st.mode == RunMode.ROOM)) {
+        // The answer: Juno's merge (@all), its reply, or a talk's wrap-up. An @all from an older build stored only the
+        // map's verdict line as its answer; the map already shows that.
+        val oldStyleAll = st.mode == RunMode.ALL && st.answer == map?.verdict?.line
+        if (st.answer != null && !oldStyleAll) {
             val id = "answer:$runId"
             val room = st.room
-            put(ThreadMessage(id, thread.get(id)?.at ?: at(st.answeredAt), Main.AUTHOR, st.answer!!,
+            val prev = thread.get(id)
+            // A new answer (a talk's wrap-up replacing the merge, a re-merge) moves below what came before it.
+            val keepAt = prev != null && prev.text == st.answer
+            put(ThreadMessage(id, if (keepAt) prev!!.at else at(st.answeredAt), Main.AUTHOR, st.answer!!,
                 choices = room?.choices.orEmpty(), yourCall = room?.yourCall == true))
         }
         st.followUps.forEachIndexed { i, f ->

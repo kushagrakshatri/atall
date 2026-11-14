@@ -89,6 +89,8 @@ data class AgreementMap(
   val unique: List<ClaimCluster> = emptyList(),
   val verdict: Verdict? = null,
   val raw: List<RawAnswer> = emptyList(),
+  /** What each answer asked the user (agentId -> questions), so the merge can ask only what no agent knows. */
+  val asked: Map<String, List<String>> = emptyMap(),
 )
 
 // ------------------------------------------------------------------ claim extraction + clustering (pure)
@@ -96,16 +98,27 @@ data class AgreementMap(
 @Serializable
 data class Claim(val topic: String, val value: String, val statement: String, val evidence: String = "")
 
+/**
+ * One answer's claims, plus its main pick on the thing being decided ([pick], [pickKind]: e.g. "WHOOP upgrade" /
+ * "physical item" vs "dinner together" / "experience") and the questions it asked the user ([asks]).
+ */
 @Serializable
-data class AgentClaims(val agentId: String, val claims: List<Claim>)
+data class AgentClaims(val agentId: String, val claims: List<Claim>, val pick: String = "", val pickKind: String = "", val asks: List<String> = emptyList())
+
+/** The claims call's result: the one decision every answer is about, and each answer's claims. */
+data class ParsedClaims(val decision: String, val answers: List<AgentClaims>)
 
 object Agreement {
   /** Structured-output schema for the claims call. Answers are labelled A, B, C… (agent names hidden: less bias). */
   val claimsSchema: JsonObject = Schema.obj(
+    "decision" to Schema.string("The one thing the user is deciding, 2-6 words, lowercase (e.g. what gift to get her)"),
     "answers" to Schema.array(
       "One entry per answer, in the order given",
       Schema.obj(
         "label" to Schema.string("The answer's label, e.g. A"),
+        "pick" to Schema.string("Its main recommendation for the decision, 1-6 words"),
+        "pick_kind" to Schema.string("The kind of thing it recommends, 1-3 words, shared across answers when they recommend the same kind (e.g. physical item, experience, cash, nothing yet)"),
+        "asks_user" to Schema.stringArray("Each question it asks the user, as one short question, or empty"),
         "claims" to Schema.array(
           "Atomic claims in this answer",
           Schema.obj(
@@ -134,7 +147,10 @@ object Agreement {
   fun label(i: Int): String = if (i < 26) ('A' + i).toString() else "A$i"
 
   /** Parses the claims JSON into per-agent claims; [labels] maps "A" -> agentId. Null when unusable. */
-  fun parseClaims(raw: String, labels: Map<String, String>): List<AgentClaims>? {
+  fun parseClaims(raw: String, labels: Map<String, String>): List<AgentClaims>? = parse(raw, labels)?.answers
+
+  /** The claims JSON with its decision, picks and questions. Null when unusable (no claim and no pick at all). */
+  fun parse(raw: String, labels: Map<String, String>): ParsedClaims? {
     val o = parseJsonObject(raw) ?: return null
     val answers = o["answers"] as? JsonArray ?: return null
     val out = answers.mapNotNull { el ->
@@ -146,9 +162,45 @@ object Agreement {
         if (topic.isEmpty() || value.isEmpty()) null
         else Claim(topic, value, co.str("statement")?.trim()?.ifEmpty { null } ?: "$topic: $value", co.str("evidence")?.trim().orEmpty())
       }
-      AgentClaims(agent, claims)
+      AgentClaims(agent, claims, a.str("pick")?.trim().orEmpty(), a.str("pick_kind")?.trim().orEmpty(),
+        a.strings("asks_user").map { it.trim() }.filter { it.isNotEmpty() })
     }
-    return out.takeIf { it.isNotEmpty() && it.any { a -> a.claims.isNotEmpty() } }
+    if (out.isEmpty() || out.none { a -> a.claims.isNotEmpty() || a.pickKind.isNotEmpty() }) return null
+    return ParsedClaims(o.str("decision")?.trim().orEmpty(), out)
+  }
+
+  /**
+   * The disagreement in substance on the decision itself: answers whose picks are different KINDS of thing (specific
+   * products vs "an experience instead"). Topic wording can differ per answer and still never line up claim by claim;
+   * the pick kind always does. Null when fewer than two answers picked or they all picked the same kind.
+   */
+  fun pickDispute(decision: String, answers: List<AgentClaims>): Dispute? {
+    val picked = answers.filter { it.pickKind.isNotBlank() }
+    if (picked.size < 2) return null
+    val groups = mutableListOf<MutableList<AgentClaims>>()
+    for (a in picked) {
+      val g = groups.firstOrNull { g -> sameKind(g.first().pickKind, a.pickKind) }
+      if (g == null) groups += mutableListOf(a) else g += a
+    }
+    if (groups.size < 2) return null
+    val sides = groups.sortedByDescending { it.size }.map { g ->
+      DisputeSide(g.first().pickKind.lowercase(), g.joinToString("; ") { it.pick.ifBlank { it.pickKind } }, g.map { it.agentId })
+    }
+    val majority = if (sides[0].agentIds.size * 2 > picked.size) 0 else null
+    return Dispute("d-pick", decision.ifBlank { "what to pick" }.lowercase(), sides, majority)
+  }
+
+  private fun sameKind(a: String, b: String): Boolean = similarity(a, b) >= VALUE_MATCH ||
+    tokens(a).let { ta -> tokens(b).let { tb -> ta.isNotEmpty() && tb.isNotEmpty() && (ta.containsAll(tb) || tb.containsAll(ta)) } }
+
+  /**
+   * Claim clusters plus the pick dispute (first, so "Talk it over" and the automatic talk pick it). A topic-level
+   * dispute on the same decision is dropped in its favour.
+   */
+  fun clusterWithPicks(parsed: ParsedClaims): Clusters {
+    val c = cluster(parsed.answers)
+    val pd = pickDispute(parsed.decision, parsed.answers) ?: return c
+    return c.copy(disputed = listOf(pd) + c.disputed.filter { similarity(it.topic, pd.topic) < TOPIC_MATCH })
   }
 
   private val STOP = setOf("the", "a", "an", "is", "are", "was", "of", "to", "in", "on", "for", "and", "or", "it", "its", "be", "at", "by", "with", "your", "you")
