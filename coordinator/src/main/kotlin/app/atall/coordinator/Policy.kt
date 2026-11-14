@@ -74,6 +74,15 @@ object ApprovalGate {
     return Verdict(false, null)
   }
 
+  /** Every money/account action verb in [text]. */
+  fun actionVerbs(text: String): List<MatchResult> = ACTIONS.findAll(text).toList()
+
+  /** The clause before an action verb negates it ("don't book", "never pay"). */
+  fun negated(clauseBefore: String): Boolean {
+    val start = maxOf(clauseBefore.lastIndexOf('.'), clauseBefore.lastIndexOf('!'), clauseBefore.lastIndexOf('?'), clauseBefore.lastIndexOf('\n')) + 1
+    return NEGATION.containsMatchIn(clauseBefore.substring(start))
+  }
+
   /** True when the action verb starts its clause ("Book the 7:30", "please pay"), i.e. it is a command. */
   private fun imperativeAt(clauseBefore: String): Boolean =
     clauseBefore.trim().lowercase().let { it.isEmpty() || it == "please" || it.endsWith(" and") || it.endsWith(" then") || it.endsWith("go ahead and") }

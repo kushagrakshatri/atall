@@ -34,6 +34,21 @@ sealed class ScoreEvent {
 
   @Serializable @SerialName("direct_sent")
   data class DirectSent(override val agentId: String, override val at: Long, val via: String) : ScoreEvent()
+
+  /**
+   * Per-topic reliability (logged now, no scoreboard UI yet): how one agent did in one talk. [topic] is the disputed
+   * point (or the question). [first]/[final] are short positions; [wentAlong] = changed with no new reason.
+   */
+  @Serializable @SerialName("talk_position")
+  data class TalkPosition(
+    override val agentId: String, override val at: Long, val runId: String, val topic: String, val trigger: TalkTrigger,
+    val answeredFirst: Boolean, val spokeAfter: Boolean, val changed: Boolean, val wentAlong: Boolean,
+    val first: String, val final: String, val endReason: EndReason,
+  ) : ScoreEvent()
+
+  /** What the user picked after a talk (a choice under Juno's wrap-up): ground truth for the per-topic scores later. */
+  @Serializable @SerialName("talk_choice")
+  data class TalkChoice(override val agentId: String, override val at: Long, val runId: String, val topic: String, val choice: String) : ScoreEvent()
 }
 
 interface ScoreLog {

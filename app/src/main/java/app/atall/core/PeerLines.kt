@@ -93,4 +93,12 @@ object PeerLines {
 
     const val MISSED_PREFIX = "closed:"
     private const val SKEW_MS = 5_000L
+
+    /**
+     * Other agents an agent's line @mentions ("@Hark is that open Sundays?"): peer ids, for "Ask Hark about this?".
+     * An agent's @mention never sends anything by itself. Emails, Juno and the author itself don't count.
+     */
+    fun suggestions(text: String, authorId: String, agents: List<AgentProfile>): List<String> =
+        Mentions.find(text, Mentions.nameMap(agents)).map { it.target }
+            .filter { it != Main.AUTHOR && it != authorId && agents.any { a -> a.id == it && !a.paused } }.distinct()
 }

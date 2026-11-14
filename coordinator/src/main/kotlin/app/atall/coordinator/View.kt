@@ -1,5 +1,7 @@
 package app.atall.coordinator
 
+import kotlinx.serialization.Serializable
+
 /**
  * Everything the thread renders for one run, derived purely from [RunState] + roster + clock, so the UI can be
  * rebuilt after a crash from what's persisted (design.md §3.2). Copy follows design-system.md's fixed vocabulary.
@@ -19,6 +21,67 @@ data class RunView(
   val agreement: AgreementMap?,
   val error: String?,
   val errorKind: LlmException.Kind?,
+  /** A talk ("Talk it over"): its live rows and controls, then "Where they landed" and the rounds. */
+  val talk: TalkView? = null,
+)
+
+// ------------------------------------------------------------------ "Talk it over" (the UI never says "room")
+
+@Serializable
+enum class TalkRowState { WAITING, STILL_WAITING, REPLIED, NEEDS_TAP, NEEDS_OK, LEFT_OUT, DIDNT_REPLY }
+
+/** One agent in the live card: "Waiting on kDot", "Still waiting on kDot", a reply preview, "kDot needs a tap". */
+@Serializable
+data class TalkRow(val agentId: String, val name: String, val state: TalkRowState, val line: String)
+
+@Serializable
+data class TalkLine(val seq: Int, val kind: EntryKind, val agentId: String, val name: String, val text: String, val late: Boolean = false, val passed: Boolean = false)
+
+@Serializable
+data class TalkRoundView(val n: Int, val caption: String, val lines: List<TalkLine>, val time: String?)
+
+/** A row of "Where they landed": the struck-through first position only when it changed. */
+@Serializable
+data class LandedRow(val agentId: String, val name: String, val first: String?, val final: String, val tag: String?, val reason: String)
+
+@Serializable
+data class TalkAgent(val agentId: String, val name: String)
+
+/** "Ask Hark about this?": an agent @mentioned another; nothing is sent until the user taps (and then sends). */
+@Serializable
+data class AskSuggestion(val agentId: String, val name: String, val fromName: String, val quote: String)
+
+/** "What Juno sent": the exact text each agent got. */
+@Serializable
+data class SentRelay(val round: Int, val agentId: String, val name: String, val text: String)
+
+@Serializable
+data class TalkView(
+  val runId: String,
+  val live: Boolean,
+  /** "Hark and kDot are talking it over" / "Hark and kDot talked it over" / "… disagreed, so they talked it over". */
+  val label: String,
+  /** Live "1:41" (mono, ticking); done "1m 48s". */
+  val timer: String,
+  /** The open round has waited past the soft deadline: rows turn warning, Wrap up now and Leave X out show. */
+  val slow: Boolean,
+  /** The live card's caption: "First answers · on their own" / "Replies to each other" / "… · last round". */
+  val caption: String?,
+  val rows: List<TalkRow>,
+  val rounds: List<TalkRoundView>,
+  /** Shown only when someone changed position or they still disagree. */
+  val landed: List<LandedRow>,
+  val canStop: Boolean,
+  val canWrapUp: Boolean,
+  val leaveOut: List<TalkAgent>,
+  val suggestions: List<AskSuggestion>,
+  /** Up to two things the user can tap to say next; under "Your call" when [yourCall]. */
+  val choices: List<String>,
+  val yourCall: Boolean,
+  /** "wrapped up early" · "Stopped" · "Stopped after first answers". */
+  val endNote: String?,
+  val sent: List<SentRelay>,
+  val accessibility: String,
 )
 
 enum class StripPhase { LIVE, DONE, FAILED }
@@ -85,7 +148,7 @@ object Views {
       s.asks.forEach { a ->
         when (a.status) {
           AskStatus.NEEDS_TAP -> add(NeedsUserLine(NeedsUserKind.TAP_TO_SEND, "Tap to send to ${name(a.agentId)}", a.agentId, a.id, null, a.draftText ?: a.text))
-          AskStatus.AWAITING_APPROVAL -> add(NeedsUserLine(NeedsUserKind.APPROVE, "Okay to have ${name(a.agentId)} do this?", a.agentId, a.id, null, a.text))
+          AskStatus.AWAITING_APPROVAL -> add(NeedsUserLine(NeedsUserKind.APPROVE, approvalLine(a, name), a.agentId, a.id, null, a.text))
           AskStatus.LIKELY_MISSED -> add(NeedsUserLine(NeedsUserKind.LOOK_IN_MESSAGES, "${name(a.agentId)} may have answered in Messages", a.agentId, a.id, null))
           else -> {}
         }
@@ -95,7 +158,82 @@ object Views {
       }
     }
     val map = s.agreement ?: if (s.mode == RunMode.ALL) collecting(s, roster) else null
-    return RunView(s.runId, s.mode, s.phase, strip, s.answer, folded, needs, s.followUps, map, s.error, s.errorKind)
+    return RunView(s.runId, s.mode, s.phase, strip, s.answer, folded, needs, s.followUps, map, s.error, s.errorKind, talk(s, roster, now, config))
+  }
+
+  /** The talk's view, or null when the run isn't one. Copy follows ux.md §11 (no "room", "round 2 of 2", "debate"). */
+  fun talk(s: RunState, roster: Roster, now: Long, config: JunoConfig): TalkView? {
+    val r = s.room ?: return null
+    val name = roster::nameOf
+    val people = r.participants.filter { it != roster.main.id }
+    val live = !s.phase.terminal
+    val who = names(people.map(name))
+    val label = when {
+      live -> "$who ${if (people.size == 1) "is" else "are"} talking it over"
+      r.trigger == TalkTrigger.CLASH -> "$who disagreed, so they talked it over"
+      else -> "$who talked it over"
+    }
+    val end = if (live) now else (s.answeredAt ?: s.room.rounds.mapNotNull { it.closedAt }.maxOrNull() ?: now)
+    val elapsed = (end - r.startedAt).coerceAtLeast(0)
+    val round = r.currentRound
+    val roundAsks = round?.askIds?.mapNotNull { s.ask(it) }.orEmpty()
+    val openFor = round?.let { now - it.openedAt } ?: 0
+    val waiting = roundAsks.filter { !it.status.settled && it.status != AskStatus.AWAITING_APPROVAL && it.status != AskStatus.NEEDS_TAP }
+    val slow = live && r.stage == RoomStage.ROUND_OPEN && waiting.isNotEmpty() && openFor >= config.talk.slowAfterMs
+    val rows = if (!live || r.stage != RoomStage.ROUND_OPEN) emptyList() else roundAsks.map { a ->
+      val n = name(a.agentId)
+      when {
+        a.agentId in r.leftOut -> TalkRow(a.agentId, n, TalkRowState.LEFT_OUT, "Left out")
+        a.replies.isNotEmpty() -> TalkRow(a.agentId, n, TalkRowState.REPLIED, preview(a.replyText))
+        a.status == AskStatus.NEEDS_TAP -> TalkRow(a.agentId, n, TalkRowState.NEEDS_TAP, "$n needs a tap")
+        a.status == AskStatus.AWAITING_APPROVAL -> TalkRow(a.agentId, n, TalkRowState.NEEDS_OK, "Waiting for your OK")
+        a.status.settled -> TalkRow(a.agentId, n, TalkRowState.DIDNT_REPLY, "$n didn't reply")
+        slow -> TalkRow(a.agentId, n, TalkRowState.STILL_WAITING, "Still waiting on $n")
+        else -> TalkRow(a.agentId, n, TalkRowState.WAITING, "Waiting on $n")
+      }
+    }
+    val caption = when {
+      round == null || !live -> null
+      round.n == 0 -> "First answers · on their own"
+      round.n >= config.talk.maxRounds -> "Replies to each other · last round"
+      else -> "Replies to each other"
+    }
+    val rounds = r.entries.groupBy { if (it.round == 0) 0 else 1 }.toSortedMap().map { (k, es) ->
+      val rr = r.rounds.filter { if (k == 0) it.n == 0 else it.n >= 1 }
+      val t = rr.mapNotNull { x -> x.closedAt?.let { it - x.openedAt } }.sum().takeIf { it > 0 }?.let(::short)
+      TalkRoundView(k, if (k == 0) "First answers · on their own" else "Replies to each other",
+        es.map { e ->
+          val n = when (e.kind) { EntryKind.USER -> "You"; else -> name(e.authorId) }
+          val left = e.kind == EntryKind.AGENT && e.authorId in r.leftOut && e.round == 0
+          TalkLine(e.seq, e.kind, e.authorId, n, e.text, e.late, e.passed).let { if (left) it.copy(late = it.late) else it }
+        }, t)
+    }
+    val stillSplit = !live && s.agreement?.disputed.orEmpty().isNotEmpty()
+    val landed = if (live || (r.landed.none { it.changed } && !stillSplit)) emptyList() else r.landed.map { l ->
+      LandedRow(l.agentId, name(l.agentId), l.first.takeIf { l.changed && it.isNotBlank() && it != l.final }, l.final,
+        when { l.wentAlongWith != null -> "Went along with ${name(l.wentAlongWith)}"; l.changed -> "Changed its mind"; else -> null }, l.reason)
+    }
+    val leaveOut = if (slow) waiting.filter { it.agentId !in r.leftOut }.map { TalkAgent(it.agentId, name(it.agentId)) }.distinctBy { it.agentId } else emptyList()
+    val spokeAfter = r.entries.any { it.kind == EntryKind.AGENT && it.round >= 1 }
+    val endNote = when {
+      s.phase == Phase.CANCELLED || r.endReason == EndReason.USER_STOP -> if (spokeAfter) "Stopped" else "Stopped after first answers"
+      r.endReason == EndReason.WRAPPED_EARLY && !live -> "wrapped up early"
+      else -> null
+    }
+    val suggestions = if (live) emptyList() else r.suggestions.map { AskSuggestion(it.toAgent, name(it.toAgent), name(it.fromAgent), it.quote) }
+    val sent = s.asks.filter { it.purpose == AskPurpose.ROOM && it.status != AskStatus.CANCELLED }.map { SentRelay(it.roomRound ?: 0, it.agentId, name(it.agentId), it.text) }
+    val timer = if (live) clock(elapsed) else short(elapsed)
+    val a11y = if (live) "$label, ${spoken(elapsed)}." + (if (slow) " Still waiting on ${names(waiting.map { name(it.agentId) })}." else "")
+      else "${roster.main.name}: $label in ${spoken(elapsed)}." + landed.filter { it.first != null }.joinToString("") { " ${it.name} changed its mind, from ${it.first} to ${it.final}." } + " Double-tap to show the talk."
+    return TalkView(s.runId, live, label, timer, slow, caption, rows, rounds, landed, live, slow, leaveOut, suggestions,
+      if (live) emptyList() else r.choices, r.yourCall, endNote, sent, a11y)
+  }
+
+  /** The approval line: a talk relay holding a private agent's answer, a relay the send gate held, or Juno's ask. */
+  fun approvalLine(a: AskState, name: (String) -> String): String = when {
+    a.purpose == AskPurpose.ROOM && a.shareFrom.isNotEmpty() -> "Share ${names(a.shareFrom.map(name))}'s answer with ${name(a.agentId)}?"
+    a.purpose == AskPurpose.ROOM -> "Okay to pass this on to ${name(a.agentId)}?"
+    else -> "Okay to have ${name(a.agentId)} do this?"
   }
 
   /** @all participants: who answered (and how fast), who's still out, who didn't answer. */
@@ -149,6 +287,20 @@ object Views {
       StripPhase.DONE -> listOf(LabelPart("Asked ")) + nameParts(all)
       StripPhase.FAILED -> nameParts(failed) + LabelPart(" didn't answer")
     }
+    if (s.mode == RunMode.ROOM && s.room != null) {
+      val t = talk(s, roster, now, config)!!
+      val people = s.room.participants.filter { it != roster.main.id }
+      val parts = nameParts(people.map { StripAgent(it, roster.nameOf(it), AgentStatus.ASKING, null) })
+      val tail = when {
+        !runDone -> " ${if (people.size == 1) "is" else "are"} talking it over"
+        s.room.trigger == TalkTrigger.CLASH -> " disagreed, so they talked it over"
+        else -> " talked it over"
+      }
+      val tPhase = if (!runDone) StripPhase.LIVE else StripPhase.DONE
+      val tNotes = listOfNotNull(t.endNote) + if (runDone) failed.map { "${it.name} didn't answer" } else emptyList()
+      return DelegationStrip(tPhase, agents, parts + LabelPart(tail), t.timer, (if (runDone) (s.answeredAt ?: now) else now) - s.room.startedAt, t.slow,
+        if (t.slow) "Still waiting on " + names(t.rows.filter { it.state == TalkRowState.STILL_WAITING }.map { it.name }) else null, tNotes, lines, t.accessibility)
+    }
     val slow = phase == StripPhase.LIVE && elapsed > config.slowAfterMs
     val notes = if (phase == StripPhase.DONE) failed.map { if (it.status == AgentStatus.CHECK_MESSAGES) "${it.name} may have answered in Messages" else "${it.name} didn't answer" } else emptyList()
     val timer = if (phase == StripPhase.LIVE) clock(elapsed) else short(elapsed)
@@ -198,7 +350,7 @@ object Views {
 
   fun clock(ms: Long): String { val s = ms / 1000; return "${s / 60}:${(s % 60).toString().padStart(2, '0')}" }
   fun short(ms: Long): String { val s = ms / 1000; return if (s < 60) "${s}s" else "${s / 60}m ${s % 60}s" }
-  private fun spoken(ms: Long): String { val s = ms / 1000; return if (s < 60) "$s seconds" else "${s / 60} minutes ${s % 60} seconds" }
+  fun spoken(ms: Long): String { val s = ms / 1000; return if (s < 60) "$s seconds" else "${s / 60} minutes ${s % 60} seconds" }
 
   fun preview(text: String): String {
     val lines = text.trim().lines().filter { it.isNotBlank() }.take(2).joinToString("\n")

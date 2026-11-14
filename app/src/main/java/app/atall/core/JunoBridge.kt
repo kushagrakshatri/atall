@@ -34,6 +34,12 @@ import app.atall.coordinator.RunStore
 import app.atall.coordinator.RunUpdate
 import app.atall.coordinator.ScoreLog
 import app.atall.coordinator.StripPhase
+import app.atall.coordinator.RoomStage
+import app.atall.coordinator.ScoreEvent
+import app.atall.coordinator.SendGate
+import app.atall.coordinator.TalkTrigger
+import app.atall.coordinator.TalkView
+import app.atall.coordinator.Views
 import app.atall.coordinator.adapters.TextAgentPeer
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -70,12 +76,15 @@ class JunoBridge(
     llm: () -> Llm?,
     store: RunStore,
     private val scope: CoroutineScope,
-    scores: ScoreLog = InMemoryScoreLog(),
+    private val scores: ScoreLog = InMemoryScoreLog(),
     private val userName: () -> String = { "" },
     private val clock: () -> Long = System::currentTimeMillis,
-    config: JunoConfig = JunoConfig(),
+    // Juno starts a talk by itself when @all's first answers clash on the thing being decided (plan.md "Triggers").
+    config: JunoConfig = JunoConfig(autoTalk = true),
     /** Off in tests that step the run by hand. */
     private val autoDrive: Boolean = true,
+    /** A talk ended with Juno's wrap-up (once per talk): the app's one notification for it. */
+    private val onTalkDone: (runId: String, text: String) -> Unit = { _, _ -> },
 ) {
     val juno = Juno({ roster() }, ::peerFor, SignedInLlm(llm), store, scores, clock, config, userName = userName)
     private val projectLock = Mutex()
@@ -86,13 +95,21 @@ class JunoBridge(
     fun start(sweepEveryMs: Long = 30_000L) {
         if (jobs.isNotEmpty()) return
         jobs = listOf(
-            scope.launch { juno.updates.collect { u -> runIdOf(u)?.let { project(it) } } },
+            scope.launch { juno.updates.collect { u ->
+                if (u is RunUpdate.TalkDone) runCatching { onTalkDone(u.runId, u.text) }
+                runIdOf(u)?.let { project(it) }
+            } },
             scope.launch {
                 for (id in safe { juno.recover() }.orEmpty()) { liveRuns += id; project(id); if (autoDrive) launch { drive(id) } }
                 while (isActive) {
                     delay(sweepEveryMs)
                     safe { juno.sweep() }
-                    for (id in liveRuns.toList()) project(id)
+                    for (id in liveRuns.toList()) {
+                        project(id)
+                        // A talk's round can end on the clock while nobody drives it (12-minute cap, deadlines).
+                        val ph = safe { juno.state(id) }?.phase
+                        if (autoDrive && (ph == Phase.PLANNING || ph == Phase.MERGING || ph == Phase.WAITING)) launch { drive(id) }
+                    }
                 }
             },
         )
@@ -104,7 +121,7 @@ class JunoBridge(
 
     /** Juno plus every agent; paused or not-yet-reachable agents are in it, marked paused. */
     fun roster(): Roster = Roster(listOf(JunoAgent(Main.AUTHOR, Main.NAME, AgentKind.MAIN)) + registry.all().map { p ->
-        JunoAgent(p.id, p.name, AgentKind.TEXT, aliases = p.aliases, paused = p.paused || !p.channel.implemented)
+        JunoAgent(p.id, p.name, AgentKind.TEXT, aliases = p.aliases, paused = p.paused || !p.channel.implemented, sensitive = p.sharesPrivately)
     })
 
     /** Whether there is anyone to coordinate (otherwise the app's streaming plain chat answers). */
@@ -117,13 +134,20 @@ class JunoBridge(
         val inner = TextAgentPeer(agent, replyWindowMs = 30 * 60_000L, allowDraft = false)
         return object : Peer {
             override val id: String = id
-            override suspend fun send(text: String, correlationId: String): PeerSend = inner.send(pack(id, text, correlationId), correlationId)
+            override suspend fun send(text: String, correlationId: String): PeerSend {
+                val p = packed(id, text, correlationId)
+                // The send gate, at the transport: only the user's own words may carry buy / book / "go ahead".
+                if (SendGate.check(p.segments, userName()).gated) return PeerSend.Failed("needs_your_ok")
+                return inner.send(p.text, correlationId)
+            }
             override suspend fun close(correlationId: String) = inner.close(correlationId)
         }
     }
 
     /** The text that actually goes to agent [agentId] for ask [askId]: Juno's sub-task wrapped in compact context. */
-    suspend fun pack(agentId: String, need: String, askId: String): String {
+    suspend fun pack(agentId: String, need: String, askId: String): String = packed(agentId, need, askId).text
+
+    suspend fun packed(agentId: String, need: String, askId: String): ContextPack.Packed {
         val runId = PeerLines.runIdOf(askId)
         val st = safe { juno.state(runId) }
         val ask = st?.ask(askId)
@@ -131,6 +155,7 @@ class JunoBridge(
         val kind = when (ask?.purpose) {
             AskPurpose.BLIND -> ContextPack.Kind.BLIND
             AskPurpose.CHALLENGE -> ContextPack.Kind.CHALLENGE
+            AskPurpose.ROOM -> ContextPack.Kind.ROOM
             else -> ContextPack.Kind.DELEGATED
         }
         val others = st?.asks.orEmpty()
@@ -139,10 +164,11 @@ class JunoBridge(
         val chrono = thread.chronological()
         val request = chrono.firstOrNull { it.runId == runId && it.author == ThreadMessage.USER }
         val recent = if (request == null) emptyList() else Router.recentBefore(chrono, request)
-        return ContextPack.pack(ContextPack.Input(
+        return ContextPack.packed(ContextPack.Input(
             kind = kind, userName = userName(), recipientId = agentId, recipientName = r.nameOf(agentId),
             request = request?.text ?: st?.userText.orEmpty(), need = need, recent = recent,
-            names = registry.all().associate { it.id to it.name }, others = others,
+            names = registry.all().associate { it.id to it.name }, others = if (kind == ContextPack.Kind.ROOM) emptyList() else others,
+            approved = ask?.approved == true, quoted = ask?.quoted.orEmpty(),
         ))
     }
 
@@ -158,6 +184,7 @@ class JunoBridge(
         val r = roster()
         val runId = when (route) {
             is Route.All -> juno.startAll(route.text, r.activePeers)
+            is Route.Talk -> juno.startTalk(route.text, route.peerIds.mapNotNull { r.byId(it) }.filter { !it.paused }.ifEmpty { r.activePeers })
             is Route.ToMain -> juno.startCoordinated(
                 route.text,
                 mustAsk = route.mentionedPeers.mapNotNull { r.byId(it) }.filter { !it.paused },
@@ -178,7 +205,17 @@ class JunoBridge(
      */
     suspend fun takeFollowUp(msg: ThreadMessage): String? {
         val now = clock()
-        val candidates = liveRuns.mapNotNull { safe { juno.state(it) } }
+        val runs = liveRuns.mapNotNull { safe { juno.state(it) } }
+        // A talk that's still going: what the user writes joins it (every agent in it sees it next round).
+        runs.filter { it.mode == RunMode.ROOM && !it.phase.terminal && it.room?.stage != RoomStage.WRAPPING }
+            .maxByOrNull { it.createdAt }?.let { talk ->
+                juno.interject(talk.runId, msg.text)
+                thread.update(msg.id) { it.copy(runId = talk.runId, status = SendStatus.SENT, statusNote = null) }
+                project(talk.runId)
+                if (autoDrive) scope.launch { drive(talk.runId) }
+                return talk.runId
+            }
+        val candidates = runs
             .filter { it.mode == RunMode.COORDINATE && !it.phase.terminal && now - it.createdAt <= FOLLOW_UP_WINDOW_MS }
             .sortedByDescending { it.createdAt }
         val run = candidates.firstOrNull { s ->
@@ -210,6 +247,24 @@ class JunoBridge(
 
     suspend fun challenge(runId: String, disputeId: String) {
         if (juno.challenge(runId, disputeId)) { liveRuns += runId; project(runId); if (autoDrive) scope.launch { drive(runId) } }
+    }
+
+    /** "Talk it over" on a disagreement in the Agreement Map (what "Check this" used to do). */
+    suspend fun talkOver(runId: String, disputeId: String) {
+        if (juno.talkOver(runId, disputeId)) { liveRuns += runId; project(runId); if (autoDrive) scope.launch { drive(runId) } }
+    }
+
+    /** "Wrap up now" on a talk that's waiting on a slow agent. */
+    suspend fun wrapUp(runId: String) { if (juno.wrapUpNow(runId)) { project(runId); if (autoDrive) scope.launch { drive(runId) } } }
+
+    /** "Leave X out" on a talk. */
+    suspend fun leaveOut(runId: String, agentId: String) { if (juno.leaveOut(runId, agentId)) { project(runId); if (autoDrive) scope.launch { drive(runId) } } }
+
+    /** The user tapped one of Juno's choices after a talk: it goes out as their own message, and it's logged. */
+    suspend fun choiceTapped(runId: String, choice: String) {
+        val st = safe { juno.state(runId) } ?: return
+        val topic = st.room?.focusTopic ?: st.userText.take(80)
+        runCatching { scores.append(ScoreEvent.TalkChoice(Main.AUTHOR, clock(), runId, topic, choice)) }
     }
 
     suspend fun drive(runId: String) {
@@ -330,7 +385,21 @@ class JunoBridge(
                 detail = stripDetail(strip), streaming = strip?.phase == StripPhase.LIVE || (strip == null && !st.phase.terminal)))
         } else thread.get(headId)?.let { if (!it.hidden) thread.upsert(it.copy(hidden = true)) }
 
+        val talk = view.talk
+        if (talk != null) {
+            val id = "talk:$runId"
+            put(ThreadMessage(id, thread.get(id)?.at ?: at(st.room?.startedAt), Main.AUTHOR, talk.label, kind = MessageKind.TALK,
+                detail = Json.encodeToString(TalkView.serializer(), talk), streaming = talk.live))
+        }
         for (a in st.asks.sortedBy { it.createdAt }) {
+            if (talk != null) {
+                // A talk shows its rounds inside its card; lines an @all projected before it became a talk fold away.
+                for (old in listOf("ask:${a.id}", "blind:${a.id}") + a.replies.map { "in:${it.messageId}" }) {
+                    thread.get(old)?.let { if (!it.hidden) thread.upsert(it.copy(hidden = true)) }
+                }
+                if (a.agentId != Main.AUTHOR) projectNeeds(a, ::put, ::at)
+                continue
+            }
             if (a.agentId == Main.AUTHOR) {
                 // @all: Juno's own blind answer, shown like the others.
                 a.replies.firstOrNull()?.let { p ->
@@ -354,7 +423,8 @@ class JunoBridge(
             for (p in replies) {
                 val id = "in:${p.messageId}"
                 put(ThreadMessage(id, thread.get(id)?.at ?: at(p.at), a.agentId, p.text, attribution = Attribution.JUNO,
-                    askId = a.id, sourceId = p.messageId, detail = replyNote(p.certainty, p.late)))
+                    askId = a.id, sourceId = p.messageId, detail = replyNote(p.certainty, p.late),
+                    suggest = PeerLines.suggestions(p.text, a.agentId, registry.all())))
             }
         }
 
@@ -364,13 +434,17 @@ class JunoBridge(
         }
 
         val map = view.agreement
-        if (st.mode == RunMode.ALL && map != null) {
+        val mapShown = map != null && (st.mode == RunMode.ALL || (st.mode == RunMode.ROOM && st.room?.trigger != TalkTrigger.ASKED))
+        if (mapShown) {
             val id = "map:$runId"
-            put(ThreadMessage(id, thread.get(id)?.at ?: at(null), Main.AUTHOR, map.verdict?.line ?: "Waiting for answers",
+            put(ThreadMessage(id, thread.get(id)?.at ?: at(null), Main.AUTHOR, map!!.verdict?.line ?: "Waiting for answers",
                 kind = MessageKind.AGREEMENT, detail = Json.encodeToString(AgreementMap.serializer(), map)))
-        } else if (st.answer != null) {
+        }
+        if (st.answer != null && (!mapShown || st.mode == RunMode.ROOM)) {
             val id = "answer:$runId"
-            put(ThreadMessage(id, thread.get(id)?.at ?: at(st.answeredAt), Main.AUTHOR, st.answer!!))
+            val room = st.room
+            put(ThreadMessage(id, thread.get(id)?.at ?: at(st.answeredAt), Main.AUTHOR, st.answer!!,
+                choices = room?.choices.orEmpty(), yourCall = room?.yourCall == true))
         }
         st.followUps.forEachIndexed { i, f ->
             val id = "follow:$runId:$i"
@@ -414,7 +488,7 @@ class JunoBridge(
                 AskStatus.DECLINED -> SendStatus.NOT_SENT
                 else -> SendStatus.SENT
             }
-            put(ThreadMessage(okId, ok?.at ?: at(null), Main.AUTHOR, "Okay to have $name do this?", kind = MessageKind.NEEDS_APPROVAL,
+            put(ThreadMessage(okId, ok?.at ?: at(null), Main.AUTHOR, Views.approvalLine(a) { roster().nameOf(it) }, kind = MessageKind.NEEDS_APPROVAL,
                 peerId = a.agentId, askId = a.id, detail = a.text, status = status))
         }
 
@@ -439,6 +513,7 @@ class JunoBridge(
         is RunUpdate.NeedsUser -> u.runId
         is RunUpdate.MapUpdated -> u.runId
         is RunUpdate.Failed -> u.runId
+        is RunUpdate.TalkDone -> u.runId
         is RunUpdate.Unsolicited, is RunUpdate.DirectReply -> null
     }
 

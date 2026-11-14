@@ -66,10 +66,21 @@ fun insertMention(value: TextFieldValue, name: String): TextFieldValue {
     return TextFieldValue(text, TextRange(pos.coerceAtMost(text.length)))
 }
 
+/**
+ * The composer. [onSend] gets the text and whether the "Talk it over" chip is on. [prefill] (from "Ask Hark about
+ * this?") replaces the text once. [talkNames] ("Hark and kDot") is set while a talk is going: what's typed joins it.
+ */
 @Composable
-fun Composer(peers: List<PeerUi>, onSend: (String) -> Unit, onAddAgent: () -> Unit) {
+fun Composer(
+    peers: List<PeerUi>, onSend: (String, Boolean) -> Unit, onAddAgent: () -> Unit,
+    prefill: String? = null, onPrefillUsed: () -> Unit = {}, talkNames: String? = null,
+) {
     var value by remember { mutableStateOf(TextFieldValue("")) }
     var dismissedAt by remember { mutableStateOf(-1) }
+    var talkChip by remember { mutableStateOf(false) }
+    androidx.compose.runtime.LaunchedEffect(prefill) {
+        if (prefill != null) { value = TextFieldValue(prefill, TextRange(prefill.length)); onPrefillUsed() }
+    }
     val c = AppTheme.colors
     val profiles = remember(peers) { peers.map { AgentProfile(it.id, it.name) } }
     val names = remember(profiles) { Mentions.nameMap(profiles) }
@@ -77,6 +88,7 @@ fun Composer(peers: List<PeerUi>, onSend: (String) -> Unit, onAddAgent: () -> Un
     val route = Mentions.route(value.text, profiles)
     val addressed = (route as? Route.Direct)?.peerIds?.mapNotNull { id -> peers.firstOrNull { it.id == id }?.name }
         ?.takeIf { value.text.trimStart().startsWith("@") }
+    val talk = talkState(value.text, route, peers, talkChip)
 
     Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)) {
         if (token != null) {
@@ -88,8 +100,17 @@ fun Composer(peers: List<PeerUi>, onSend: (String) -> Unit, onAddAgent: () -> Un
             )
             Spacer(Modifier.size(8.dp))
         }
-        if (route is Route.All && token == null) {
+        if (talk.show && token == null) {
+            Row(Modifier.padding(start = 16.dp, bottom = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text(if (talk.on) "To everyone · they'll answer, then reply to each other" else "To everyone · each answers on its own, ${Main.NAME} compares",
+                    Modifier.weight(1f, fill = false), style = AppTheme.type.caption, color = c.ink3)
+                Spacer(Modifier.width(8.dp))
+                TalkChip(talk.on) { talkChip = !talk.on }
+            }
+        } else if (route is Route.All && token == null) {
             Text("To everyone · each answers on its own, ${Main.NAME} compares", Modifier.padding(start = 16.dp, bottom = 6.dp), style = AppTheme.type.caption, color = c.ink3)
+        } else if (talkNames != null && token == null && value.text.isNotBlank() && route is Route.ToMain && route.mentionedPeers.isEmpty()) {
+            Text("Joins the talk · $talkNames will see this", Modifier.padding(start = 16.dp, bottom = 6.dp), style = AppTheme.type.caption, color = c.ink3)
         }
         if (addressed != null && token == null) {
             Row(Modifier.padding(start = 16.dp, bottom = 6.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -130,12 +151,33 @@ fun Composer(peers: List<PeerUi>, onSend: (String) -> Unit, onAddAgent: () -> Un
                 val canSend = value.text.isNotBlank()
                 Box(
                     Modifier.size(44.dp).clip(CircleShape).background(if (canSend) c.ink else c.sunken)
-                        .clickable(enabled = canSend) { onSend(value.text); value = TextFieldValue("") },
+                        .clickable(enabled = canSend) { onSend(value.text, talk.on); value = TextFieldValue(""); talkChip = false },
                     contentAlignment = Alignment.Center,
                 ) { Icon(Glyph.Send, if (canSend) c.onInk else c.ink4, size = 20.dp) }
             }
         }
     }
+}
+
+/** Whether the "Talk it over" chip shows (with @all, or when the user writes "talk it over") and whether it's on. */
+data class TalkChipState(val show: Boolean, val on: Boolean)
+
+fun talkState(text: String, route: Route, peers: List<PeerUi>, chip: Boolean): TalkChipState {
+    val enough = peers.count { !it.paused && it.channel.implemented } >= 2
+    val words = Mentions.asksToTalk(text)
+    val show = enough && (route is Route.All || words)
+    return TalkChipState(show, show && (chip || words))
+}
+
+@Composable
+private fun TalkChip(on: Boolean, onToggle: () -> Unit) {
+    val c = AppTheme.colors
+    Text(
+        "Talk it over",
+        Modifier.clip(CircleShape).background(if (on) c.ink else c.surface).then(if (on) Modifier else Modifier.hairlineBorder(CircleShape))
+            .clickable(onClick = onToggle).padding(horizontal = 10.dp, vertical = 4.dp),
+        style = AppTheme.type.caption, color = if (on) c.onInk else c.ink,
+    )
 }
 
 /** Colors complete mentions in the field (same text, so offsets map 1:1). */
@@ -208,4 +250,4 @@ private fun PickerNoMatchPreview() = PreviewTheme {
 
 @Preview(name = "Composer", widthDp = 412)
 @Composable
-private fun ComposerPreview() = PreviewTheme { Composer(SamplePeers, {}, {}) }
+private fun ComposerPreview() = PreviewTheme { Composer(SamplePeers, { _, _ -> }, {}) }

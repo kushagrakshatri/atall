@@ -20,6 +20,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.put
 
 data class JunoConfig(
@@ -48,6 +49,10 @@ data class JunoConfig(
   /** Longest single sleep while waiting (re-checks deadlines at least this often). */
   val maxSleepMs: Long = 60_000,
   val maxContextLines: Int = 30,
+  /** "Talk it over": rounds, relay caps, the 12-minute limit, round waits. */
+  val talk: TalkLimits = TalkLimits(),
+  /** @all: when the first answers clash, Juno starts a talk on the first disagreement by itself (once per message). */
+  val autoTalk: Boolean = false,
 )
 
 /** A recent thread line given to Juno as context (author display name, text). */
@@ -61,6 +66,8 @@ sealed interface RunUpdate {
   data class NeedsUser(val runId: String, val line: NeedsUserLine) : RunUpdate
   data class MapUpdated(val runId: String, val map: AgreementMap) : RunUpdate
   data class Failed(val runId: String, val kind: LlmException.Kind?, val message: String) : RunUpdate
+  /** A talk ended with Juno's wrap-up. Emitted once per talk: the app's one notification for it. */
+  data class TalkDone(val runId: String, val text: String) : RunUpdate
   /** A peer message no ask claims (story 3): show it as a plain agent message. */
   data class Unsolicited(val agentId: String, val text: String, val at: Long) : RunUpdate
   /** A reply to a direct @mention: show it attributed, "replied directly". */
@@ -207,8 +214,8 @@ class Juno(
           Phase.DONE -> return DriveResult.Done(viewOf(s))
           Phase.FAILED, Phase.CANCELLED -> return DriveResult.Failed(viewOf(s))
           Phase.AWAITING_USER -> return DriveResult.WaitingOnUser(viewOf(s))
-          Phase.PLANNING -> { steps++; if (s.unprocessed.isNotEmpty()) processCalls(runId) else modelTurn(runId) }
-          Phase.MERGING -> { steps++; merge(runId) }
+          Phase.PLANNING -> { steps++; if (s.mode == RunMode.ROOM) roomPlan(runId) else if (s.unprocessed.isNotEmpty()) processCalls(runId) else modelTurn(runId) }
+          Phase.MERGING -> { steps++; if (s.mode == RunMode.ROOM) roomMerge(runId) else merge(runId) }
           Phase.WAITING -> {
             val mainAsk = s.asks.firstOrNull { it.agentId == roster.main.id && it.status == AskStatus.PENDING }
             if (mainAsk != null) { answerAsMain(runId, mainAsk); continue }
@@ -286,10 +293,22 @@ class Juno(
       val a = s.ask(askId)?.takeIf { it.status == AskStatus.AWAITING_APPROVAL } ?: return@withLock false
       if (approved) {
         // The user took a while: give the waits that include this ask a fresh window.
-        val until = clock() + config.maxWaitSeconds * 1000L
-        putL(s.replaceAsk(a.copy(status = AskStatus.SENDING)).copy(pending = s.pending.map {
-          if (it.kind == PendingKind.WAIT && askId in it.askIds && it.output == null) it.copy(until = maxOf(it.until ?: 0, until)) else it
-        }))
+        val until = clock() + (if (a.purpose == AskPurpose.ROOM) config.talk.roundWaitMs else config.maxWaitSeconds * 1000L)
+        val room = s.room?.let { r -> if (a.shareFrom.isEmpty()) r else r.copy(shared = (r.shared + a.shareFrom.map { "$it>${a.agentId}" }).distinct()) }
+        putL(recompute(s.replaceAsk(a.copy(status = AskStatus.SENDING, approved = true)).copy(room = room, pending = s.pending.map {
+          if ((it.kind == PendingKind.WAIT || it.kind == PendingKind.ROOM_ROUND) && askId in it.askIds && it.output == null) it.copy(until = maxOf(it.until ?: 0, until)) else it
+        })))
+      }
+      else if (a.purpose == AskPurpose.ROOM) {
+        // "Don't share" / "No": drop the private (or gated) part. What's left still goes, if anything is left and it
+        // passes the gate on its own.
+        val events = mutableListOf<ScoreEvent>()
+        val room = s.room?.let { r -> r.copy(notShared = (r.notShared + a.shareFrom.map { "$it>${a.agentId}" }).distinct()) }
+        val rest = a.textWithoutShared?.takeIf { a.shareFrom.isNotEmpty() && !SendGate.check(a.quotedWithoutShared.map { Segment(it, Provenance.PEER_RELAY) }, userNameNow()).gated }
+        val next = if (rest != null) a.copy(status = AskStatus.SENDING, text = rest, quoted = a.quotedWithoutShared, shareFrom = emptyList(), textWithoutShared = null, quotedWithoutShared = emptyList())
+          else settle(a, AskStatus.DECLINED, clock(), events)
+        putL(recompute(s.replaceAsk(next).copy(room = room)))
+        events.forEach { scores.append(it) }
       }
       else {
         val events = mutableListOf<ScoreEvent>()
@@ -300,6 +319,7 @@ class Juno(
       true
     }
     if (!ok) return false
+    if (mutex.withLock { getL(runId)?.mode } == RunMode.ROOM) { flushSends(runId); return true }
     if (approved) {
       flushSends(runId)
       mutex.withLock {
@@ -315,6 +335,7 @@ class Juno(
   suspend fun answer(runId: String, text: String) {
     mutex.withLock {
       val s = getL(runId) ?: return
+      if (s.mode == RunMode.ROOM) { roomSteerL(s, text); return }
       val q = s.pending.firstOrNull { it.kind == PendingKind.ASK_USER && it.output == null }
       if (q == null) { putL(s.copy(interjections = s.interjections + text)); return }
       val out = obj("answer" to JsonPrimitive(text)).toString()
@@ -331,7 +352,9 @@ class Juno(
       val s = getL(runId) ?: return
       val events = mutableListOf<ScoreEvent>()
       val open = s.asks.filter { !it.status.settled }
-      putL(s.copy(phase = if (s.phase.terminal) s.phase else Phase.CANCELLED, asks = s.asks.map { if (!it.status.settled) settle(it, AskStatus.CANCELLED, clock(), events) else it }))
+      val room = s.room?.takeIf { !s.phase.terminal }?.let { it.copy(stage = RoomStage.CLOSED, endReason = EndReason.USER_STOP) } ?: s.room
+      putL(s.copy(phase = if (s.phase.terminal) s.phase else Phase.CANCELLED, room = room, pending = if (s.phase.terminal) s.pending else emptyList(),
+        asks = s.asks.map { if (!it.status.settled) settle(it, AskStatus.CANCELLED, clock(), events) else it }))
       events.forEach { scores.append(it) }
       open.map { it.agentId to it.id }
     }
@@ -629,7 +652,21 @@ class Juno(
   // ============================================================== sends, sweeping, waking
 
   private suspend fun flushSends(runId: String) {
-    val toSend = mutex.withLock { getL(runId)?.asks?.filter { it.status == AskStatus.SENDING && it.agentId != roster.main.id }.orEmpty() }
+    val gated = mutableListOf<RunUpdate>()
+    val toSend = mutex.withLock {
+      val s = getL(runId) ?: return@withLock emptyList()
+      val sending = s.asks.filter { it.status == AskStatus.SENDING && it.agentId != roster.main.id }
+      // The send gate (backstop): only the user's own words may carry buy / book / "go ahead" to an agent.
+      val blocked = sending.filter { SendGate.check(segmentsOf(it), userNameNow()).gated }
+      if (blocked.isNotEmpty()) {
+        val events = mutableListOf<ScoreEvent>()
+        putL(blocked.fold(s) { acc, a -> acc.replaceAsk(settle(a.copy(failReason = "needs_your_ok"), AskStatus.FAILED, clock(), events)) })
+        events.forEach { scores.append(it) }
+        gated += RunUpdate.Changed(runId)
+      }
+      sending - blocked.toSet()
+    }
+    gated.forEach { _updates.tryEmit(it) }
     if (toSend.isEmpty()) return
     val results = coroutineScope {
       toSend.map { a ->
@@ -691,7 +728,8 @@ class Juno(
     var s = s0.copy(asks = asks)
     // Resolve waits whose asks are all settled, whose time is up, or that the user interrupted.
     val pend = s.pending.map { p ->
-      if (p.output != null || (p.kind != PendingKind.WAIT && p.kind != PendingKind.CHALLENGE_WAIT)) p
+      if (p.output == null && p.kind == PendingKind.ROOM_ROUND) roomRoundDone(s, p, now)?.let { p.copy(output = it) } ?: p
+      else if (p.output != null || (p.kind != PendingKind.WAIT && p.kind != PendingKind.CHALLENGE_WAIT)) p
       else {
         val all = p.askIds.mapNotNull { s.ask(it) }
         val done = all.all { it.status.settled } || (p.until != null && now >= p.until) || (s.mode == RunMode.COORDINATE && s.interjections.isNotEmpty())
@@ -712,9 +750,22 @@ class Juno(
       return when (s.mode) {
         RunMode.COORDINATE -> s.copy(transcript = s.transcript + s.pending.map { Items.functionCallOutput(it.callId, it.output!!) }, pending = emptyList(), phase = Phase.PLANNING)
         RunMode.ALL -> s.copy(pending = emptyList(), phase = Phase.MERGING)
+        RunMode.ROOM -> {
+          // Close the round now, with why (everyone in, its deadline, the user's words, a wrap-up, the 12 minutes).
+          val why = s.pending.firstOrNull { it.kind == PendingKind.ROOM_ROUND }?.output
+          val now = clock()
+          val room = s.room?.let { r -> r.copy(rounds = r.rounds.map { if (it.closedAt == null) it.copy(closedAt = now, closeReason = why) else it }) }
+          s.copy(pending = emptyList(), phase = Phase.MERGING, room = room)
+        }
       }
     }
     val open = s.pending.filter { it.output == null }
+    if (s.mode == RunMode.ROOM) {
+      // A round waits on the user only when everything else in it is in and a relay is held for their tap.
+      val held = open.flatMap { it.askIds }.mapNotNull { s.ask(it) }
+      val waitingOnUser = held.any { it.status == AskStatus.AWAITING_APPROVAL } && held.all { it.status.settled || it.status == AskStatus.AWAITING_APPROVAL }
+      return s.copy(phase = if (waitingOnUser) Phase.AWAITING_USER else Phase.WAITING)
+    }
     return s.copy(phase = if (open.any { it.kind == PendingKind.APPROVAL || it.kind == PendingKind.ASK_USER }) Phase.AWAITING_USER else Phase.WAITING)
   }
 
@@ -725,6 +776,7 @@ class Juno(
     val now = clock()
     val times = buildList {
       s.pending.filter { it.output == null }.mapNotNull { it.until }.forEach { add(it) }
+      s.room?.takeIf { it.stage == RoomStage.ROUND_OPEN }?.let { add(it.startedAt + config.talk.maxMs) }
       s.asks.forEach { a ->
         if (a.status == AskStatus.REPLYING) add(a.lastReplyAt + config.quietWindowMs)
         if (!a.status.settled) a.hardDeadline?.let { add(it) }
@@ -770,6 +822,11 @@ class Juno(
   private suspend fun lateWork(s: RunState) {
     val late = s.asks.filter { it.afterMerge && it.status == AskStatus.ANSWERED && !it.followedUp && it.replies.isNotEmpty() }
     if (late.isEmpty()) return
+    if (s.mode == RunMode.ROOM) {
+      // A talk is over once Juno wrapped up: a late reply stays in the talk's detail, with no new turn or notification.
+      mutex.withLock { getL(s.runId)?.let { cur -> putL(cur.copy(asks = cur.asks.map { a -> if (late.any { it.id == a.id }) a.copy(followedUp = true) else a })) } }
+      return
+    }
     if (s.mode == RunMode.ALL) {
       mutex.withLock { getL(s.runId)?.let { cur -> putL(cur.copy(asks = cur.asks.map { a -> if (late.any { it.id == a.id }) a.copy(followedUp = true) else a }, phase = Phase.MERGING)) } }
       merge(s.runId)
@@ -815,33 +872,39 @@ class Juno(
       putL(cur.copy(agreement = map, phase = Phase.DONE, answer = map.verdict?.line, answeredAt = cur.answeredAt ?: clock()))
     }
     _updates.tryEmit(RunUpdate.MapUpdated(runId, map))
+    if (challenged == null && config.autoTalk && s.mode == RunMode.ALL && s.room == null) {
+      map.disputed.firstOrNull()?.let { if (talkOver(runId, it.id, TalkTrigger.CLASH)) return }
+    }
     if (challenged == null && config.autoChallenge) map.disputed.firstOrNull()?.let { challenge(runId, it.id) }
   }
 
   private suspend fun compare(s: RunState): AgreementMap {
-    val blind = s.asks.filter { it.purpose == AskPurpose.BLIND }
-    val answers = blind.filter { it.replies.isNotEmpty() }
-    val raw = answers.map { RawAnswer(it.agentId, roster.nameOf(it.agentId), it.replyText, it.uncertain, it.late) }
+    val answers = s.asks.filter { it.purpose == AskPurpose.BLIND && it.replies.isNotEmpty() }
+    return compareAnswers(s, answers.map { RawAnswer(it.agentId, roster.nameOf(it.agentId), it.replyText, it.uncertain, it.late) }, verdictCall = true)
+  }
+
+  /** Claims → clusters → verdict over [raw] (the blind answers, or in a talk each agent's latest position). */
+  private suspend fun compareAnswers(s: RunState, raw: List<RawAnswer>, verdictCall: Boolean): AgreementMap {
     val base = AgreementMap(s.userText, MapStatus.READY, Views.participants(s, roster), raw = raw)
-    if (answers.size < 2) {
+    if (raw.size < 2) {
       return base.copy(verdict = Verdict(VerdictLevel.TOO_FEW, Agreement.fallbackLine(VerdictLevel.TOO_FEW, null, roster::nameOf), 0, 0, 0))
     }
-    val labels = answers.mapIndexed { i, a -> Agreement.label(i) to a.agentId }.toMap()
+    val labels = raw.mapIndexed { i, a -> Agreement.label(i) to a.agentId }.toMap()
     val input = buildString {
       append("Question: ").append(s.userText).append("\n")
-      answers.forEachIndexed { i, a -> append("\nAnswer ").append(Agreement.label(i)).append(":\n").append(a.replyText.trim()).append("\n") }
+      raw.forEachIndexed { i, a -> append("\nAnswer ").append(Agreement.label(i)).append(":\n").append(a.text.trim()).append("\n") }
     }
     val parsed = try {
       Agreement.parseClaims(llm.respond(LlmRequest("claims", Prompts.render("claims_extract"), listOf(Items.user(input)), jsonSchema = Agreement.claimsSchema, schemaName = "claims")).text, labels)
     } catch (e: CancellationException) { throw e } catch (_: Exception) { null }
     val clusters = parsed?.let { Agreement.cluster(it) }
-    return withVerdict(base.copy(agreed = clusters?.agreed.orEmpty(), disputed = clusters?.disputed.orEmpty(), unique = clusters?.unique.orEmpty()), answers.size, clusters == null)
+    return withVerdict(base.copy(agreed = clusters?.agreed.orEmpty(), disputed = clusters?.disputed.orEmpty(), unique = clusters?.unique.orEmpty()), raw.size, clusters == null, verdictCall)
   }
 
-  private suspend fun withVerdict(map: AgreementMap, answered: Int, unclear: Boolean): AgreementMap {
+  private suspend fun withVerdict(map: AgreementMap, answered: Int, unclear: Boolean, verdictCall: Boolean = true): AgreementMap {
     val c = if (unclear) null else Agreement.Clusters(map.agreed, map.disputed, map.unique)
     val level = Agreement.level(answered, c)
-    val line = if (c == null || level == VerdictLevel.TOO_FEW || level == VerdictLevel.UNCLEAR) Agreement.fallbackLine(level, c, roster::nameOf)
+    val line = if (!verdictCall || c == null || level == VerdictLevel.TOO_FEW || level == VerdictLevel.UNCLEAR) Agreement.fallbackLine(level, c, roster::nameOf)
     else try {
       llm.respond(LlmRequest("verdict", Prompts.render("verdict", mapOf("main" to roster.main.name)), listOf(Items.user(Agreement.describe(map.question, c, roster::nameOf))))).text.trim()
         .ifEmpty { Agreement.fallbackLine(level, c, roster::nameOf) }
@@ -906,6 +969,540 @@ class Juno(
     val answeredCount = s.asks.count { it.purpose == AskPurpose.BLIND && it.replies.isNotEmpty() }
     return withVerdict(map.copy(agreed = agreed, disputed = disputed), answeredCount, false)
   }
+
+  // ============================================================== "Talk it over" (room mode)
+
+  /**
+   * "Talk it over": [question] to every agent in [agents], blind (round 0, exactly like @all but without Juno's own
+   * answer: Juno moderates). Then up to [TalkLimits.maxRounds] reveal rounds, then Juno's wrap-up. Returns the run id.
+   */
+  suspend fun startTalk(question: String, agents: List<AgentProfile> = roster.activePeers): String {
+    val now = clock()
+    val runId = "r" + newId()
+    mutex.withLock {
+      val busy = busyAgentsL()
+      val who = agents.filter { it.kind != AgentKind.MAIN && !it.paused }.distinctBy { it.id }
+      val asks = who.mapIndexed { n, p ->
+        val st = if (p.kind == AgentKind.TEXT && p.id in busy) AskStatus.QUEUED else AskStatus.SENDING
+        AskState("$runId~a$n", p.id, question, AskPurpose.BLIND, status = st, createdAt = now, roomRound = 0)
+      }
+      val until = now + config.allWaitMs
+      val room = RoomState(RoomStage.ROUND_OPEN, TalkTrigger.ASKED, question, who.map { it.id }, startedAt = now,
+        rounds = listOf(RoomRound(0, who.map { it.id }, asks.map { it.id }, now, until)))
+      val wait = PendingCall("room-r0", PendingKind.ROOM_ROUND, asks.map { it.id }, until = until, startedAt = now)
+      putL(RunState(runId, RunMode.ROOM, question, emptyList(), now, Phase.WAITING, asks = asks, pending = listOf(wait), room = room))
+    }
+    return runId
+  }
+
+  /**
+   * "Talk it over" on one disagreement of a finished @all (what "Check this" used to be), or Juno starting one itself
+   * when the first answers clash ([TalkTrigger.CLASH]). The blind answers become round 0; the reveal round goes to the
+   * agents on each side. Once per message. Then [drive].
+   */
+  suspend fun talkOver(runId: String, disputeId: String, trigger: TalkTrigger = TalkTrigger.CHECK_THIS): Boolean = mutex.withLock {
+    val s = getL(runId) ?: return@withLock false
+    val map = s.agreement ?: return@withLock false
+    if (s.mode != RunMode.ALL || s.room != null || s.phase != Phase.DONE) return@withLock false
+    val d = map.disputed.firstOrNull { it.id == disputeId && it.challenge == ChallengeState.NONE } ?: return@withLock false
+    val now = clock()
+    val participants = s.asks.filter { it.purpose == AskPurpose.BLIND && it.agentId != roster.main.id }.map { it.agentId }.distinct()
+    var room = RoomState(RoomStage.MODERATING, trigger, s.userText, participants, focusTopic = d.topic, focusDisputeId = d.id, startedAt = now)
+    room = appendEntriesL(s, room, now, closingRound = 0).first
+    room = room.copy(rounds = listOf(RoomRound(0, participants, s.asks.filter { it.purpose == AskPurpose.BLIND }.map { it.id }, s.createdAt, s.createdAt, s.answeredAt ?: now, "all_in")))
+    val m2 = map.copy(status = MapStatus.CHALLENGING, disputed = map.disputed.map { it.copy(challenge = ChallengeState.ASKED) })
+    putL(s.copy(mode = RunMode.ROOM, phase = Phase.PLANNING, room = room, agreement = m2, answer = null, answeredAt = null, pending = emptyList(), unprocessed = emptyList()))
+    true
+  }
+
+  /** "Wrap up now": close the open round and let Juno answer with what's in. Then [drive]. */
+  suspend fun wrapUpNow(runId: String): Boolean = mutex.withLock {
+    val s = getL(runId) ?: return@withLock false
+    val r = s.room ?: return@withLock false
+    if (s.phase.terminal || r.stage == RoomStage.WRAPPING || r.stage == RoomStage.CLOSED) return@withLock false
+    putL(recompute(s.copy(room = r.copy(wrapRequested = true), pending = s.pending.map { if (it.kind == PendingKind.ROOM_ROUND && it.output == null) it.copy(output = "wrap") else it })))
+    true
+  }
+
+  /** "Leave X out": no more relays to [agentId]; its open turn in the talk is dropped. Its first answer still counts. */
+  suspend fun leaveOut(runId: String, agentId: String): Boolean {
+    val closes = mutex.withLock {
+      val s = getL(runId) ?: return@withLock null
+      val r = s.room ?: return@withLock null
+      if (s.phase.terminal || agentId !in r.participants || agentId in r.leftOut) return@withLock null
+      val events = mutableListOf<ScoreEvent>()
+      val open = s.asks.filter { it.agentId == agentId && !it.status.settled && (it.purpose == AskPurpose.ROOM || it.purpose == AskPurpose.BLIND) }
+      var next = s.copy(room = r.copy(leftOut = r.leftOut + agentId), asks = s.asks.map { a -> if (a in open) settle(a, AskStatus.CANCELLED, clock(), events) else a })
+      next = next.copy(pending = next.pending.map { p -> if (p.kind == PendingKind.ROOM_ROUND && p.output == null) roomRoundDone(next, p, clock())?.let { p.copy(output = it) } ?: p else p })
+      putL(recompute(next))
+      events.forEach { scores.append(it) }
+      open.map { it.agentId to it.id }
+    } ?: return false
+    closePeers(closes)
+    return true
+  }
+
+  /** Whether a talk round is over, and why: everyone in, the round's deadline, a wrap-up, or the talk's 12 minutes. */
+  private fun roomRoundDone(s: RunState, p: PendingCall, now: Long): String? {
+    val room = s.room ?: return "done"
+    val asks = p.askIds.mapNotNull { s.ask(it) }
+    if (room.wrapRequested) return "wrap"
+    if (now >= room.startedAt + config.talk.maxMs) return "wall_clock"
+    if (asks.all { it.status.settled }) return "all_in"
+    // A relay held for the user's tap pauses the round's clock; an agent mid-reply gets its quiet window.
+    if (p.until != null && now >= p.until && asks.none { it.status == AskStatus.AWAITING_APPROVAL || it.status == AskStatus.REPLYING }) return "deadline"
+    return null
+  }
+
+  /** The user wrote while a talk is open: their words join it (relayed to everyone next round) and end the round early. */
+  private suspend fun roomSteerL(s: RunState, text: String) {
+    val r = s.room ?: return
+    if (s.phase.terminal || r.stage == RoomStage.WRAPPING || r.stage == RoomStage.CLOSED) { putL(s.copy(interjections = s.interjections + text)); return }
+    val entry = RoomEntry(r.nextSeq, (r.currentRound?.n ?: 0), EntryKind.USER, "user", text.trim(), at = clock())
+    putL(recompute(s.copy(room = r.copy(entries = r.entries + entry), pending = s.pending.map { if (it.kind == PendingKind.ROOM_ROUND && it.output == null) it.copy(output = "user") else it })))
+  }
+
+  /**
+   * Settled answers become entries (with their @mentions resolved), and agents get their anonymous labels. Returns the
+   * room and the ids of asks that now have entries.
+   */
+  private fun appendEntriesL(s: RunState, room0: RoomState, now: Long, closingRound: Int): Pair<RoomState, List<String>> {
+    var room = room0
+    val added = mutableListOf<String>()
+    val talkAsks = s.asks.filter { (it.purpose == AskPurpose.BLIND || it.purpose == AskPurpose.ROOM) && it.replies.isNotEmpty() && it.status.settled }
+      .sortedBy { a -> a.replies.firstOrNull()?.at ?: a.createdAt }
+    for (a in talkAsks) {
+      val covered = room.entries.filter { it.askId == a.id }.maxOfOrNull { it.parts } ?: 0
+      val parts = a.replies
+      if (parts.size <= covered) continue
+      val text = parts.drop(covered).joinToString("\n") { it.text }.trim()
+      if (text.isEmpty()) continue
+      val round = a.roomRound ?: 0
+      val mentions = if (a.agentId == roster.main.id) emptyList() else Relay.mentions(text, a.agentId, roster)
+      val e = RoomEntry(room.nextSeq, round, EntryKind.AGENT, a.agentId, text, a.id, parts.size, mentions, Relay.isPass(text),
+        late = covered > 0 || round < closingRound, at = parts.last().at)
+      var labels = room.labels
+      if (a.agentId !in labels) labels = labels + (a.agentId to Agreement.label(labels.size))
+      var pending = room.pendingMentions
+      var sugg = room.suggestions
+      for (m in mentions) {
+        val targets = if (m == "all") room.participants.filter { it != a.agentId } else listOf(m)
+        for (t in targets) {
+          if (t in room.participants && t != a.agentId) pending = pending + (t to (pending[t].orEmpty() + e.seq))
+          else if (m != "all" && roster.byId(t)?.let { !it.paused && it.kind != AgentKind.MAIN } == true && sugg.none { it.toAgent == t && it.fromAgent == a.agentId })
+            sugg = sugg + Suggestion(a.agentId, t, e.seq, Relay.quoteFor(text, roster.nameOf(t)))
+        }
+      }
+      room = room.copy(entries = room.entries + e, labels = labels, pendingMentions = pending, suggestions = sugg)
+      added += a.id
+    }
+    return room to added
+  }
+
+  /** The last relay each agent was sent covers every entry up to this seq. Derived, never stored (engine.md §1). */
+  private fun cursorOf(s: RunState, agentId: String): Int = s.asks
+    .filter { it.agentId == agentId && it.purpose == AskPurpose.ROOM && it.relayThrough != null && it.status !in setOf(AskStatus.FAILED, AskStatus.DECLINED, AskStatus.CANCELLED) }
+    .maxOfOrNull { it.relayThrough!! } ?: -1
+
+  /** Mentions of [agentId] its relays haven't carried yet. */
+  private fun unconsumedMentions(s: RunState, room: RoomState, agentId: String): List<Int> {
+    val c = cursorOf(s, agentId)
+    return room.pendingMentions[agentId].orEmpty().filter { it > c }
+  }
+
+  /** The user's words (said mid-talk) that [agentId]'s relays haven't carried yet. */
+  private fun unrelayedUser(s: RunState, room: RoomState, agentId: String): List<Int> {
+    val c = cursorOf(s, agentId)
+    return room.entries.filter { it.kind == EntryKind.USER && it.seq > c }.map { it.seq }
+  }
+
+  /** The latest position of each agent (its newest non-pass entry), for comparing. */
+  private fun latestPositions(room: RoomState): List<RoomEntry> = room.entries.filter { it.kind == EntryKind.AGENT }
+    .groupBy { it.authorId }.mapNotNull { (_, es) -> es.lastOrNull { !it.passed } ?: es.lastOrNull() }
+
+  /** A round closed (or the user steered, or asked to wrap up): record entries, re-compare, pick what's next. */
+  private suspend fun roomMerge(runId: String) {
+    // Step 1 (persisted): entries and the closed round.
+    val s1 = mutex.withLock {
+      val s = getL(runId) ?: return
+      val r = s.room ?: return
+      val now = clock()
+      val n = r.currentRound?.n ?: 0
+      var (room, _) = appendEntriesL(s, r, now, n)
+      room = room.copy(rounds = room.rounds.map { if (it.n == n && it.closedAt == null) it.copy(closedAt = now, closeReason = if (r.wrapRequested) "wrap" else "all_in") else it })
+      val next = s.copy(room = room, pending = emptyList())
+      putL(next)
+      next
+    }
+    // Step 2: compare the latest positions (the Agreement Map updates every round).
+    val room = s1.room!!
+    val latest = latestPositions(room)
+    val map = if (latest.size >= 2) compareAnswers(s1, latest.map { RawAnswer(it.authorId, roster.nameOf(it.authorId), it.text) }, verdictCall = false) else s1.agreement
+    // Step 3 (persisted): what's next.
+    mutex.withLock {
+      val cur = getL(runId) ?: return
+      val r = cur.room ?: return
+      if (cur.phase.terminal) return
+      val withMap = cur.copy(agreement = map?.let { m -> m.copy(status = MapStatus.CHALLENGING, disputed = m.disputed.map { it.copy(challenge = ChallengeState.ASKED) }) } ?: cur.agreement)
+      val n = r.currentRound?.n ?: 0
+      val end = roomEndReason(withMap, r, n)
+      val nextRoom = if (end != null) r.copy(stage = RoomStage.WRAPPING, endReason = end) else r.copy(stage = RoomStage.MODERATING)
+      putL(withMap.copy(room = nextRoom, phase = Phase.PLANNING))
+    }
+    map?.let { _updates.tryEmit(RunUpdate.MapUpdated(runId, it)) }
+  }
+
+  /** Why the talk ends after round [n], or null to go on (engine.md §5, in order). */
+  private fun roomEndReason(s: RunState, r: RoomState, n: Int): EndReason? {
+    val now = clock()
+    if (r.wrapRequested) return EndReason.WRAPPED_EARLY
+    if (now >= r.startedAt + config.talk.maxMs) return EndReason.WALL_CLOCK
+    val answered = r.entries.filter { it.kind == EntryKind.AGENT }.map { it.authorId }.distinct()
+    if (answered.size < 2) return EndReason.TOO_FEW
+    if (n >= config.talk.maxRounds) return EndReason.ROUND_CAP
+    if (s.asks.count { it.purpose == AskPurpose.ROOM } >= config.talk.maxRelays) return EndReason.RELAY_CAP
+    // The user said something mid-talk that hasn't reached everyone: it goes out before the talk can end by itself.
+    val steer = r.participants.any { r.eligible(it) && unrelayedUser(s, r, it).isNotEmpty() }
+    if (n >= 1 && !steer) {
+      val thisRound = r.entries.filter { it.kind == EntryKind.AGENT && it.round == n }
+      if (thisRound.isEmpty() || thisRound.all { it.passed }) return EndReason.SILENCE
+      val mentions = r.participants.filter { r.eligible(it) }.any { unconsumedMentions(s, r, it).isNotEmpty() }
+      if (s.agreement?.disputed.isNullOrEmpty() && !mentions) return EndReason.CONSENSUS
+    }
+    if (defaultFloor(s, r, n + 1).isEmpty()) return if (n == 0) EndReason.TOO_FEW else EndReason.CONSENSUS
+    return null
+  }
+
+  /** Can [agentId] be relayed to now? In the talk, not left out, reachable, nothing open in this talk, under its cap. */
+  private fun canSpeak(s: RunState, r: RoomState, agentId: String): Boolean {
+    val p = roster.byId(agentId) ?: return false
+    // An agent still thinking isn't re-asked, except to pass on the user's own words (queued behind its open turn).
+    val open = s.asks.filter { it.agentId == agentId && !it.status.settled }
+    val steerOk = open.isNotEmpty() && unrelayedUser(s, r, agentId).isNotEmpty() && open.none { it.purpose == AskPurpose.ROOM && it.roomRound == (r.currentRound?.n ?: 0) + 1 }
+    return r.eligible(agentId) && !p.paused && p.kind != AgentKind.MAIN && peerFor(agentId) != null &&
+      (open.isEmpty() || steerOk) &&
+      s.asks.count { it.agentId == agentId && it.purpose == AskPurpose.ROOM } < config.talk.maxPerAgent
+  }
+
+  /**
+   * Who speaks in round [n] by default (engine.md §3): round 1 = everyone who answered (only the two sides of the
+   * disagreement for "Talk it over" on one point); round 2 = agents an agent @mentioned, then agents on either side of
+   * a disagreement that's still open. Capped by the relays left.
+   */
+  private fun defaultFloor(s: RunState, r: RoomState, n: Int): List<String> {
+    val answered = r.entries.filter { it.kind == EntryKind.AGENT && it.authorId != roster.main.id }.map { it.authorId }.distinct()
+    val mentioned = r.participants.filter { unconsumedMentions(s, r, it).isNotEmpty() }
+    val sides = s.agreement?.disputed.orEmpty().flatMap { d -> d.sides.flatMap { it.agentIds } }.filter { it != roster.main.id }
+    val focus = s.agreement?.disputed?.firstOrNull { it.id == r.focusDisputeId }?.sides?.flatMap { it.agentIds }
+    val raw = when {
+      n <= 1 && r.trigger != TalkTrigger.ASKED && focus != null -> mentioned + focus.filter { it in answered }
+      n <= 1 -> answered
+      else -> mentioned + sides
+    } + r.participants.filter { unrelayedUser(s, r, it).isNotEmpty() && it in answered }
+    val left = config.talk.maxRelays - s.asks.count { it.purpose == AskPurpose.ROOM }
+    return raw.distinct().filter { canSpeak(s, r, it) }.take(left.coerceAtLeast(0))
+  }
+
+  /** Between rounds: Juno moderates (one model call), or wraps up. */
+  private suspend fun roomPlan(runId: String) {
+    val s = mutex.withLock { getL(runId) } ?: return
+    val r = s.room ?: return
+    when (r.stage) {
+      RoomStage.WRAPPING -> { wrapUp(runId); return }
+      RoomStage.MODERATING -> {}
+      else -> { mutex.withLock { getL(runId)?.let { putL(recompute(it.copy(phase = Phase.WAITING))) } }; return }
+    }
+    if (s.unprocessed.isNotEmpty()) { processRoomCalls(runId); return }
+    val n = (r.currentRound?.n ?: 0) + 1
+    val floor = defaultFloor(s, r, n)
+    val calls = try {
+      if (s.modelCalls >= config.maxModelCalls) null
+      else llm.respond(LlmRequest("room", Prompts.render("room_moderator", mapOf("main" to roster.main.name, "userLine" to Prompts.userLine(userNameNow()))),
+        listOf(Items.user(moderatorBrief(s, r, n, floor))), roomTools(r))).toolCalls.takeIf { it.isNotEmpty() }
+    } catch (e: CancellationException) { throw e } catch (_: Exception) { null }
+    // The model failed or said nothing useful: the deterministic floor, as if Juno had opened it.
+    val records = calls?.map { CallRecord(it.callId, it.name, it.arguments) }
+      ?: listOf(CallRecord("auto-r$n", "open_floor", buildJsonObject { put("agents", buildJsonArray { floor.forEach { add(JsonPrimitive(roster.nameOf(it))) } }) }.toString()))
+    mutex.withLock {
+      val cur = getL(runId) ?: return
+      putL(cur.copy(unprocessed = records, modelCalls = cur.modelCalls + if (calls != null) 1 else 0))
+    }
+    processRoomCalls(runId)
+  }
+
+  private fun roomTools(r: RoomState): List<ToolSpec> {
+    val names = r.participants.filter { r.eligible(it) }.map { roster.nameOf(it) }
+    return listOf(
+      ToolSpec("open_floor", "Start the next round: each listed agent gets one text with what it hasn't seen yet.",
+        Schema.obj("agents" to Schema.stringArray("Who speaks next (from: ${names.joinToString()})"), "note" to Schema.string("Optional, one line: what to focus on. Never paraphrase an agent's answer."))),
+      ToolSpec("relay", "Send one agent only the listed entries (it counts as its turn this round).",
+        Schema.obj("to" to Schema.string("Which agent", names.ifEmpty { null }), "seqs" to Schema.stringArray("Entry numbers to send"), "note" to Schema.string("Optional, one line"))),
+      ToolSpec("say", "Add one short moderator line that the next round carries to everyone. At most once per round.",
+        Schema.obj("text" to Schema.string("One line, no instructions to book, buy or act"))),
+      ToolSpec("close_room", "End the talk now and answer the user.", Schema.obj("reply" to Schema.string("Your answer to the user: the answer first, at most two sentences"))),
+    )
+  }
+
+  private fun moderatorBrief(s: RunState, r: RoomState, n: Int, floor: List<String>): String = buildString {
+    append("Question: ").append(r.question).append("\n")
+    r.focusTopic?.let { append("The talk is about this disagreement: ").append(it).append("\n") }
+    append("Round ").append(n - 1).append(" just closed. Next would be round ").append(n).append(" of at most ").append(config.talk.maxRounds).append(".\n\n")
+    append("Entries so far (number, who, round):\n")
+    r.entries.forEach { e ->
+      val who = when (e.kind) { EntryKind.USER -> userNameNow().ifBlank { "The user" } + " (the user)"; EntryKind.JUNO -> roster.main.name; EntryKind.AGENT -> roster.nameOf(e.authorId) }
+      append("[").append(e.seq).append("] ").append(who).append(" (round ").append(e.round).append(if (e.late) ", late" else "").append("): ")
+        .append(Relay.trim(e.text.replace(Regex("\\s+"), " "), 500)).append("\n")
+    }
+    val d = s.agreement?.disputed.orEmpty()
+    if (d.isNotEmpty()) {
+      append("\nStill disagree on:\n")
+      d.forEach { x -> append("- ").append(x.topic).append(": ").append(x.sides.joinToString(" vs ") { side -> "${side.value} (${side.agentIds.joinToString { roster.nameOf(it) }})" }).append("\n") }
+    } else append("\nNo open disagreement on the compared points.\n")
+    val waiting = r.participants.mapNotNull { a -> unconsumedMentions(s, r, a).takeIf { it.isNotEmpty() }?.let { "${roster.nameOf(a)} (entries ${it.joinToString()})" } }
+    if (waiting.isNotEmpty()) append("Mentioned and not yet told: ").append(waiting.joinToString("; ")).append("\n")
+    append("Default next speakers: ").append(floor.joinToString { roster.nameOf(it) }.ifEmpty { "nobody" }).append("\n")
+    append("Relays left in this talk: ").append(config.talk.maxRelays - s.asks.count { it.purpose == AskPurpose.ROOM }).append("\n")
+  }
+
+  /** Turns the moderator's calls (or the default floor) into relays. Re-running it after a crash reuses asks by call id. */
+  private suspend fun processRoomCalls(runId: String) {
+    val notes = mutableListOf<RunUpdate>()
+    val events = mutableListOf<ScoreEvent>()
+    mutex.withLock {
+      val s = getL(runId) ?: return
+      var r = s.room ?: return
+      val now = clock()
+      val n = (r.currentRound?.n ?: 0) + 1
+      val calls = s.unprocessed
+      val floorDefault = defaultFloor(s, r, n)
+      var floor: List<String>? = null
+      var note: String? = null
+      val targeted = mutableMapOf<String, Pair<Set<Int>, String?>>()
+      var closeReply: String? = null
+      for (c in calls) {
+        val a = parseJsonObject(c.arguments) ?: continue
+        when (c.name) {
+          "say" -> {
+            val t = a.str("text")?.trim().orEmpty().take(300)
+            if (t.isNotEmpty() && r.entries.none { it.kind == EntryKind.JUNO && it.round == n } && !ApprovalGate.check(t, false).gated)
+              r = r.copy(entries = r.entries + RoomEntry(r.nextSeq, n, EntryKind.JUNO, roster.main.id, t, at = now))
+          }
+          "open_floor" -> {
+            val asked = a.strings("agents").mapNotNull { roster.resolve(it)?.id }.filter { canSpeak(s, r, it) }
+            floor = (floor.orEmpty() + asked).distinct()
+            note = a.str("note")?.trim()?.takeIf { it.isNotEmpty() && !ApprovalGate.check(it, false).gated } ?: note
+          }
+          "relay" -> {
+            val to = a.str("to")?.let { roster.resolve(it)?.id }?.takeIf { canSpeak(s, r, it) } ?: continue
+            val seqs = a.strings("seqs").mapNotNull { it.trim().toIntOrNull() }.toSet()
+            if (seqs.isNotEmpty()) targeted[to] = seqs to a.str("note")?.trim()?.takeIf { it.isNotEmpty() && !ApprovalGate.check(it, false).gated }
+          }
+          "close_room" -> closeReply = a.str("reply")?.trim()?.takeIf { it.isNotEmpty() }
+        }
+      }
+      if (closeReply != null) {
+        putL(s.copy(unprocessed = emptyList(), room = r.copy(stage = RoomStage.WRAPPING, endReason = r.endReason ?: EndReason.CONSENSUS, closeReply = closeReply)))
+        return@withLock
+      }
+      val focusNote = if (n == 1 && r.focusTopic != null) s.agreement?.disputed?.firstOrNull { it.id == r.focusDisputeId }?.let { d ->
+        "The answers split on ${d.topic}: ${d.sides.joinToString(" or ") { it.value }}. Say which, and why."
+      } else null
+      val speakers = (floor ?: floorDefault).ifEmpty { if (targeted.isEmpty()) floorDefault else emptyList() }
+      val left = config.talk.maxRelays - s.asks.count { it.purpose == AskPurpose.ROOM }
+      val order = (targeted.keys.toList() + speakers).distinct().take(left.coerceAtLeast(0))
+      val busy = busyAgentsL(exceptRun = runId)
+      var asks = s.asks
+      val created = mutableListOf<AskState>()
+      for (agent in order) {
+        val callId = calls.firstOrNull()?.callId
+        asks.firstOrNull { it.callId == callId && it.agentId == agent && it.purpose == AskPurpose.ROOM && it.roomRound == n }?.let { created += it; continue }
+        val (only, tNote) = targeted[agent] ?: (null to null)
+        val ask = composeRelayL(s.copy(asks = asks), r, agent, n, tNote ?: note ?: focusNote, only, "$runId~a${asks.size}", callId, now, busy) ?: continue
+        asks = asks + ask
+        created += ask
+        if (ask.status == AskStatus.AWAITING_APPROVAL) {
+          events += ScoreEvent.NeededUser(agent, now, ask.id, if (ask.shareFrom.isNotEmpty()) "share" else "approval")
+          notes += RunUpdate.NeedsUser(runId, NeedsUserLine(NeedsUserKind.APPROVE, approvalText(ask), agent, ask.id, null, ask.text))
+        }
+      }
+      if (created.isEmpty()) {
+        putL(s.copy(unprocessed = emptyList(), room = r.copy(stage = RoomStage.WRAPPING, endReason = r.endReason ?: if (n == 1) EndReason.TOO_FEW else EndReason.CONSENSUS)))
+        return@withLock
+      }
+      val api = created.all { roster.byId(it.agentId)?.kind == AgentKind.API }
+      val until = now + if (api) config.talk.apiRoundWaitMs else config.talk.roundWaitMs
+      r = r.copy(stage = RoomStage.ROUND_OPEN, rounds = r.rounds + RoomRound(n, created.map { it.agentId }, created.map { it.id }, now, until))
+      val wait = PendingCall("room-r$n", PendingKind.ROOM_ROUND, created.map { it.id }, until = until, startedAt = now)
+      putL(recompute(s.copy(asks = asks, unprocessed = emptyList(), room = r, pending = listOf(wait))))
+    }
+    events.forEach { scores.append(it) }
+    notes.forEach { _updates.tryEmit(it) }
+    flushSends(runId)
+  }
+
+  /** "Share Hark's answer with kDot?" or, for a relay the gate held, "Okay to pass this on to kDot?". */
+  private fun approvalText(a: AskState): String = Views.approvalLine(a, roster::nameOf)
+
+  /**
+   * One relay to [agent] for round [n]: the entries it hasn't seen (or only [only]), anonymised and quoted. Held for
+   * the user when it would carry a private agent's answer they haven't shared with [agent], or when the quoted words
+   * would read as a go-ahead or an order (the send gate). Null when there's nothing new for it.
+   */
+  private fun composeRelayL(s: RunState, r: RoomState, agent: String, n: Int, note: String?, only: Set<Int>?, id: String, callId: String?, now: Long, busy: Set<String>): AskState? {
+    val budget = config.talk.maxRelayChars - RELAY_HEADER_RESERVE
+    val user = userNameNow()
+    val refused = { e: RoomEntry -> "${e.authorId}>$agent" in r.notShared }
+    val c = Relay.compose(r, agent, cursorOf(s, agent), user, note, budget, refused, only, roster.main.name) ?: return null
+    val private = c.authors.filter { a -> roster.byId(a)?.sensitive == true && "$a>$agent" !in r.shared }
+    val without = if (private.isEmpty()) null else Relay.compose(r, agent, cursorOf(s, agent), user, note, budget, { e -> refused(e) || e.authorId in private }, only, roster.main.name)
+    val gate = SendGate.check(c.quoted.map { Segment(it, Provenance.PEER_RELAY) }, user)
+    val prof = roster.byId(agent)
+    val status = when {
+      private.isNotEmpty() || gate.gated -> AskStatus.AWAITING_APPROVAL
+      prof?.kind == AgentKind.TEXT && (agent in busy || s.asks.any { it.agentId == agent && (it.status.inFlight || it.status == AskStatus.QUEUED) }) -> AskStatus.QUEUED
+      else -> AskStatus.SENDING
+    }
+    return AskState(id, agent, c.text, AskPurpose.ROOM, callId, "talk", status, now,
+      gateReason = gate.reason ?: if (private.isNotEmpty()) "share" else null, roomRound = n, relayThrough = c.relayThrough, quoted = c.quoted,
+      shareFrom = private, textWithoutShared = without?.text, quotedWithoutShared = without?.quoted.orEmpty())
+  }
+
+  /** The talk is over: where each agent landed, Juno's wrap-up, the reliability log. */
+  private suspend fun wrapUp(runId: String) {
+    val s = mutex.withLock { getL(runId) } ?: return
+    val r = s.room ?: return
+    val agentEntries = r.entries.filter { it.kind == EntryKind.AGENT && it.authorId != roster.main.id }
+    val byAgent = agentEntries.groupBy { it.authorId }
+    // Where they landed (only meaningful when an agent spoke after seeing the others).
+    val landed: List<Landed> = if (byAgent.values.none { es -> es.any { it.round >= 1 } }) emptyList() else {
+      val labels = byAgent.keys.mapIndexed { i, a -> Agreement.label(i) to a }.toMap()
+      val input = buildString {
+        append("Question: ").append(r.question).append("\n")
+        r.focusTopic?.let { append("Disputed point: ").append(it).append("\n") }
+        labels.forEach { (l, a) ->
+          val es = byAgent.getValue(a)
+          append("\nAgent ").append(l).append(" first answer: ").append(es.first().text.trim()).append("\n")
+          es.drop(1).forEach { e -> append("Agent ").append(l).append(" later (round ").append(e.round).append("): ").append(e.text.trim()).append("\n") }
+        }
+      }
+      try {
+        val o = parseJsonObject(llm.respond(LlmRequest("positions", Prompts.render("room_positions"), listOf(Items.user(input)), jsonSchema = positionsSchema, schemaName = "positions")).text)
+        (o?.get("positions") as? JsonArray).orEmpty().mapNotNull { el ->
+          val p = el as? JsonObject ?: return@mapNotNull null
+          val agent = labels[p.str("agent")?.trim()?.uppercase()] ?: return@mapNotNull null
+          val changed = p.bool("changed") == true
+          val along = if (changed && p.bool("new_reason") == false) p.str("went_along_with")?.trim()?.uppercase()?.let { labels[it] } ?: labels.values.firstOrNull { it != agent } else null
+          Landed(agent, p.str("first")?.trim().orEmpty(), p.str("final")?.trim().orEmpty(), changed, along, p.str("reason")?.trim().orEmpty())
+        }.filter { it.final.isNotEmpty() }.sortedBy { r.participants.indexOf(it.agentId) }
+      } catch (e: CancellationException) { throw e } catch (_: Exception) { emptyList() }
+    }
+    var answer = r.closeReply
+    var choices = emptyList<String>()
+    var yourCall = false
+    if (answer == null && agentEntries.isNotEmpty()) {
+      val input = buildString {
+        append("Question: ").append(r.question).append("\n")
+        append("How the talk ended: ").append(endWords(r.endReason)).append("\n\n")
+        append("Final positions:\n")
+        latestPositions(r).filter { it.authorId != roster.main.id }.forEach { append("- ").append(roster.nameOf(it.authorId)).append(": ").append(Relay.trim(it.text.replace(Regex("\\s+"), " "), 600)).append("\n") }
+        if (landed.isNotEmpty()) {
+          append("\nChanges:\n")
+          landed.forEach { l ->
+            append("- ").append(roster.nameOf(l.agentId)).append(": ")
+            append(when { !l.changed -> "kept ${l.final}"; l.wentAlongWith != null -> "went from ${l.first} to ${l.final} with no new reason (went along with ${roster.nameOf(l.wentAlongWith)}; don't count this as agreement)"; else -> "changed from ${l.first} to ${l.final}: ${l.reason}" })
+            append("\n")
+          }
+        }
+        val disputes = s.agreement?.disputed.orEmpty()
+        if (disputes.isNotEmpty()) append("\nStill split on: ").append(disputes.joinToString("; ") { d -> d.topic + " (" + d.sides.joinToString(" vs ") { side -> side.value + ": " + side.agentIds.joinToString { roster.nameOf(it) } } + ")" }).append("\n")
+        val user = r.entries.filter { it.kind == EntryKind.USER }
+        if (user.isNotEmpty()) append("\nThe user added: ").append(user.joinToString(" / ") { it.text }).append("\n")
+        val silent = r.participants.filter { it !in byAgent.keys }.map { roster.nameOf(it) }
+        if (silent.isNotEmpty()) append("Didn't answer: ").append(silent.joinToString()).append("\n")
+      }
+      try {
+        val o = parseJsonObject(llm.respond(LlmRequest("wrap", Prompts.render("room_wrap", mapOf("main" to roster.main.name, "userLine" to Prompts.userLine(userNameNow()))),
+          listOf(Items.user(input)), jsonSchema = wrapSchema, schemaName = "wrap")).text)
+        answer = o?.str("answer")?.trim()?.takeIf { it.isNotEmpty() }
+        choices = o?.strings("choices").orEmpty().map { it.trim().take(40) }.filter { it.isNotEmpty() }.distinct().take(2)
+        yourCall = o?.bool("your_call") == true
+      } catch (e: CancellationException) { throw e } catch (_: Exception) {}
+    }
+    val text = answer ?: fallbackWrap(s, r)
+    val events = mutableListOf<ScoreEvent>()
+    mutex.withLock {
+      val cur = getL(runId) ?: return
+      if (cur.phase.terminal) return
+      val room = cur.room ?: return
+      val now = clock()
+      val map = cur.agreement?.let { m -> m.copy(status = MapStatus.READY, disputed = m.disputed.map { d ->
+        d.copy(challenge = ChallengeState.RESOLVED, resolution = d.resolution ?: "They still disagree")
+      }, verdict = m.verdict ?: Verdict(Agreement.level(latestPositions(room).size, Agreement.Clusters(m.agreed, m.disputed, m.unique)), text, m.agreed.size, m.disputed.size, m.unique.size)) }
+      // Mentions the talk never relayed become "Ask X about this?".
+      val extra = room.participants.flatMap { t -> unconsumedMentions(cur, room, t).mapNotNull { seq ->
+        room.entries.firstOrNull { it.seq == seq }?.let { e -> Suggestion(e.authorId, t, seq, Relay.quoteFor(e.text, roster.nameOf(t))) }
+      } }.filter { x -> room.suggestions.none { it.toAgent == x.toAgent && it.fromAgent == x.fromAgent } }.distinctBy { it.fromAgent to it.toAgent }
+      val topic = room.focusTopic ?: Relay.trim(room.question, 80)
+      if (!room.logged) {
+        val firsts = room.entries.filter { it.kind == EntryKind.AGENT }.groupBy { it.authorId }
+        for (a in room.participants) {
+          val l = landed.firstOrNull { it.agentId == a }
+          val es = firsts[a].orEmpty()
+          events += ScoreEvent.TalkPosition(a, now, runId, topic, room.trigger, answeredFirst = es.any { it.round == 0 }, spokeAfter = es.any { it.round >= 1 },
+            changed = l?.changed == true, wentAlong = l?.wentAlongWith != null, first = l?.first ?: "", final = l?.final ?: "", endReason = room.endReason ?: EndReason.CONSENSUS)
+        }
+      }
+      val closed = room.copy(stage = RoomStage.CLOSED, landed = landed, choices = choices, yourCall = yourCall, suggestions = room.suggestions + extra, logged = true,
+        endReason = room.endReason ?: EndReason.CONSENSUS)
+      putL(finishL(cur.copy(room = closed, agreement = map, fallback = answer == null), text, answer == null))
+    }
+    events.forEach { scores.append(it) }
+    _updates.tryEmit(RunUpdate.TalkDone(runId, text))
+  }
+
+  private fun endWords(e: EndReason?) = when (e) {
+    EndReason.CONSENSUS -> "they agree"; EndReason.SILENCE -> "nobody had more to add"; EndReason.ROUND_CAP -> "the round limit"
+    EndReason.WRAPPED_EARLY -> "the user asked to wrap up early"; EndReason.WALL_CLOCK -> "the time limit"; EndReason.RELAY_CAP -> "the relay limit"
+    EndReason.TOO_FEW -> "too few answers to talk over"; else -> "it ended"
+  }
+
+  /** The wrap-up without the model: the map's line, or each agent's last position. Never retells the talk. */
+  private fun fallbackWrap(s: RunState, r: RoomState): String {
+    val latest = latestPositions(r).filter { it.authorId != roster.main.id }
+    if (latest.isEmpty()) return "Nobody answered, so there was nothing to talk over."
+    if (latest.size == 1) return "Only ${roster.nameOf(latest[0].authorId)} answered, so there was nothing to talk over: ${Views.preview(latest[0].text)}"
+    val d = s.agreement?.disputed.orEmpty()
+    return if (d.isEmpty()) "**They agree.** " + Views.preview(latest.first().text)
+    else "**They didn't agree.** " + latest.joinToString(" ") { "${roster.nameOf(it.authorId)}: ${Relay.trim(Relay.sanitize(it.text), 120)}" }
+  }
+
+  private val positionsSchema: JsonObject = Schema.obj(
+    "positions" to Schema.array("One per agent", Schema.obj(
+      "agent" to Schema.string("The agent's label as given"),
+      "first" to Schema.string("Its first position as a short noun phrase, 2-5 words"),
+      "final" to Schema.string("Its final position, same style; reuse the first's wording if unchanged"),
+      "changed" to Schema.boolean("True if its final position differs from its first"),
+      "new_reason" to Schema.boolean("True if it named a new fact or reason for changing"),
+      "went_along_with" to Schema.string("If it changed with no new reason: the label it went along with, else empty"),
+      "reason" to Schema.string("One clause: why it changed or kept its answer, from its own words"),
+    )),
+  )
+
+  private val wrapSchema: JsonObject = Schema.obj(
+    "answer" to Schema.string("The answer in the main agent's voice: verdict first in bold, at most two sentences"),
+    "choices" to Schema.stringArray("At most two short tap-to-say choices for the user (e.g. Go with Rooh), or empty"),
+    "your_call" to Schema.boolean("True when it's a split, or acting on it would spend money: the user decides"),
+  )
+
+  /** What the send gate sees for an ask: who wrote which part of it. */
+  private fun segmentsOf(a: AskState): List<Segment> = when (a.purpose) {
+    AskPurpose.BLIND -> listOf(Segment(a.text, Provenance.USER_VERBATIM))
+    AskPurpose.TASK -> listOf(Segment(a.text, if (a.approved) Provenance.USER_APPROVED else Provenance.JUNO_REWRITE))
+    AskPurpose.CHALLENGE -> listOf(Segment(a.text, Provenance.PEER_RELAY))
+    AskPurpose.ROOM -> listOf(Segment(a.text, Provenance.ATALL)) + a.quoted.map { Segment(it, if (a.approved) Provenance.USER_APPROVED else Provenance.PEER_RELAY) }
+  }
+
+  private fun userNameNow(): String = runCatching { userName() }.getOrDefault("")
 
   // ============================================================== helpers
 

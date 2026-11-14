@@ -52,6 +52,19 @@ class MainActivity : ComponentActivity() {
         setContent { AppTheme { Root() } }
     }
 
+    override fun onStart() { super.onStart(); TalkNotifier.visible = true }
+    override fun onStop() { TalkNotifier.visible = false; super.onStop() }
+
+    /** Talks can take minutes: the first time the user starts one, ask (once) to let Juno say when it's done. */
+    private fun askForNotifications() {
+        if (android.os.Build.VERSION.SDK_INT < 33) return
+        if (checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) == android.content.pm.PackageManager.PERMISSION_GRANTED) return
+        val sp = getSharedPreferences("atall", MODE_PRIVATE)
+        if (sp.getBoolean("asked_notifications", false)) return
+        sp.edit().putBoolean("asked_notifications", true).apply()
+        runOnUiThread { requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 7) }
+    }
+
     override fun onResume() {
         super.onResume()
         resumes.intValue++
@@ -105,6 +118,7 @@ class MainActivity : ComponentActivity() {
                 ThreadUi(messages, peers, access),
                 ThreadActions(
                     onSend = { text -> g.scope.launch { g.router.send(text) } },
+                    onSendTalk = { text -> askForNotifications(); g.scope.launch { g.router.send(text, talk = true) } },
                     onRetry = { id -> g.scope.launch { g.router.retry(id) } },
                     // Tap-to-send opens Messages, which Android allows only from the foreground: run in the activity's scope.
                     onTapToSend = { id -> lifecycleScope.launch { g.router.tapToSend(id) } },
@@ -114,7 +128,10 @@ class MainActivity : ComponentActivity() {
                     onTurnOnAccess = ::openAccess,
                     onApprove = { id, yes -> g.scope.launch { g.router.approve(id, yes) } },
                     onStopWaiting = { runId -> g.scope.launch { g.juno.stopWaiting(runId) } },
-                    onChallenge = { runId, dispute -> g.scope.launch { g.juno.challenge(runId, dispute) } },
+                    onTalkOver = { runId, dispute -> askForNotifications(); g.scope.launch { g.juno.talkOver(runId, dispute) } },
+                    onWrapUp = { runId -> g.scope.launch { g.juno.wrapUp(runId) } },
+                    onLeaveOut = { runId, agent -> g.scope.launch { g.juno.leaveOut(runId, agent) } },
+                    onChoice = { runId, choice -> g.scope.launch { g.juno.choiceTapped(runId, choice); g.router.send(choice) } },
                 ),
             )
             Screen.Agents -> {
@@ -158,6 +175,8 @@ class MainActivity : ComponentActivity() {
                         }
                     },
                     onPause = { g.updateAgent(profile.copy(paused = it)) },
+                    askBeforeSharing = profile.sharesPrivately,
+                    onAskBeforeSharing = { g.updateAgent(profile.copy(askBeforeSharing = it)) },
                     onRemove = { g.removeAgent(profile.id); screen = Screen.Agents },
                 )
             }

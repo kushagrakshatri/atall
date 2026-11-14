@@ -11,6 +11,11 @@ sealed interface Route {
     data class Direct(val peerIds: List<String>, val text: String) : Route
     /** `@all` / `@everyone`: the same question to every active agent, blind, then the Agreement Map. */
     data class All(val text: String) : Route
+    /**
+     * "Talk it over": the agents answer on their own first, then see each other's answers and reply, then Juno wraps
+     * up. [peerIds] empty means every active agent.
+     */
+    data class Talk(val text: String, val peerIds: List<String> = emptyList()) : Route
 }
 
 /**
@@ -43,6 +48,33 @@ object Mentions {
 
     fun nameMap(agents: List<AgentProfile>): Map<String, String> =
         agents.associate { it.name.lowercase() to it.id } + (Main.NAME.lowercase() to Main.AUTHOR)
+
+    /** The user's own words asking for a talk ("talk it over", "talk this over"). */
+    private val TALK_WORDS = Regex("\\btalk (?:it|this|that) over\\b", RegexOption.IGNORE_CASE)
+    fun asksToTalk(text: String): Boolean = TALK_WORDS.containsMatchIn(text)
+
+    /**
+     * Where [text] goes with the "Talk it over" chip on ([talk]) or the words in it: a [Route.Talk] when at least two
+     * agents would take part (`@all`, two or more @mentions, or none named and two or more active agents);
+     * otherwise the ordinary route.
+     */
+    fun route(text: String, agents: List<AgentProfile>, talk: Boolean): Route {
+        val plain = route(text, agents)
+        if (!talk && !asksToTalk(text)) return plain
+        val active = agents.filter { !it.paused }
+        val names = nameMap(agents)
+        val mentioned = find(text, names).map { it.target }.filter { it != Main.AUTHOR }.distinct()
+        val all = allMentions(text, names).isNotEmpty()
+        val who = when {
+            all -> emptyList()
+            mentioned.size >= 2 -> mentioned
+            mentioned.isEmpty() -> emptyList()
+            else -> return plain
+        }
+        if (who.isEmpty() && active.size < 2) return plain
+        val body = remove(text, allMentions(text, names) + find(text, names))
+        return if (body.isBlank()) plain else Route.Talk(body, who)
+    }
 
     fun route(text: String, agents: List<AgentProfile>): Route {
         val names = nameMap(agents)

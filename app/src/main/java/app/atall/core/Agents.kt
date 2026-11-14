@@ -27,9 +27,21 @@ data class AgentProfile(
     val hue: Int = 0,
     val paused: Boolean = false,
     val createdAt: Long = 0,
+    /**
+     * "Ask before sharing its answers with other agents" (in a talk, a "Share with X?" tap). Null: the default, which
+     * is on for agents that read the user's private accounts (Hark, Muse) and off for the rest.
+     */
+    val askBeforeSharing: Boolean? = null,
 ) {
     fun toPeer() = PeerInfo(id, name, channel, address, aliases, paused)
     val monogram: String get() = name.trim().take(1).ifEmpty { "?" }
+    val sharesPrivately: Boolean get() = askBeforeSharing ?: AgentPrivacy.privateByDefault(name)
+}
+
+/** Which agents' answers count as private by default (risks.md #1): those that answer from the user's own accounts. */
+object AgentPrivacy {
+    private val PRIVATE = setOf("hark", "muse")
+    fun privateByDefault(name: String): Boolean = name.trim().lowercase(Locale.ROOT) in PRIVATE
 }
 
 /** Plain-language checks for the add/edit form. Returns the first problem as user-facing copy, or null. */

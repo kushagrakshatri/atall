@@ -154,12 +154,14 @@ internal fun Approval(m: ThreadMessage, peer: PeerUi?, onApprove: (String, Boole
         Text(m.text, style = AppTheme.type.bodyStrong, color = c.ink)
         m.detail?.let { Text(it, Modifier.padding(top = 2.dp), style = AppTheme.type.body2, color = c.ink2) }
         Spacer(Modifier.height(8.dp))
+        // A talk relay that carries a private agent's answer: "Share Hark's answer with kDot?".
+        val share = m.text.startsWith("Share ")
         when (m.status) {
-            SendStatus.SENT -> Text("Approved. Sent to ${peer?.name ?: "the agent"}.", style = AppTheme.type.caption, color = c.ink3)
-            SendStatus.NOT_SENT -> Text("Not sent.", style = AppTheme.type.caption, color = c.ink3)
+            SendStatus.SENT -> Text(if (share) "Shared with ${peer?.name ?: "the agent"}." else "Approved. Sent to ${peer?.name ?: "the agent"}.", style = AppTheme.type.caption, color = c.ink3)
+            SendStatus.NOT_SENT -> Text(if (share) "Not shared." else "Not sent.", style = AppTheme.type.caption, color = c.ink3)
             else -> Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Chip("Yes, send it", { onApprove(m.id, true) }, filled = true)
-                Chip("No", { onApprove(m.id, false) })
+                Chip(if (share) "Share" else "Yes, send it", { onApprove(m.id, true) }, filled = true)
+                Chip(if (share) "Don't share" else "No", { onApprove(m.id, false) })
             }
         }
     }
@@ -167,9 +169,9 @@ internal fun Approval(m: ThreadMessage, peer: PeerUi?, onApprove: (String, Boole
 
 private val MapJson = Json { ignoreUnknownKeys = true }
 
-/** The @all Agreement Map: verdict, what everyone agrees on, disputes (with "Check this"), one-offs, raw answers. */
+/** The @all Agreement Map: verdict, what everyone agrees on, disputes (with "Talk it over"), one-offs, raw answers. */
 @Composable
-internal fun AgreementCard(m: ThreadMessage, peers: Map<String, PeerUi>, onChallenge: (String, String) -> Unit) {
+internal fun AgreementCard(m: ThreadMessage, peers: Map<String, PeerUi>, onTalkOver: (String, String) -> Unit) {
     val c = AppTheme.colors
     val map = remember(m.detail) { m.detail?.let { runCatching { MapJson.decodeFromString(AgreementMap.serializer(), it) }.getOrNull() } }
     var raw by rememberSaveable(m.id) { mutableStateOf(false) }
@@ -196,9 +198,9 @@ internal fun AgreementCard(m: ThreadMessage, peers: Map<String, PeerUi>, onChall
                 d.sides.forEach { side -> Bullet(side.agentIds.joinToString(", ") { peers[it]?.name ?: if (it == Main.AUTHOR) Main.NAME else "Agent" } + ": " + side.statement) }
                 when (d.challenge) {
                     ChallengeState.NONE -> if (map.status == MapStatus.READY && m.runId != null) {
-                        Spacer(Modifier.height(4.dp)); Chip("Check this", { onChallenge(m.runId!!, d.id) })
+                        Spacer(Modifier.height(4.dp)); Chip("Talk it over", { onTalkOver(m.runId!!, d.id) })
                     }
-                    ChallengeState.ASKED -> Text("Checking…", style = AppTheme.type.caption, color = c.ink3)
+                    ChallengeState.ASKED -> Text("Talking it over…", style = AppTheme.type.caption, color = c.ink3)
                     ChallengeState.RESOLVED -> d.resolution?.let { Text(it, style = AppTheme.type.caption, color = c.ink3) }
                 }
             }

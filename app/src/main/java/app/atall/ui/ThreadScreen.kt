@@ -25,7 +25,10 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -61,6 +64,8 @@ data class ThreadUi(
 
 class ThreadActions(
     val onSend: (String) -> Unit = {},
+    /** Sent with the "Talk it over" chip on. */
+    val onSendTalk: (String) -> Unit = {},
     val onRetry: (String) -> Unit = {},
     val onTapToSend: (String) -> Unit = {},
     val onSignIn: () -> Unit = {},
@@ -71,8 +76,14 @@ class ThreadActions(
     val onApprove: (String, Boolean) -> Unit = { _, _ -> },
     /** "Stop waiting" on a slow Juno turn (run id). */
     val onStopWaiting: (String) -> Unit = {},
-    /** "Check this" on a disputed claim of an Agreement Map (run id, dispute id). */
-    val onChallenge: (String, String) -> Unit = { _, _ -> },
+    /** "Talk it over" on a disputed claim of an Agreement Map (run id, dispute id). */
+    val onTalkOver: (String, String) -> Unit = { _, _ -> },
+    /** A talk's "Wrap up now" (run id). */
+    val onWrapUp: (String) -> Unit = {},
+    /** A talk's "Leave X out" (run id, agent id). */
+    val onLeaveOut: (String, String) -> Unit = { _, _ -> },
+    /** One of Juno's choices after a talk (run id, the choice): sent as the user's own message. */
+    val onChoice: (String, String) -> Unit = { _, _ -> },
 )
 
 private sealed interface Row {
@@ -117,6 +128,11 @@ fun ThreadScreen(state: ThreadUi, actions: ThreadActions, zone: ZoneId = ZoneId.
     val today = LocalDate.now(zone)
     val list = remember(state.messages, today) { rows(state.messages, zone, today) }
     val railRuns = remember(state.messages) { state.messages.filter { it.kind == MessageKind.RUN }.mapNotNull { it.runId }.toSet() }
+    // A talk that's still going: what the user types joins it.
+    val liveTalk = remember(state.messages) { state.messages.lastOrNull { it.kind == MessageKind.TALK && it.streaming }?.let { parseTalk(it.detail) } }
+    // "Ask Hark about this?" fills the composer; the user sends it (or not).
+    var draft by remember { mutableStateOf<String?>(null) }
+    val talkActions = remember(actions) { TalkActions(actions.onWrapUp, actions.onLeaveOut, actions.onStopWaiting) { _, text -> draft = text } }
     val listState = rememberLazyListState()
     LaunchedEffect(list.size, state.messages.lastOrNull()?.text?.length) {
         if (list.isNotEmpty()) listState.animateScrollToItem(list.size - 1)
@@ -134,12 +150,16 @@ fun ThreadScreen(state: ThreadUi, actions: ThreadActions, zone: ZoneId = ZoneId.
                 items(list, key = { it.key }) { row ->
                     when (row) {
                         is Row.Day -> DayDivider(row.label)
-                        is Row.Msg -> MessageRow(row, peersById, names, actions, railRuns)
+                        is Row.Msg -> MessageRow(row, peersById, names, actions, railRuns, talkActions)
                     }
                 }
             }
         }
-        Composer(state.peers, actions.onSend, actions.onAddAgent)
+        Composer(
+            state.peers, onSend = { text, talk -> if (talk) actions.onSendTalk(text) else actions.onSend(text) }, onAddAgent = actions.onAddAgent,
+            prefill = draft, onPrefillUsed = { draft = null },
+            talkNames = liveTalk?.let { t -> t.label.substringBefore(" are talking it over").substringBefore(" is talking it over") },
+        )
     }
 }
 
@@ -194,7 +214,7 @@ private fun DayDivider(label: String) {
 }
 
 @Composable
-private fun MessageRow(row: Row.Msg, peers: Map<String, PeerUi>, names: Map<String, String>, actions: ThreadActions, railRuns: Set<String>) {
+private fun MessageRow(row: Row.Msg, peers: Map<String, PeerUi>, names: Map<String, String>, actions: ThreadActions, railRuns: Set<String>, talk: TalkActions) {
     val m = row.m
     val top = if (row.header) AppTheme.spacing.turnGap / 2 else AppTheme.spacing.groupGap
     // Lines of a Juno turn (strip, sub-tasks, agent replies, answer) sit on one rail under it.
@@ -207,11 +227,12 @@ private fun MessageRow(row: Row.Msg, peers: Map<String, PeerUi>, names: Map<Stri
             m.kind == MessageKind.SUBTASK -> SubTask(m, peers[m.peerId], peers)
             m.kind == MessageKind.NEEDS_TAP -> NeedsTap(m, peers[m.peerId], actions.onTapToSend)
             m.kind == MessageKind.NEEDS_APPROVAL -> Approval(m, peers[m.peerId], actions.onApprove)
-            m.kind == MessageKind.AGREEMENT -> AgreementCard(m, peers, actions.onChallenge)
+            m.kind == MessageKind.AGREEMENT -> AgreementCard(m, peers, actions.onTalkOver)
+            m.kind == MessageKind.TALK -> TalkCard(m, peers, talk)
             m.kind == MessageKind.NEEDS_SIGN_IN -> AgentTurn(null, m, row.header) { Spacer(Modifier.height(8.dp)); Chip("Sign in", actions.onSignIn, filled = true) }
             m.kind == MessageKind.NOTICE -> Notice(m.text, indent = !child)
-            m.author == Main.AUTHOR -> AgentTurn(null, m, row.header || child)
-            else -> AgentTurn(peers[m.author] ?: PeerUi(m.author, "Removed agent", AgentHue.Slate, ChannelType.RCS, ""), m, row.header)
+            m.author == Main.AUTHOR -> AgentTurn(null, m, row.header || child) { Choices(m, actions.onChoice) }
+            else -> AgentTurn(peers[m.author] ?: PeerUi(m.author, "Removed agent", AgentHue.Slate, ChannelType.RCS, ""), m, row.header) { AskChips(m, peers, talk.onAsk) }
         }
     }
 }

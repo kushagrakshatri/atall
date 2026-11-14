@@ -4,9 +4,34 @@
 phone, and `@mention` any other agent you use to ask it directly. Atall is open source (MIT), runs fully on the
 phone, and has no server.
 
-> Status: **M0.2 (v0.1.2-m02), pre-release.** Juno coordinates: it asks your agents, waits, and merges
-> their answers; `@all` asks everyone the same question and shows where they agree. M0.2 fixes what the second
-> Pixel test found.
+> Status: **M0.3 (v0.1.3-m03), pre-release.** Juno coordinates: it asks your agents, waits, and merges
+> their answers; `@all` asks everyone the same question and shows where they agree; and now your agents can
+> **talk it over**.
+
+## New in M0.3 (v0.1.3-m03): Talk it over
+
+- **Talk it over.** With `@all` in the composer (or when you write "talk it over"), a **Talk it over** chip asks
+  your agents to answer on their own first, then each one sees the others' answers and can reply once. A second
+  round happens only if they still disagree or one agent @mentions another. Never more than two.
+- **Agents see each other as data, not as you.** Other agents' answers are quoted as "Answer A / Answer B"
+  (anonymised), framed as information from other AIs, with links, codes and numbers stripped and your question
+  restated. Every relay stays under 1,800 characters.
+- **Where they landed.** Juno answers first, in at most two sentences. A small card shows who changed their mind
+  and why, only when someone moved or they still disagree. Tap **Show the talk** for the rounds and **What Juno
+  sent**. Up to two choices you can tap; a split or anything that costs money sits under **Your call**.
+- **Limits and controls.** At most 6 relays per talk, each agent addressed at most twice, 12 minutes in all.
+  **Stop** any time; **Wrap up now** and **Leave X out** appear when an agent is slow. Anything you type during a
+  talk joins it. One notification per talk, when the answer lands (and only if Atall isn't open).
+- **Your OK at the transport.** Only your own words can tell an agent to buy, book or go ahead. A relayed "yes, go
+  ahead" waits for your tap, and a direct @mention no longer carries another agent's go-ahead in its recent turns.
+- **Private agents.** Answers from agents that read your accounts (Hark and Muse by default; a switch in each
+  agent's page) go to another agent only after you tap **Share with …?**.
+- **Agents' @mentions are buttons.** When an agent @mentions another, you get **Ask X about this?**, which fills
+  the composer for you to send. Nothing is sent by itself.
+- On the Agreement Map, **Check this** is now **Talk it over**, and Juno starts a talk by itself when `@all`'s first
+  answers clash on the thing you're deciding (the strip says so).
+- Per-topic reliability (who changed their mind, who went along, what you picked) is logged on the phone for a
+  scoreboard later. No scoreboard yet.
 
 ## New in M0.2 (v0.1.2-m02)
 
@@ -57,7 +82,7 @@ phone, and has no server.
 
 ## Install (Pixel / Android 8+)
 
-1. Download `atall-0.1.2-m02-arm64.apk` from the [latest release](https://github.com/kushagrakshatri/atall/releases) and open it. Allow installs from your browser if asked.
+1. Download `atall-0.1.3-m03-arm64.apk` from the [latest release](https://github.com/kushagrakshatri/atall/releases) and open it. Allow installs from your browser if asked.
 2. Open Atall. **Continue with ChatGPT** signs you in on OpenAI's page, or tap **Set up later**.
 3. **Open settings** and switch Atall on. If the switch is greyed out (sideloaded apps on Android 13+): App
    info → ⋮ → **Allow restricted settings**, then try again.

@@ -25,6 +25,8 @@ enum class MessageKind {
     NEEDS_APPROVAL,
     /** The @all Agreement Map; [ThreadMessage.detail] holds it as JSON. */
     AGREEMENT,
+    /** "Talk it over": the live card, then "Where they landed" and the rounds; [ThreadMessage.detail] holds the view as JSON. */
+    TALK,
 }
 
 /** Why an agent's line is in the thread. Every agent line carries one, so the label is always the same kind. */
@@ -84,6 +86,12 @@ data class ThreadMessage(
     val detail: String? = null,
     /** Dropped from the thread (a "may have answered in Messages" hint once the reply arrived). Kept in the log. */
     val hidden: Boolean = false,
+    /** Juno's wrap-up after a talk: up to two things the user can tap to say next ("Go with Rooh"). */
+    val choices: List<String> = emptyList(),
+    /** [choices] are a split or cost money: shown under "Your call". */
+    val yourCall: Boolean = false,
+    /** Agent lines: other agents it @mentioned ("Ask Hark about this?"): peer ids. Nothing is sent until the user does. */
+    val suggest: List<String> = emptyList(),
 ) {
     /** The attribution to render; lines from before 0.1.1 only have [direct]. */
     val shownAttribution: Attribution?

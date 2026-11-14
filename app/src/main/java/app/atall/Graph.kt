@@ -49,6 +49,7 @@ class Graph(private val context: Context) {
     val thread = ThreadStore(File(dataDir, "thread.jsonl"))
     val chatGpt = ChatGpt(context, scope)
     val prefs = Prefs(context)
+    private val talkNotifier = TalkNotifier(context)
 
     val rcs = RcsChannel(context)
     val adapters: Map<ChannelType, ChannelAdapter> = mapOf(ChannelType.RCS to rcs)
@@ -70,6 +71,7 @@ class Graph(private val context: Context) {
         store = FileRunStore(File(dataDir, "runs").apply { mkdirs() }),
         scores = JsonLinesScoreLog(File(dataDir.apply { mkdirs() }, "scores.jsonl")),
         scope = scope, userName = ::userName,
+        onTalkDone = { runId, text -> talkNotifier.talkDone(runId, text) },
     )
 
     val router = Router(

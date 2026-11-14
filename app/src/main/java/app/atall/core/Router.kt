@@ -49,13 +49,16 @@ class Router(
     /** Whether Juno can call the model (a ChatGPT sign-in exists). Defaults to [responses] being present. */
     private val signedIn: () -> Boolean = { responses() != null },
 ) {
-    /** Called for each user message. Suspends until direct sends are handed off and the main agent has answered. */
-    suspend fun send(raw: String) {
+    /**
+     * Called for each user message. Suspends until direct sends are handed off and the main agent has answered.
+     * [talk]: the "Talk it over" chip was on (the agents answer, then see each other's answers and reply).
+     */
+    suspend fun send(raw: String, talk: Boolean = false) {
         val text = raw.trim()
         if (text.isEmpty()) return
         val msg = ThreadMessage(ThreadMessage.newId(), now(), ThreadMessage.USER, text, status = SendStatus.SENDING)
         thread.upsert(msg)
-        dispatch(msg)
+        dispatch(msg, talk = talk)
     }
 
     /** Retry a NOT_SENT user message. */
@@ -65,10 +68,12 @@ class Router(
         dispatch(m, attempt = now().toString(36))
     }
 
-    private suspend fun dispatch(msg: ThreadMessage, attempt: String = "0") {
-        when (val route = Mentions.route(msg.text, registry.all())) {
+    private suspend fun dispatch(msg: ThreadMessage, attempt: String = "0", talk: Boolean = false) {
+        val agents = registry.all().filter { it.channel.implemented }
+        when (val route = Mentions.route(msg.text, registry.all(), talk && agents.count { !it.paused } >= 2)) {
             is Route.Direct -> direct(msg, route, attempt)
             is Route.All -> coordinate(msg, route)
+            is Route.Talk -> coordinate(msg, route)
             is Route.ToMain -> coordinate(msg, route)
         }
     }
@@ -77,7 +82,7 @@ class Router(
     private suspend fun coordinate(msg: ThreadMessage, route: Route) {
         val bridge = juno()
         if (bridge == null || !bridge.hasActivePeers()) {
-            val text = (route as? Route.ToMain)?.text ?: (route as Route.All).text
+            val text = when (route) { is Route.ToMain -> route.text; is Route.All -> route.text; is Route.Talk -> route.text; else -> msg.text }
             val mentioned = (route as? Route.ToMain)?.mentionedPeers.orEmpty()
             thread.upsert(msg.copy(status = SendStatus.SENT))
             runMain(MainTurn(msg.id, text, msg.at, mentioned))
@@ -116,10 +121,13 @@ class Router(
             if (agent == null) { failure = failure ?: (problem ?: "${p.name} can't be reached right now."); continue }
             val cid = directCid(msg.id, p.id, attempt)
             val others = route.peerIds.filter { it != p.id }.mapNotNull { names[it] }
-            val text = ContextPack.pack(ContextPack.Input(
+            val packed = ContextPack.packed(ContextPack.Input(
                 kind = ContextPack.Kind.DIRECT, userName = userName(), recipientId = p.id, recipientName = p.name,
                 request = msg.text, recent = recent, names = names, others = others,
             ))
+            // The send gate, at the transport: the user's own words go; nothing else may say buy / book / go ahead.
+            if (app.atall.coordinator.SendGate.check(packed.segments, userName()).gated) { failure = failure ?: "Needs your OK first."; continue }
+            val text = packed.text
             when (val r = agent.send(text, cid, SendOptions(allowDraft = false))) {
                 is SendResult.Sent, is SendResult.Duplicate, is SendResult.Drafted -> {}
                 is SendResult.NeedsUser -> thread.upsert(
@@ -220,7 +228,8 @@ class Router(
         val direct = attribution == Attribution.DIRECT
         // A direct answer never shows above the question it answers, even with a skewed timestamp.
         val floor = if (direct) (thread.chronological().lastOrNull { it.author == ThreadMessage.USER }?.at ?: 0) + 1 else 0
-        thread.upsert(ThreadMessage("in:$sourceId", maxOf(sentAt, floor), peerId, text, direct = direct, sourceId = sourceId, attribution = attribution))
+        thread.upsert(ThreadMessage("in:$sourceId", maxOf(sentAt, floor), peerId, text, direct = direct, sourceId = sourceId, attribution = attribution,
+            suggest = PeerLines.suggestions(text, peerId, registry.all())))
         dropStaleHints(peerId)
     }
 

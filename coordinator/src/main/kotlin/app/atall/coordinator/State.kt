@@ -11,6 +11,8 @@ enum class RunMode {
   COORDINATE,
   /** @all: the same question blind to everyone, then an Agreement Map. */
   ALL,
+  /** "Talk it over": blind first answers, then up to two reveal rounds relayed by Juno, then Juno wraps up. */
+  ROOM,
 }
 
 @Serializable
@@ -31,7 +33,7 @@ enum class Phase {
 }
 
 @Serializable
-enum class AskPurpose { TASK, BLIND, CHALLENGE }
+enum class AskPurpose { TASK, BLIND, CHALLENGE, ROOM }
 
 @Serializable
 enum class AskStatus {
@@ -99,6 +101,19 @@ data class AskState(
   val followedUp: Boolean = false,
   /** For CHALLENGE asks: the dispute it is about. */
   val disputeId: String? = null,
+  /** Talk asks: the round it belongs to (0 = the blind first answers). */
+  val roomRound: Int? = null,
+  /** Talk relays: every room entry with seq <= this was considered for this agent (the cursor; see [RoomState]). */
+  val relayThrough: Int? = null,
+  /** Talk relays: the other agents' words quoted in [text] (and Juno's note). Checked by the send gate as relayed text. */
+  val quoted: List<String> = emptyList(),
+  /** Talk relays held for the user's "Share with X?": the agents whose answers are in [text] and need the tap. */
+  val shareFrom: List<String> = emptyList(),
+  /** The same relay without [shareFrom]'s answers (null when nothing would be left): sent if the user says no. */
+  val textWithoutShared: String? = null,
+  val quotedWithoutShared: List<String> = emptyList(),
+  /** The user approved this exact text with a tap: it goes out as theirs. */
+  val approved: Boolean = false,
 ) {
   val replyText: String get() = replies.joinToString("\n") { it.text }
   val uncertain: Boolean get() = replies.any { it.certainty == Certainty.LOW }
@@ -106,7 +121,7 @@ data class AskState(
 }
 
 @Serializable
-enum class PendingKind { WAIT, ASK_USER, APPROVAL, CHALLENGE_WAIT }
+enum class PendingKind { WAIT, ASK_USER, APPROVAL, CHALLENGE_WAIT, ROOM_ROUND }
 
 /** A tool call whose output is not known yet. The run continues once every pending call has an [output]. */
 @Serializable
@@ -152,6 +167,8 @@ data class RunState(
   val error: String? = null,
   val errorKind: LlmException.Kind? = null,
   val agreement: AgreementMap? = null,
+  /** A talk ("Talk it over"): its entries, rounds and outcome. Set for [RunMode.ROOM]. */
+  val room: RoomState? = null,
   val version: Long = 0,
 ) {
   fun ask(id: String) = asks.firstOrNull { it.id == id }

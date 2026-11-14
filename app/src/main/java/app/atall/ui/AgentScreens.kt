@@ -171,6 +171,7 @@ fun AddAgentScreen(form: AgentFormState, existing: List<AgentProfile>, onBack: (
 fun AgentDetailScreen(
     peer: PeerUi, form: AgentFormState, existing: List<AgentProfile>,
     onBack: () -> Unit, onSave: () -> Unit, onPause: (Boolean) -> Unit, onRemove: () -> Unit,
+    askBeforeSharing: Boolean = false, onAskBeforeSharing: (Boolean) -> Unit = {},
 ) {
     val c = AppTheme.colors
     var confirm by remember { mutableStateOf(false) }
@@ -198,6 +199,21 @@ fun AgentDetailScreen(
                         colors = SwitchDefaults.colors(checkedTrackColor = c.ink, checkedThumbColor = c.onInk, uncheckedTrackColor = c.sunken, uncheckedBorderColor = c.hairlineStrong, uncheckedThumbColor = c.ink3),
                     )
                 }
+            }
+            SectionLabel("Talking it over")
+            Card {
+                Row(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Ask before sharing its answers", style = AppTheme.type.body, color = c.ink)
+                        Text("When your agents talk something over, ${peer.name}'s answers go to the others only after you tap Share.", style = AppTheme.type.caption, color = c.ink3)
+                    }
+                    Switch(
+                        checked = askBeforeSharing, onCheckedChange = onAskBeforeSharing,
+                        colors = SwitchDefaults.colors(checkedTrackColor = c.ink, checkedThumbColor = c.onInk, uncheckedTrackColor = c.sunken, uncheckedBorderColor = c.hairlineStrong, uncheckedThumbColor = c.ink3),
+                    )
+                }
+                HorizontalDivider(color = c.hairline)
+                Text("In a talk, ${Main.NAME} sends ${peer.name} what the others said.", Modifier.padding(14.dp), style = AppTheme.type.caption, color = c.ink3)
             }
             SectionLabel("Name and number")
             AgentForm(form, existing)

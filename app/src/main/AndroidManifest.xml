@@ -2,6 +2,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- One notification when a talk's answer lands (Android 13+ asks the first time a talk starts). -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <queries>
         <!-- Custom Tabs for Sign in with ChatGPT (Android 11+ package visibility). -->

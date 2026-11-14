@@ -20,6 +20,11 @@ data class AgentProfile(
   val paused: Boolean = false,
   val softTimeoutMs: Long? = null,
   val hardTimeoutMs: Long? = null,
+  /**
+   * Its answers may hold the user's private details (it reads their mail, calendar or memory, like Hark or Muse).
+   * In a talk, nothing it says is passed to another agent until the user taps "Share with X?".
+   */
+  val sensitive: Boolean = false,
 ) {
   init { require(id.isNotBlank() && name.isNotBlank()) { "agent needs an id and a name" } }
   val handles: List<String> get() = listOf(name) + aliases
