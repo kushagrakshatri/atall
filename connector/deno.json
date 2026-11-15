@@ -1,0 +1,32 @@
+{
+  "tasks": {
+    "test": "deno test --allow-net --allow-env --allow-read tests/",
+    "test:pg": "ATALL_TEST_PG=${ATALL_TEST_PG:-postgres://postgres@127.0.0.1:54329/atall_test} deno test --allow-net --allow-env --allow-read tests/",
+    "test:pglite": "ATALL_TEST_PGLITE=1 deno test --allow-net --allow-env --allow-read --allow-write --allow-sys tests/",
+    "check": "deno check supabase/functions/atall/index.ts tests/ tools/ scripts/build-static.ts scripts/local-stack.ts",
+    "lint": "deno lint supabase/ tests/ tools/ scripts/lib/phone.ts scripts/build-static.ts scripts/local-stack.ts",
+    "build-static": "deno run --allow-read --allow-write --allow-env scripts/build-static.ts",
+    "local-stack": "deno run -A scripts/local-stack.ts",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "imports": {
+    "@std/expect": "jsr:@std/expect@^1",
+    "@std/testing/bdd": "jsr:@std/testing@^1/bdd",
+    "postgres": "npm:postgres@^3.4",
+    "@electric-sql/pglite": "npm:@electric-sql/pglite@^0.3"
+  },
+  "compilerOptions": {
+    "strict": true
+  },
+  "lint": {
+    "rules": {
+      "exclude": [
+        "no-explicit-any",
+        "require-await"
+      ]
+    }
+  },
+  "fmt": {
+    "lineWidth": 200
+  }
+}

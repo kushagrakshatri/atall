@@ -1,0 +1,11 @@
+.env
+.env.local
+supabase/.env.local
+supabase/.temp/
+supabase/.branches/
+.atall-secrets.local
+dist/
+node_modules/
+tools/.phone-sim.state.json
+.secrets/
+*.pem

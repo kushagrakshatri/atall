@@ -1,0 +1,28 @@
+# Supabase CLI config for the Atall connector (C0). Only what this project needs; the CLI fills
+# the rest with defaults. Hosted project: ggmvzyyuksewkgbokrhe (us-west-1).
+project_id = "atall-connector"
+
+[api]
+enabled = true
+port = 54321
+# PostgREST must expose `public`, where the atall_* SQL functions live (service_role only).
+schemas = ["public", "graphql_public"]
+extra_search_path = ["public", "extensions"]
+
+[db]
+port = 54322
+major_version = 17
+
+[studio]
+enabled = true
+port = 54323
+
+[edge_runtime]
+enabled = true
+policy = "per_worker"
+
+# The function runs its own OAuth 2.1 server, so the gateway must not require a Supabase JWT.
+[functions.atall]
+enabled = true
+verify_jwt = false
+entrypoint = "./functions/atall/index.ts"
