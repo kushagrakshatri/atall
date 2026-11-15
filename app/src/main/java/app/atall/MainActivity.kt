@@ -150,6 +150,7 @@ class MainActivity : ComponentActivity() {
                         g.prefs.userName = app.atall.core.UserName.normalize(typed)
                     },
                     debug = debugUi(),
+                    relay = relayParams(),
                 )
             }
             is Screen.AddAgent -> {
@@ -186,6 +187,19 @@ class MainActivity : ComponentActivity() {
             val text = remember { runCatching { assets.open("licenses/OFL-Geist.txt").bufferedReader().readText() }.getOrDefault("") }
             LicencesDialog(text) { licences = false }
         }
+    }
+
+    /** Settings → Agents → Connected agents, and the debug test task. The list refreshes each time the screen opens. */
+    @Composable
+    private fun relayParams(): app.atall.ui.RelayParams {
+        val r = graph.relay
+        val ui by r.ui.collectAsState()
+        val test by r.test.collectAsState()
+        LaunchedEffect(Unit) { r.refreshAgents() }
+        return app.atall.ui.RelayParams(
+            ui = ui, onConnect = { code -> r.pair(code) }, onRevoke = { r.revoke(it) },
+            test = test, onSendTest = { r.sendTestTask() }, onCloseTest = { r.closeTest() },
+        )
     }
 
     /** Settings → Debugging. State lives here so the switch and the DSN field update as you use them. */

@@ -24,3 +24,5 @@ include(":chatgpt-auth")
 include(":coordinator", ":coordinator:adapters")
 // Agent Inbox (dedupe, triage, digest). Pure Kotlin; built and tested, not yet wired into the thread.
 include(":inbox")
+// Atall relay (C1): pairing, signed phone requests, verified events. Pure Kotlin + an Android Keystore edge.
+include(":relay-client", ":relay-client:android")

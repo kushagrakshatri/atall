@@ -83,6 +83,8 @@ dependencies {
     implementation(project(":chatgpt-auth"))
     // Juno (coordinator) + its glue to text-agents/chatgpt-auth, and the inbox module.
     implementation(project(":coordinator:adapters"))
+    // Atall relay (C1): Keystore-signed phone requests and verified agent events.
+    implementation(project(":relay-client:android"))
 
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.activity.compose)
