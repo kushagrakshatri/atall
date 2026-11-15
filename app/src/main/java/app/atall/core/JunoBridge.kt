@@ -41,7 +41,10 @@ import app.atall.coordinator.SendGate
 import app.atall.coordinator.TalkTrigger
 import app.atall.coordinator.TalkView
 import app.atall.coordinator.Views
+import app.atall.coordinator.adapters.ConnectorAgent
+import app.atall.coordinator.adapters.ConnectorText
 import app.atall.coordinator.adapters.TextAgentPeer
+import app.atall.api.ChannelType
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -91,7 +94,11 @@ class JunoBridge(
     private val telemetry: Telemetry = Telemetry.NONE,
     /** A run is reported as stuck when nothing changed for this long while every reply is in. */
     private val stuckAfterMs: Long = 60_000L,
+    /** C2: the Atall connector. Agents it can reach get Juno's asks as signed task cards; the rest go by text. */
+    private val connector: ConnectorAccess = ConnectorAccess.NONE,
 ) {
+    /** Called when a run starts for a user message, before anything is sent (the debug Story 1 marks its run here). */
+    var onRunStarted: (runId: String, msg: ThreadMessage) -> Unit = { _, _ -> }
     val juno = Juno({ roster() }, ::peerFor, SignedInLlm(llm), store, scores, clock, config, userName = userName, trace = { runId, name, detail, text ->
         log.add("juno", name, runId, detail, text)
         when {
@@ -137,28 +144,55 @@ class JunoBridge(
 
     // ------------------------------------------------------------------ roster and peers
 
-    /** Juno plus every agent; paused or not-yet-reachable agents are in it, marked paused. */
+    /**
+     * Juno plus every agent; paused or not-yet-reachable agents are in it, marked paused. An agent the connector can
+     * reach gets its per-agent connector timeouts (C2); a connector-only agent with no live connection is unreachable.
+     */
     fun roster(): Roster = Roster(listOf(JunoAgent(Main.AUTHOR, Main.NAME, AgentKind.MAIN)) + registry.all().map { p ->
-        JunoAgent(p.id, p.name, AgentKind.TEXT, aliases = p.aliases, paused = p.paused || !p.channel.implemented, sensitive = p.sharesPrivately)
+        val relayId = connector.relayIdFor(p)
+        val t = relayId?.let { ConnectorRouting.timeouts(it) }
+        JunoAgent(p.id, p.name, AgentKind.TEXT, aliases = p.aliases, paused = p.paused || (!textRoute(p) && relayId == null),
+            sensitive = p.sharesPrivately, softTimeoutMs = t?.softMs, hardTimeoutMs = t?.hardMs)
     })
 
-    /** Whether there is anyone to coordinate (otherwise the app's streaming plain chat answers). */
-    fun hasActivePeers(): Boolean = registry.all().any { !it.paused && it.channel.implemented && peers.agent(it.id) != null }
+    private fun textRoute(p: AgentProfile) = p.channel.implemented && p.channel != ChannelType.CONNECTOR
 
+    /** Whether there is anyone to coordinate (otherwise the app's streaming plain chat answers). */
+    fun hasActivePeers(): Boolean = registry.all().any { !it.paused && ((textRoute(it) && peers.agent(it.id) != null) || connector.relayIdFor(it) != null) }
+
+    /**
+     * The peer Juno sends [id]'s asks to. Over the connector when the phone is paired and the agent is connected (a
+     * signed task card: a short title and the same packed text a text would carry); by text otherwise. When the relay
+     * can't be reached or refuses this phone at send time, the ask goes by text instead, except in a connector-only run.
+     */
     private fun peerFor(id: String): Peer? {
-        val agent = peers.agent(id) ?: return null
+        val profile = registry.get(id) ?: return null
+        val agent = if (textRoute(profile)) peers.agent(id) else null
         // No draft from Juno's side: with no live reply action the ask becomes "Tap to send to X" in the thread
         // (two drafts opened back to back would replace each other in Messages).
-        val inner = TextAgentPeer(agent, replyWindowMs = 30 * 60_000L, allowDraft = false)
+        val inner = agent?.let { TextAgentPeer(it, replyWindowMs = 30 * 60_000L, allowDraft = false) }
+        val conn = connector.peer(profile)
+        if (inner == null && conn == null) return null
         return object : Peer {
             override val id: String = id
             override suspend fun send(text: String, correlationId: String): PeerSend {
                 val p = packed(id, text, correlationId)
                 // The send gate, at the transport: only the user's own words may carry buy / book / "go ahead".
                 if (SendGate.check(p.segments, userName()).gated) return PeerSend.Failed("needs_your_ok")
-                return inner.send(p.text, correlationId)
+                val runId = PeerLines.runIdOf(correlationId)
+                val only = connector.connectorOnly(runId)
+                if (conn != null) {
+                    val r = conn.sendCard(correlationId, ConnectorText.title(text), p.text)
+                    val byText = r is PeerSend.Failed && r.reason in ConnectorAgent.UNAVAILABLE && inner != null && !only
+                    log.add("connector", "send", runId, "${correlationId.substringAfter('~')} to ${conn.relayAgentId}: " + when (r) {
+                        is PeerSend.Sent -> "posted"; is PeerSend.Duplicate -> "already posted"; is PeerSend.Failed -> r.reason + if (byText) " (sending by text)" else ""
+                        else -> r.javaClass.simpleName
+                    })
+                    if (!byText) return r
+                } else if (only) return PeerSend.Failed("connector_unavailable")
+                return inner!!.send(p.text, correlationId)
             }
-            override suspend fun close(correlationId: String) = inner.close(correlationId)
+            override suspend fun close(correlationId: String) { conn?.close(correlationId); inner?.close(correlationId) }
         }
     }
 
@@ -211,6 +245,7 @@ class JunoBridge(
             is Route.Direct -> error("direct messages don't start runs")
         }
         liveRuns += runId
+        runCatching { onRunStarted(runId, msg) }
         thread.update(msg.id) { it.copy(runId = runId, status = SendStatus.SENT, statusNote = null) }
         project(runId)
         if (autoDrive) scope.launch { drive(runId) }
@@ -481,7 +516,7 @@ class JunoBridge(
             for (p in replies) {
                 val id = "in:${p.messageId}"
                 put(ThreadMessage(id, thread.get(id)?.at ?: at(p.at), a.agentId, p.text, attribution = Attribution.JUNO,
-                    askId = a.id, sourceId = p.messageId, detail = replyNote(p.certainty, p.late),
+                    askId = a.id, sourceId = p.messageId, detail = replyNote(p.certainty, p.late), via = p.provenance.takeIf { it == app.atall.coordinator.Via.CONNECTOR },
                     suggest = PeerLines.suggestions(p.text, a.agentId, registry.all())))
             }
         }

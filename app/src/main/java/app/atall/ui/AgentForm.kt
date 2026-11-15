@@ -104,7 +104,8 @@ private fun ChannelPicker(selected: ChannelType, onPick: (ChannelType) -> Unit) 
         Text("How it reaches you", style = AppTheme.type.label, color = c.ink3)
         Spacer(Modifier.height(6.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            for (ch in ChannelType.entries) {
+            // Connector agents are added from the relay (Connected agents), never typed in.
+            for (ch in ChannelType.entries.filter { it != ChannelType.CONNECTOR }) {
                 val on = ch == selected
                 Box(
                     Modifier.heightIn(min = 36.dp).clip(CircleShape)

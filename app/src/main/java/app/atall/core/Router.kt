@@ -21,6 +21,11 @@ import app.atall.api.ShowEverything
 import app.atall.api.ThreadLine
 import app.atall.api.ThreadSink
 import app.atall.chatgpt.ResponsesClient
+import app.atall.coordinator.PeerSend
+import app.atall.coordinator.PeerSignal
+import app.atall.coordinator.Via
+import app.atall.coordinator.adapters.ConnectorAgent
+import app.atall.coordinator.adapters.ConnectorText
 
 /**
  * Turns what the user types into sends, and what agents send into thread lines.
@@ -49,6 +54,8 @@ class Router(
     private val userName: () -> String = { "" },
     /** Whether Juno can call the model (a ChatGPT sign-in exists). Defaults to [responses] being present. */
     private val signedIn: () -> Boolean = { responses() != null },
+    /** C2: direct @mentions to an agent the connector can reach go as signed task cards. */
+    private val connector: () -> ConnectorAccess = { ConnectorAccess.NONE },
 ) {
     /**
      * Called for each user message. Suspends until direct sends are handed off and the main agent has answered.
@@ -113,13 +120,16 @@ class Router(
         val names = registry.all().associate { it.id to it.name }
         for (peerId in route.peerIds) {
             val p = registry.get(peerId) ?: continue
+            val conn = if (p.paused) null else connector().peer(p)
             val problem = when {
                 p.paused -> "${p.name} is paused."
+                conn != null -> null
+                p.channel == app.atall.api.ChannelType.CONNECTOR -> "${p.name} isn't connected right now."
                 !p.channel.implemented -> "${p.name} can't be reached from Atall yet."
                 else -> null
             }
-            val agent = if (problem == null) peers.agent(p.id) else null
-            if (agent == null) { failure = failure ?: (problem ?: "${p.name} can't be reached right now."); continue }
+            val agent = if (problem == null && p.channel != app.atall.api.ChannelType.CONNECTOR) peers.agent(p.id) else null
+            if (agent == null && conn == null) { failure = failure ?: (problem ?: "${p.name} can't be reached right now."); continue }
             val cid = directCid(msg.id, p.id, attempt)
             val others = route.peerIds.filter { it != p.id }.mapNotNull { names[it] }
             val packed = ContextPack.packed(ContextPack.Input(
@@ -129,6 +139,20 @@ class Router(
             // The send gate, at the transport: the user's own words go; nothing else may say buy / book / go ahead.
             if (app.atall.coordinator.SendGate.check(packed.segments, userName()).gated) { failure = failure ?: "Needs your OK first."; continue }
             val text = packed.text
+            if (conn != null) {
+                // Over the connector: a signed task card. Its answer comes back verified through onConnectorReply.
+                val r = conn.sendCard(cid, ConnectorText.title(msg.text), text)
+                val byText = r is PeerSend.Failed && r.reason in ConnectorAgent.UNAVAILABLE && agent != null
+                if (!byText) {
+                    when (r) {
+                        is PeerSend.Sent, is PeerSend.Duplicate -> {}
+                        is PeerSend.RateLimited -> failure = failure ?: "Wait a moment, then retry."
+                        else -> failure = failure ?: "Couldn't reach ${p.name} over Atall."
+                    }
+                    continue
+                }
+            }
+            if (agent == null) { failure = failure ?: "Couldn't reach ${p.name} over Atall."; continue }
             when (val r = agent.send(text, cid, SendOptions(allowDraft = false))) {
                 is SendResult.Sent, is SendResult.Duplicate, is SendResult.Drafted -> {}
                 is SendResult.NeedsUser -> thread.upsert(
@@ -196,6 +220,21 @@ class Router(
         showPeer(p.id, m.id, m.text, m.sentAt, attribution)
     }
 
+    /**
+     * An answer (or a status line) over the connector to a direct @mention. A result shows as the agent's direct reply
+     * with the verified badge; progress, questions and approval requests are muted status lines, never the answer.
+     */
+    suspend fun onConnectorReply(peerId: String, m: PeerSignal.Message) {
+        val p = registry.get(peerId) ?: return
+        if (thread.hasSource(m.messageId) || thread.get("status:${m.messageId}") != null) return
+        if (m.status != null) {
+            thread.upsert(ThreadMessage("status:${m.messageId}", maxOf(m.at, now()), Main.AUTHOR, PeerLines.statusLine(p.name, m.text),
+                kind = MessageKind.NOTICE, peerId = p.id, sourceId = m.messageId))
+            return
+        }
+        showPeer(p.id, m.messageId, m.text, m.at, Attribution.DIRECT, via = if (m.via == Via.CONNECTOR && m.verified) Via.CONNECTOR else null)
+    }
+
     /** Catch up from a peer's durable log (the live flow doesn't replay). Lines from before the agent was added are skipped. */
     suspend fun backfill(peerId: String, entries: List<LogEntry>) {
         val p = registry.get(peerId) ?: return
@@ -232,12 +271,12 @@ class Router(
         if (next !== target) thread.upsert(next)
     }
 
-    private fun showPeer(peerId: String, sourceId: String, text: String, sentAt: Long, attribution: Attribution) {
+    private fun showPeer(peerId: String, sourceId: String, text: String, sentAt: Long, attribution: Attribution, via: Via? = null) {
         val direct = attribution == Attribution.DIRECT
         // A direct answer never shows above the question it answers, even with a skewed timestamp.
         val floor = if (direct) (thread.chronological().lastOrNull { it.author == ThreadMessage.USER }?.at ?: 0) + 1 else 0
         thread.upsert(ThreadMessage("in:$sourceId", maxOf(sentAt, floor), peerId, text, direct = direct, sourceId = sourceId, attribution = attribution,
-            suggest = PeerLines.suggestions(text, peerId, registry.all())))
+            suggest = PeerLines.suggestions(text, peerId, registry.all()), via = via))
         dropStaleHints(peerId)
     }
 

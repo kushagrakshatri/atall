@@ -288,12 +288,19 @@ class Juno(
             return@withLock
           }
           val late = signal.late || ask.status.settled
-          val part = ReplyPart(signal.messageId, signal.text, signal.at, signal.certainty, late, signal.userInterjected)
+          val part = ReplyPart(signal.messageId, signal.text, signal.at, signal.certainty, late, signal.userInterjected,
+            via = signal.via, verified = signal.verified, claims = signal.claims)
           if (ask.replies.isEmpty()) events += ScoreEvent.FirstReply(ask.agentId, now, ask.id, now - (ask.sentAt ?: ask.createdAt), signal.certainty, late)
-          val updated = ask.copy(
+          if (signal.via == Via.CONNECTOR) {
+            events += ScoreEvent.ClaimsIn(ask.agentId, now, ask.id, signal.claims.size, signal.claims.sumOf { it.sources.size }, signal.verified)
+            trace.event(s.runId, "reply.connector", "${ask.id} ${roster.nameOf(ask.agentId)} claims=${signal.claims.size} verified=${signal.verified} final=${signal.final}", null)
+          }
+          val replying = ask.copy(
             replies = ask.replies + part, status = AskStatus.REPLYING, lastReplyAt = now, settledAt = null,
             sentAt = ask.sentAt ?: now, afterMerge = ask.afterMerge || s.phase.terminal, followedUp = false,
           )
+          // A connector result is the whole answer: no quiet window for more fragments.
+          val updated = if (signal.final) settle(replying, AskStatus.ANSWERED, now, events) else replying
           putL(s.replaceAsk(updated))
           updates += RunUpdate.Changed(s.runId)
         }
@@ -692,6 +699,9 @@ class Juno(
             else -> "still_working"
           })
           if (a.replies.isNotEmpty()) put("reply", a.replyText)
+          // C2: an answer over the connector carries its claims with confidence and sources; use them in the merge.
+          if (a.claims.isNotEmpty()) put("claims", Claims.json(a.claims))
+          if (a.replies.isNotEmpty()) put("via", if (a.verified) "connector_verified" else "text")
           val notes = buildList {
             if (a.uncertain) add("Uncertain: the user also typed in that chat, so this may not answer your message.")
             if (a.late) add("Arrived late.")
@@ -740,11 +750,14 @@ class Juno(
       var s = getL(runId) ?: return
       val now = clock()
       for ((a0, r) in results) {
-        val a = s.ask(a0.id)?.takeIf { it.status == AskStatus.SENDING } ?: continue
+        val cur = s.ask(a0.id) ?: continue
+        // A reply can land before the send call returns (it moved the ask on); still record the transport it went by.
+        if (cur.status != AskStatus.SENDING) { if (cur.via == null && r is PeerSend.Sent) s = s.replaceAsk(cur.copy(via = r.via)); continue }
+        val a = cur
         val prof = roster.byId(a.agentId)
         fun sentAt(at: Long) = a.copy(sentAt = a.sentAt ?: at, softDeadline = at + soft(prof), hardDeadline = at + hard(prof))
         val next = when (r) {
-          is PeerSend.Sent -> sentAt(r.at).copy(status = AskStatus.PENDING)
+          is PeerSend.Sent -> sentAt(r.at).copy(status = AskStatus.PENDING, via = r.via)
           is PeerSend.Duplicate -> sentAt(r.firstAt).copy(status = AskStatus.PENDING)
           is PeerSend.Drafted -> sentAt(r.at).copy(status = AskStatus.DRAFTED)
           is PeerSend.NeedsUser -> a.copy(status = AskStatus.NEEDS_TAP, draftText = r.draftText, draftNumber = r.number)
@@ -753,7 +766,7 @@ class Juno(
         }
         trace.event(runId, "send", "${a.id} ${roster.nameOf(a.agentId)} " + when (r) {
           is PeerSend.Failed -> "failed:${r.reason}"; is PeerSend.RateLimited -> "rate_limited"; is PeerSend.NeedsUser -> "needs_tap (no live reply action)"
-          is PeerSend.Drafted -> "drafted"; is PeerSend.Duplicate -> "duplicate"; is PeerSend.Sent -> "sent"
+          is PeerSend.Drafted -> "drafted"; is PeerSend.Duplicate -> "duplicate"; is PeerSend.Sent -> if (r.via == Via.CONNECTOR) "sent (connector)" else "sent"
         }, null)
         if (r !is PeerSend.Duplicate) events += ScoreEvent.AskSent(a.agentId, now, a.id, viaOf(r), a.purpose)
         if (r is PeerSend.NeedsUser) {
@@ -972,6 +985,7 @@ class Juno(
         val who = if (agent == roster.main.id) "Your own first take (${roster.main.name}, written without the agents' context)" else roster.nameOf(agent)
         append("\n").append(who).append(":\n")
         asks.forEach { append(it.replyText.trim()).append("\n") }
+        asks.flatMap { it.claims }.takeIf { it.isNotEmpty() }?.let { append("Its claims (with confidence and sources):\n").append(Claims.lines(it)).append("\n") }
       }
       val c = Agreement.Clusters(map.agreed, map.disputed, map.unique)
       append("\nComparison:\n").append(Agreement.describe(s.userText, c, roster::nameOf)).append("\n")
@@ -1022,7 +1036,11 @@ class Juno(
     val labels = raw.mapIndexed { i, a -> Agreement.label(i) to a.agentId }.toMap()
     val input = buildString {
       append("Question: ").append(s.userText).append("\n")
-      raw.forEachIndexed { i, a -> append("\nAnswer ").append(Agreement.label(i)).append(":\n").append(a.text.trim()).append("\n") }
+      raw.forEachIndexed { i, a ->
+        append("\nAnswer ").append(Agreement.label(i)).append(":\n").append(a.text.trim()).append("\n")
+        // C2: claims the agent posted with its answer (connector): extract from these first, keep their sources as evidence.
+        claimsOf(s, a.agentId).takeIf { it.isNotEmpty() }?.let { append("Claims it posted (with confidence and sources):\n").append(Claims.lines(it)).append("\n") }
+      }
     }
     val parsed = try {
       Agreement.parse(model(LlmRequest("claims", Prompts.render("claims_extract"), listOf(Items.user(input)), jsonSchema = Agreement.claimsSchema, schemaName = "claims")).text, labels)
@@ -1034,6 +1052,11 @@ class Juno(
     val asked = parsed?.answers.orEmpty().filter { it.asks.isNotEmpty() }.associate { it.agentId to it.asks }
     return withVerdict(base.copy(agreed = clusters?.agreed.orEmpty(), disputed = clusters?.disputed.orEmpty(), unique = clusters?.unique.orEmpty(), asked = asked), raw.size, clusters == null, verdictCall)
   }
+
+  /** The structured claims [agentId] posted for this run's blind/talk asks (connector answers), newest ask last. */
+  private fun claimsOf(s: RunState, agentId: String): List<SourcedClaim> =
+    s.asks.filter { it.agentId == agentId && (it.purpose == AskPurpose.BLIND || it.purpose == AskPurpose.ROOM || it.purpose == AskPurpose.CHALLENGE) }
+      .lastOrNull { it.claims.isNotEmpty() }?.claims.orEmpty()
 
   private suspend fun withVerdict(map: AgreementMap, answered: Int, unclear: Boolean, verdictCall: Boolean = true): AgreementMap {
     val c = if (unclear) null else Agreement.Clusters(map.agreed, map.disputed, map.unique)
@@ -1656,7 +1679,8 @@ class Juno(
   private fun hard(p: AgentProfile?) = p?.hardTimeoutMs ?: if (p?.kind == AgentKind.API) config.apiHardTimeoutMs else config.textHardTimeoutMs
 
   private fun viaOf(r: PeerSend) = when (r) {
-    is PeerSend.Sent, is PeerSend.Duplicate -> "sent"; is PeerSend.Drafted -> "drafted"; is PeerSend.NeedsUser -> "needs_tap"
+    is PeerSend.Sent -> if (r.via == Via.CONNECTOR) "connector" else "sent"
+    is PeerSend.Duplicate -> "sent"; is PeerSend.Drafted -> "drafted"; is PeerSend.NeedsUser -> "needs_tap"
     is PeerSend.RateLimited -> "rate_limited"; is PeerSend.Failed -> "failed"
   }
 

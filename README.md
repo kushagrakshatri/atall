@@ -5,9 +5,26 @@ phone, and `@mention` any other agent you use to ask it directly. Atall is open 
 phone. The optional Atall relay (`connector/`, a Supabase Edge Function) lets agents that support MCP pick up
 phone-signed tasks.
 
-> Status: **v0.1.5, pre-release.** Juno coordinates: it asks your agents, waits, and merges their answers;
-> `@all` asks everyone the same question and shows where they agree; your agents can **talk it over**; and the
-> phone can now pair with the Atall relay (C1).
+> Status: **v0.1.6-c2.1, pre-release (branch c2).** Juno coordinates: it asks your agents, waits, and merges their
+> answers; `@all` asks everyone the same question and shows where they agree; your agents can **talk it over**; and
+> Juno now reaches agents connected to the Atall relay over the connector (C2), falling back to texts only when it
+> can't.
+
+## New in v0.1.6-c2.1: C2, Juno on the connector
+
+- **Connector first.** When the phone is paired and an agent has a live connection on the relay, Juno's asks,
+  `@all` and direct `@mentions` go to it as phone-signed task cards (addressed to that agent only, asking for
+  claims). Agents that aren't connected, or a relay that can't be reached, use the text route as before.
+- **Answers with claims.** A result is the whole answer at once (no quiet window). Its claims, with confidence and
+  sources, are stored on the run and given to the merge and the Agreement Map. Progress messages, questions and
+  approval requests show as muted status lines (a bare claim shows nothing); they never count as an answer, and each
+  agent keeps its own timeout.
+- **Provenance.** An answer that came over the connector with a countersignature that checked out for that agent's
+  connection shows **✓ Verified**. Texted answers show no badge. Events that don't verify are dropped.
+- **Connected agents join the thread.** Agents the relay lists that you haven't added (e.g. Grok, Duet) appear in
+  your agents as "Over the Atall connector". While Juno waits on them, a silent notification keeps Atall running.
+- **Debugging → Run Story 1.** "@Juno ask @Grok and @Duet: Plan Saturday dinner for four, no pork or beef." over
+  the connector only (no text fallback).
 
 ## New in v0.1.5: M0.5 fixes
 
@@ -96,7 +113,7 @@ phone-signed tasks.
   relay (kDot, Grok, Hark, Claude Duet, Meta Muse) with when each was last seen and what it last did, and a
   **Revoke** button (with a confirm) that cuts that agent off right away.
 - **Debugging → Send test task to all.** Posts a phone-signed test task and shows each agent's events as they arrive,
-  with a check when the relay's countersignature verifies. Not wired into Juno yet (that's C2).
+  with a check when the relay's countersignature verifies.
 - Every phone request is signed (`METHOD\nPATH\nTS\nbase64url(sha256(body))`); every event's `relay_sig` is checked
   against the relay key from pairing. See `connector/C1-CONTRACT.md`.
 
@@ -137,7 +154,7 @@ Kotlin + Jetpack Compose (Material 3), no NDK, no Play Services, no Firebase.
 | `:text-agents:android` | Notification listener, reply-action firing, Messages draft intents |
 | `:chatgpt-auth` | Pure-Kotlin Sign in with ChatGPT (PKCE + loopback) and a streaming Responses client |
 | `:coordinator` | Pure-Kotlin Juno: routing, the plan → ask → wait → merge tool loop, approval gate, `@all` Agreement Map, scoreboard |
-| `:coordinator:adapters` | Glue: Responses client → Juno's model, text-agents → Juno's peers, text-agents → inbox |
+| `:coordinator:adapters` | Glue: Responses client → Juno's model, text-agents → Juno's peers, text-agents → inbox, relay-client → Juno's peers (`ConnectorAgent`, `ConnectorPump`, C2) |
 | `:inbox` | Pure-Kotlin Agent Inbox (dedupe, triage, digest, code redaction); built and tested, not wired into the thread yet |
 | `:relay-client` | Pure-Kotlin client for the Atall relay (C1): pairing, request signing, canonical JSON, relay countersignature checks, events poller with cursor + ack, tasks, answers, agents, revoke |
 | `:relay-client:android` | The relay device key (P-256, non-exportable, Android Keystore) and the paired-state store |

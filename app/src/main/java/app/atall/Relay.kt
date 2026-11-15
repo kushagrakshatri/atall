@@ -2,8 +2,18 @@ package app.atall
 
 import android.content.Context
 import android.os.Build
+import app.atall.core.AgentProfile
+import app.atall.core.AgentRegistry
+import app.atall.core.ConnectorAccess
+import app.atall.core.ConnectorRouting
 import app.atall.core.DebugLog
 import app.atall.core.RelayCopy
+import app.atall.coordinator.PeerSignal
+import app.atall.coordinator.adapters.CardPeer
+import app.atall.coordinator.adapters.ConnectorAgent
+import app.atall.coordinator.adapters.ConnectorDirectory
+import app.atall.coordinator.adapters.ConnectorLedger
+import app.atall.coordinator.adapters.ConnectorPump
 import app.atall.relay.EventsPoller
 import app.atall.relay.RelayAgent
 import app.atall.relay.RelayClient
@@ -12,16 +22,21 @@ import app.atall.relay.RelayException
 import app.atall.relay.TaskCard
 import app.atall.relay.android.KeystoreDeviceKey
 import app.atall.relay.android.PrefsRelayStore
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
+import java.io.File
 import java.io.IOException
 import java.time.Instant
 import java.time.temporal.ChronoUnit
+import java.util.concurrent.ConcurrentHashMap
 
 /** Settings → Agents, relay part. */
 data class RelayUi(
@@ -43,19 +58,111 @@ data class TestTaskUi(
 )
 
 /**
- * The phone side of the Atall relay (C1): pairing with the owner code, the connected agents, revoking, and a debug test
- * task. Not wired into Juno yet (C2). Signing uses a non-exportable Android Keystore key.
+ * The phone side of the Atall relay: pairing with the owner code, the connected agents, revoking, the debug test task,
+ * and (C2) the connector Juno uses. One events poller feeds everything: Juno's asks and direct @mentions (through
+ * [ConnectorPump]) and the debug test task. It polls every few seconds while a connector task is open, else slowly.
+ * Signing uses a non-exportable Android Keystore key.
  */
-class Relay(context: Context, private val scope: CoroutineScope, private val log: DebugLog) {
+class Relay(
+    private val context: Context,
+    private val scope: CoroutineScope,
+    private val log: DebugLog,
+    dataDir: File,
+    private val registry: AgentRegistry,
+) {
     private val key = KeystoreDeviceKey()
     private val store = PrefsRelayStore(context)
     val client = RelayClient(key = key, store = store)
+    val ledger = ConnectorLedger(File(dataDir, "connector-tasks.json"))
+    val directory = ConnectorDirectory(client)
 
     private val _ui = MutableStateFlow(RelayUi(paired = store.paired))
     val ui: StateFlow<RelayUi> = _ui
     private val _test = MutableStateFlow<TestTaskUi?>(null)
     val test: StateFlow<TestTaskUi?> = _test
     private var testJob: Job? = null
+    @Volatile private var testTaskId: String? = null
+    private val connectorOnlyRuns = ConcurrentHashMap.newKeySet<String>()
+    private val poller = EventsPoller(client, store) { page -> onEvents(page) }
+    private var pump: ConnectorPump? = null
+    private var loop: Job? = null
+    /** Wakes the loop early (a task was just posted). */
+    private val kick = MutableStateFlow(0L)
+    /** Called after the connected agents change, so the registry and the thread roster follow. */
+    var onAgentsChanged: () -> Unit = {}
+
+    /** What Juno and the Router use: the connector route for an agent, when there is one right now. */
+    val access = object : ConnectorAccess {
+        override fun relayIdFor(p: AgentProfile): String? {
+            val ids = directory.agents?.map { it.agentId } ?: return null
+            return if (directory.paired) ConnectorRouting.relayIdOf(p, ids) else null
+        }
+
+        override fun peer(p: AgentProfile): CardPeer? {
+            val relayId = relayIdFor(p) ?: return null
+            val agent = ConnectorAgent(p.id, relayId, client, ledger, ConnectorRouting.timeouts(relayId).hardMs)
+            return object : CardPeer by agent {
+                override suspend fun sendCard(correlationId: String, title: String, goal: String) =
+                    agent.sendCard(correlationId, title, goal).also { kick.value = System.currentTimeMillis() }
+            }
+        }
+
+        override fun connectorOnly(runId: String): Boolean = runId in connectorOnlyRuns
+    }
+
+    /** Story 1 (debug): this run never falls back to text. */
+    fun markConnectorOnly(runId: String) { connectorOnlyRuns += runId }
+
+    /**
+     * Starts the events loop. [toJuno] takes signals for Juno's asks, [toDirect] answers to direct @mentions. Also keeps
+     * the connected-agents list fresh (every minute), which is what routing reads.
+     */
+    fun start(toJuno: suspend (PeerSignal) -> Unit, toDirect: suspend (String, PeerSignal.Message) -> Unit) {
+        if (loop != null) return
+        pump = ConnectorPump(ledger, toJuno, toDirect, note = { n -> log.add("connector", "event", null, "#${n.cursor} ${n.type} ${n.agentId}: ${n.outcome}") })
+        loop = scope.launch {
+            var lastAgents = 0L
+            var backoff = FAST_MS
+            while (isActive) {
+                val now = System.currentTimeMillis()
+                var wait = SLOW_MS
+                if (store.paired) {
+                    if (now - lastAgents >= AGENTS_EVERY_MS || directory.agents == null) { refreshAgentsNow(); lastAgents = now }
+                    val busy = ledger.open(now).isNotEmpty() || testJob?.isActive == true
+                    ConnectorService.keep(context, busy) { waitingNames(now) }
+                    wait = try {
+                        val got = poller.pollOnce()
+                        backoff = FAST_MS
+                        when { got.isNotEmpty() -> 0L; busy -> FAST_MS; else -> SLOW_MS }
+                    } catch (e: CancellationException) { throw e } catch (e: Throwable) {
+                        log.add("connector", "poll.error", null, describe(e))
+                        backoff = (backoff * 2).coerceAtMost(SLOW_MS)
+                        backoff
+                    }
+                }
+                if (wait > 0) {
+                    val k = kick.value
+                    withTimeoutOrNull(wait) { kick.first { it != k } }
+                }
+            }
+        }
+    }
+
+    private fun waitingNames(now: Long): List<String> = ledger.open(now).mapNotNull { registry.get(it.peerId)?.name }.distinct()
+
+    private suspend fun onEvents(page: List<RelayEvent>) {
+        val test = testTaskId
+        if (test != null) {
+            val mine = page.filter { it.taskId == test }
+            mine.forEach { log.add("relay", "event", null, "type=${it.type} agent=${it.agentId} verified=${it.verified} task=$test") }
+            if (mine.isNotEmpty()) _test.value = _test.value?.let { t ->
+                val events = t.events + mine
+                val results = events.count { it.type == RelayEvent.RESULT }
+                t.copy(events = events, status = "Sent to all · $results result${if (results == 1) "" else "s"}")
+            }
+        }
+        pump?.onEvents(page.filter { it.taskId == null || it.taskId != test })
+    }
 
     /** Pairs this phone. Returns null when it worked, else a short line to show under the code field. */
     suspend fun pair(ownerCode: String): String? {
@@ -80,14 +187,24 @@ class Relay(context: Context, private val scope: CoroutineScope, private val log
 
     fun refreshAgents() {
         if (!store.paired) return
-        scope.launch {
-            _ui.value = _ui.value.copy(loading = true)
-            _ui.value = try {
-                RelayUi(paired = true, agents = client.agents().sortedBy { RelayCopy.agentName(it.agentId, it.clientName).lowercase() })
-            } catch (e: Throwable) {
-                log.add("relay", "agents.error", null, describe(e))
-                _ui.value.copy(loading = false, problem = problemLine(e), reconnect = e is RelayException && e.unauthorized)
-            }
+        scope.launch { refreshAgentsNow() }
+    }
+
+    private suspend fun refreshAgentsNow() {
+        _ui.value = _ui.value.copy(loading = true)
+        val before = directory.agents?.map { it.agentId }?.toSet()
+        val list = directory.refresh()
+        val e = directory.lastError
+        _ui.value = if (e == null && list != null) {
+            RelayUi(paired = true, agents = list.sortedBy { RelayCopy.agentName(it.agentId, it.clientName).lowercase() })
+        } else {
+            log.add("relay", "agents.error", null, e?.let(::describe) ?: "no list")
+            _ui.value.copy(loading = false, problem = e?.let(::problemLine), reconnect = e is RelayException && e.unauthorized)
+        }
+        val after = directory.agents?.map { it.agentId }?.toSet()
+        if (after != before) {
+            log.add("connector", "agents", null, "connected=" + (after?.sorted()?.joinToString(",") ?: "unknown"))
+            onAgentsChanged()
         }
     }
 
@@ -102,7 +219,7 @@ class Relay(context: Context, private val scope: CoroutineScope, private val log
                 log.add("relay", "revoke.error", null, describe(e))
                 _ui.value = _ui.value.copy(problem = "Couldn't revoke ${RelayCopy.agentName(agent.agentId, agent.clientName)}. " + (problemLine(e) ?: ""))
             }
-            refreshAgents()
+            refreshAgentsNow()
         }
     }
 
@@ -126,30 +243,17 @@ class Relay(context: Context, private val scope: CoroutineScope, private val log
                 _test.value = TestTaskUi(ref, "Couldn't send. ${problemLine(e) ?: ""}".trim(), running = false)
                 return@launch
             }
+            testTaskId = taskId
+            kick.value = System.currentTimeMillis()
             log.add("relay", "test.sent", null, "task=$taskId ref=$ref")
             _test.value = _test.value?.copy(status = "Sent to all · waiting")
-            val poller = EventsPoller(client, store) { page ->
-                val mine = page.filter { it.taskId == taskId }
-                mine.forEach { log.add("relay", "event", null, "type=${it.type} agent=${it.agentId} verified=${it.verified} task=$taskId") }
-                if (mine.isNotEmpty()) _test.value = _test.value?.let { t ->
-                    val events = t.events + mine
-                    val results = events.count { it.type == RelayEvent.RESULT }
-                    t.copy(events = events, status = "Sent to all · $results result${if (results == 1) "" else "s"}")
-                }
-            }
-            val until = System.currentTimeMillis() + 10 * 60_000
-            while (isActive && System.currentTimeMillis() < until) {
-                try { poller.pollOnce() } catch (e: Throwable) {
-                    log.add("relay", "poll.error", null, describe(e))
-                    _test.value = _test.value?.copy(status = problemLine(e) ?: "Couldn't check for results")
-                }
-                delay(3_000)
-            }
+            // The events loop polls fast while this runs and shows this task's events.
+            delay(10 * 60_000)
             _test.value = _test.value?.copy(running = false)
         }
     }
 
-    fun closeTest() { testJob?.cancel(); testJob = null; _test.value = null }
+    fun closeTest() { testJob?.cancel(); testJob = null; testTaskId = null; _test.value = null }
 
     private fun problemLine(e: Throwable): String? = when {
         e is RelayException && e.unauthorized -> "The relay didn't accept this phone. Check the phone's clock, or connect again."
@@ -160,5 +264,13 @@ class Relay(context: Context, private val scope: CoroutineScope, private val log
     private fun describe(e: Throwable) = when (e) {
         is RelayException -> "status=${e.status} error=${e.error}"
         else -> e.javaClass.simpleName + ": " + (e.message ?: "")
+    }
+
+    companion object {
+        /** While a connector task is open. */
+        const val FAST_MS = 3_000L
+        /** Otherwise: late results, presence. */
+        const val SLOW_MS = 60_000L
+        const val AGENTS_EVERY_MS = 60_000L
     }
 }

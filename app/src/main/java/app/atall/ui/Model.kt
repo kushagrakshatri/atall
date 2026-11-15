@@ -29,23 +29,27 @@ object Copy {
         ChannelType.RCS -> "Text"
         ChannelType.WHATSAPP -> "WhatsApp"
         ChannelType.APP_NOTIFICATIONS -> "App notifications"
+        ChannelType.CONNECTOR -> "Atall connector"
     }
 
     fun descriptor(c: ChannelType) = when (c) {
         ChannelType.RCS -> "By text"
         ChannelType.WHATSAPP -> "On WhatsApp"
         ChannelType.APP_NOTIFICATIONS -> "From its app"
+        ChannelType.CONNECTOR -> "Over Atall"
     }
 
     fun addressLabel(c: ChannelType) = when (c) {
         ChannelType.RCS -> "Phone number"
         ChannelType.WHATSAPP -> "WhatsApp contact name"
         ChannelType.APP_NOTIFICATIONS -> "App"
+        ChannelType.CONNECTOR -> "Connection"
     }
 
     fun addressHelper(c: ChannelType, name: String) = when (c) {
         ChannelType.RCS -> "The number ${name.ifBlank { "the agent" }} texts you from."
         ChannelType.WHATSAPP -> "The chat name WhatsApp shows."
         ChannelType.APP_NOTIFICATIONS -> "The app that posts its messages."
+        ChannelType.CONNECTOR -> "Connected in Settings → Connected agents."
     }
 }

@@ -29,6 +29,13 @@ sealed class ScoreEvent {
   @Serializable @SerialName("needed_user")
   data class NeededUser(override val agentId: String, override val at: Long, val askId: String, val kind: String) : ScoreEvent()
 
+  /**
+   * C2: an agent's structured result over the connector. [claims] how many claims, [sources] how many cited sources,
+   * [verified] the relay countersignature checked out. The claims themselves are on the run's reply (RunState).
+   */
+  @Serializable @SerialName("claims_in")
+  data class ClaimsIn(override val agentId: String, override val at: Long, val askId: String, val claims: Int, val sources: Int, val verified: Boolean) : ScoreEvent()
+
   @Serializable @SerialName("unsolicited")
   data class Unsolicited(override val agentId: String, override val at: Long) : ScoreEvent()
 

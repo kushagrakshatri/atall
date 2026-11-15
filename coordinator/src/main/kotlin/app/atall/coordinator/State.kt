@@ -72,7 +72,16 @@ data class ReplyPart(
   val certainty: Certainty = Certainty.HIGH,
   val late: Boolean = false,
   val userInterjected: Boolean = false,
-)
+  /** How this part came in; null on parts stored before C2 (they came by text). */
+  val via: Via? = null,
+  /** A connector part whose relay countersignature verified. */
+  val verified: Boolean = false,
+  /** The agent's structured claims (connector results). */
+  val claims: List<SourcedClaim> = emptyList(),
+) {
+  /** The provenance to show: a verified connector answer, or a text. */
+  val provenance: Via get() = if (via == Via.CONNECTOR && verified) Via.CONNECTOR else Via.TEXT
+}
 
 @Serializable
 data class AskState(
@@ -119,8 +128,14 @@ data class AskState(
   val quotedWithoutShared: List<String> = emptyList(),
   /** The user approved this exact text with a tap: it goes out as theirs. */
   val approved: Boolean = false,
+  /** The transport the ask went out on (null before it was sent, and on asks stored before C2). */
+  val via: Via? = null,
 ) {
   val replyText: String get() = replies.joinToString("\n") { it.text }
+  /** Every structured claim the agent sent for this ask. */
+  val claims: List<SourcedClaim> get() = replies.flatMap { it.claims }
+  /** Every part came over the connector with a verified countersignature. */
+  val verified: Boolean get() = replies.isNotEmpty() && replies.all { it.provenance == Via.CONNECTOR }
   val uncertain: Boolean get() = replies.any { it.certainty == Certainty.LOW }
   val late: Boolean get() = replies.any { it.late }
 }

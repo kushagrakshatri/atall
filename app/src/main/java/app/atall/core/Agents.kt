@@ -32,6 +32,11 @@ data class AgentProfile(
      * is on for agents that read the user's private accounts (Hark, Muse) and off for the rest.
      */
     val askBeforeSharing: Boolean? = null,
+    /**
+     * Its id on the Atall relay (kdot, grok, hark, duet, muse) when the user's agent is also connected there. Null:
+     * matched by name ([ConnectorRouting.relayIdOf]). Connector-only agents always have it.
+     */
+    val relayId: String? = null,
 ) {
     fun toPeer() = PeerInfo(id, name, channel, address, aliases, paused)
     val monogram: String get() = name.trim().take(1).ifEmpty { "?" }
@@ -124,6 +129,17 @@ class AgentRegistry(private val file: File, private val clock: () -> Long = Syst
     }
 
     fun remove(id: String) = synchronized(lock) { agents = agents.filter { it.id != id }; save() }
+
+    /** Adds an agent that is only reachable over the Atall connector (listed by the relay, not in the registry yet). */
+    fun addConnector(name: String, relayId: String, hue: Int? = null): AgentProfile = synchronized(lock) {
+        val p = AgentProfile(
+            id = "a-" + UUID.randomUUID().toString().take(8), name = name.trim(), channel = ChannelType.CONNECTOR,
+            address = relayId, hue = hue ?: nextHue(), createdAt = clock(), relayId = relayId,
+        )
+        agents = agents + p
+        save()
+        p
+    }
 
     private fun load(): List<AgentProfile> = try {
         if (file.isFile) Json.decodeFromString(ListSerializer(AgentProfile.serializer()), file.readText()) else emptyList()
