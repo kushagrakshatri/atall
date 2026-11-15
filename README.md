@@ -5,12 +5,12 @@ phone, and `@mention` any other agent you use to ask it directly. Atall is open 
 phone. The optional Atall relay (`connector/`, a Supabase Edge Function) lets agents that support MCP pick up
 phone-signed tasks.
 
-> Status: **v0.1.6-c2.1, pre-release (branch c2).** Juno coordinates: it asks your agents, waits, and merges their
-> answers; `@all` asks everyone the same question and shows where they agree; your agents can **talk it over**; and
-> Juno now reaches agents connected to the Atall relay over the connector (C2), falling back to texts only when it
-> can't.
+> Status: **v0.1.6, pre-release.** Juno coordinates: it asks your agents, waits, and merges their answers; `@all`
+> asks everyone the same question and shows where they agree; your agents can **talk it over**; and Juno now reaches
+> agents connected to the Atall relay over the connector (C2), falling back to texts only when it can't. Known gap:
+> connector agents don't wake up on their own yet and must be nudged by hand (until C3).
 
-## New in v0.1.6-c2.1: C2, Juno on the connector
+## New in v0.1.6: C2, Juno on the connector
 
 - **Connector first.** When the phone is paired and an agent has a live connection on the relay, Juno's asks,
   `@all` and direct `@mentions` go to it as phone-signed task cards (addressed to that agent only, asking for
