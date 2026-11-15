@@ -56,7 +56,17 @@ class Graph(private val context: Context) {
     val telemetry = SentryTelemetry(context) { prefs.sendMessageText }
 
     /** The Atall relay: pairing, connected agents, the debug test task, and (C2) the connector Juno asks agents over. */
-    val relay = Relay(context, scope, debugLog, dataDir, registry)
+    val wakeSettings = WakeSettings(context)
+    val relay = Relay(context, scope, debugLog, dataDir, registry, wakeSettings) { peers }
+
+    /** C3: approval requests from agents; Approve needs a fingerprint before a token is signed and sent. */
+    val approvalSigner = BiometricApprovalSigner(context) { BiometricApprovalSigner.current?.get() }
+    val approvals = app.atall.coordinator.adapters.ApprovalGate(
+        app.atall.coordinator.adapters.ApprovalTransport.of(relay.client), approvalSigner,
+        keyRegistered = { wakeSettings.approvalKeyRegistered }, onKeyRegistered = { wakeSettings.approvalKeyRegistered = true },
+        note = { line -> debugLog.add("approval", line.substringBefore(' '), null, line.substringAfter(' ')) },
+    )
+    private val wakeNotifier = WakeNotifier(context)
 
     val rcs = RcsChannel(context)
     val adapters: Map<ChannelType, ChannelAdapter> = mapOf(ChannelType.RCS to rcs)
@@ -118,6 +128,15 @@ class Graph(private val context: Context) {
         // C2: agents connected on the relay join the roster; their answers come back through one events loop.
         relay.onAgentsChanged = { syncConnectorAgents() }
         juno.onRunStarted = { runId, msg -> if (msg.text == story1Pending) { story1Pending = null; relay.markConnectorOnly(runId); debugLog.add("connector", "story1", runId, "connector only") } }
+        // C3: the ladder's text and tap rungs go through Juno's packing; approvals wait for a fingerprint.
+        relay.hasTextRoute = { id -> registry.get(id)?.let { p -> !p.paused && p.channel == ChannelType.RCS && peers.agent(p.id) != null } == true }
+        relay.fallbackText = { t, why -> juno.sendAskByText(t.cid, why) }
+        relay.fullAsk = { cid -> juno.fullAskText(cid) }
+        relay.onApproval = { r ->
+            approvals.onRequest(r)
+            val name = r.peerId?.let { registry.get(it)?.name } ?: app.atall.core.RelayCopy.agentName(r.relayAgentId)
+            wakeNotifier.approval(r, app.atall.core.WakeSetup.approvalLine(name, r.action, r.amount, r.currency))
+        }
         relay.start(toJuno = { juno.juno.ingest(it) }, toDirect = { id, m -> router.onConnectorReply(id, m) })
         chatGpt.refresh()
         // The listener may deliver before our collectors subscribe; the durable log covers the gap.
@@ -229,6 +248,17 @@ class Graph(private val context: Context) {
     }
 
     fun updateAgent(p: AgentProfile) { registry.update(p); sync() }
+    /** Approve (fingerprint first) or deny an agent's request. Returns a short line to show, or null. */
+    suspend fun decideApproval(id: String, approve: Boolean): String? {
+        val r = if (approve) approvals.approve(id) else approvals.deny(id)
+        if (r !is app.atall.coordinator.adapters.ApprovalResult.Cancelled) wakeNotifier.clearApproval(id)
+        return when (r) {
+            is app.atall.coordinator.adapters.ApprovalResult.Failed -> "Couldn't send that. Try again."
+            is app.atall.coordinator.adapters.ApprovalResult.Cancelled -> if (!approvalSigner.available()) "Set up a fingerprint to approve." else null
+            else -> null
+        }
+    }
+
     fun removeAgent(id: String) {
         registry.get(id)?.takeIf { it.channel == ChannelType.CONNECTOR }?.relayId?.let { prefs.removedConnectorAgents = prefs.removedConnectorAgents + it.lowercase() }
         adapters.values.forEach { it.unregister(id) }; registry.remove(id); sync()

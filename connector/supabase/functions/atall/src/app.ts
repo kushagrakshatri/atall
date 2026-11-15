@@ -93,13 +93,13 @@ export async function handleRequest(req: Request, env: Env, ctx: Ctx, deps: Deps
   if (p === "/authorize/request" && req.method === "GET") return withHeaders(await authorizeRequestInfo(req, env), uiCors(req, env));
 
   // C1 phone API (native app; no CORS). Every route but /phone/pair is device-signed.
-  if (p.startsWith("/phone/")) return handlePhone(req, env, p);
+  if (p.startsWith("/phone/")) return handlePhone(req, env, p, ctx, deps);
 
   if (p.startsWith("/admin/")) return withHeaders(await handleAdmin(req, env, p), uiCors(req, env));
   if (p === "/dev" && req.method === "GET") return env.ATALL_DEV_PAGE === "false" ? json({ error: "not found" }, 404) : devPage(base);
 
   if (p === "/" && req.method === "GET")
-    return json({ name: "Atall connector", milestone: "C1", runtime: "supabase-edge", mcp_endpoint: `${base}/mcp`, protected_resource_metadata: `${base}/.well-known/oauth-protected-resource/mcp` });
+    return json({ name: "Atall connector", milestone: "C3", runtime: "supabase-edge", mcp_endpoint: `${base}/mcp`, protected_resource_metadata: `${base}/.well-known/oauth-protected-resource/mcp` });
 
   return json({ error: "not found" }, 404);
 }

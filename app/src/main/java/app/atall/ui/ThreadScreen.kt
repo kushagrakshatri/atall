@@ -60,6 +60,10 @@ data class ThreadUi(
     val messages: List<ThreadMessage>,
     val peers: List<PeerUi>,
     val notificationAccess: Boolean,
+    /** C3: agents' requests waiting for the user's OK (id, line such as "Grok: Book Sakoon 7:30 · $42"). */
+    val approvals: List<Pair<String, String>> = emptyList(),
+    /** A short line after an approval didn't go through, or null. */
+    val approvalNote: String? = null,
 )
 
 class ThreadActions(
@@ -84,6 +88,8 @@ class ThreadActions(
     val onLeaveOut: (String, String) -> Unit = { _, _ -> },
     /** One of Juno's choices after a talk (run id, the choice): sent as the user's own message. */
     val onChoice: (String, String) -> Unit = { _, _ -> },
+    /** C3: Approve (fingerprint) / Deny on an agent's request (approval id, approve). */
+    val onAgentApproval: (String, Boolean) -> Unit = { _, _ -> },
 )
 
 private sealed interface Row {
@@ -140,6 +146,8 @@ fun ThreadScreen(state: ThreadUi, actions: ThreadActions, zone: ZoneId = ZoneId.
     Column(Modifier.fillMaxSize().background(c.bg).statusBarsPadding().navigationBarsPadding().imePadding()) {
         AppBar(state.peers, actions.onOpenAgents)
         if (!state.notificationAccess) AccessBanner(actions.onTurnOnAccess)
+        state.approvals.forEach { (id, line) -> ApprovalBanner(line, { actions.onAgentApproval(id, true) }, { actions.onAgentApproval(id, false) }) }
+        state.approvalNote?.let { Text(it, Modifier.padding(horizontal = 20.dp, vertical = 4.dp), style = AppTheme.type.caption, color = AppTheme.colors.ink3) }
         Box(Modifier.weight(1f).fillMaxWidth()) {
             if (list.isEmpty()) EmptyThread(state.peers)
             else LazyColumn(
@@ -175,6 +183,22 @@ private fun AppBar(peers: List<PeerUi>, onAgents: () -> Unit) {
         Box(Modifier.size(48.dp).clip(CircleShape).clickable(onClick = onAgents), contentAlignment = Alignment.Center) {
             Icon(Glyph.People, AppTheme.colors.ink)
         }
+    }
+}
+
+/** An agent wants the user's OK (money, a booking, an account change). Approve asks for a fingerprint. */
+@Composable
+private fun ApprovalBanner(line: String, onApprove: () -> Unit, onDeny: () -> Unit) {
+    val c = AppTheme.colors
+    Row(
+        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp).clip(AppTheme.radii.card).background(c.sunken)
+            .padding(start = 16.dp, end = 8.dp, top = 4.dp, bottom = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(line, Modifier.weight(1f), style = AppTheme.type.body2, color = c.ink)
+        Chip("Deny", onDeny)
+        Spacer(Modifier.width(6.dp))
+        Chip("Approve", onApprove, filled = true)
     }
 }
 

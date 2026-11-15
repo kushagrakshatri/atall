@@ -10,11 +10,14 @@ import { type Ctx, type Deps, type Env, issuer } from "./env.ts";
 import { type Caller, unauthorized, verifyBearer } from "./oauth.ts";
 import { callTool, INSTRUCTIONS, TOOLS, UnknownToolError } from "./tools.ts";
 import { json, nowIso } from "./util.ts";
+import { EventsError, eventsList, eventsSubscribe, eventsUnsubscribe } from "./events.ts";
 
 export const MODERN = "2026-07-28";
 export const LEGACY = ["2025-11-25", "2025-06-18", "2025-03-26"];
 export const SUPPORTED = [MODERN, ...LEGACY];
-export const SERVER_INFO = { name: "atall-connector", title: "Atall", version: "0.2.0-c1" };
+export const SERVER_INFO = { name: "atall-connector", title: "Atall", version: "0.3.0-c3" };
+/** C3: tools plus MCP Events (task.assigned), for ChatGPT dots. */
+export const CAPABILITIES = { tools: { listChanged: false }, events: {} };
 
 const ERR = {
   PARSE: -32700,
@@ -92,7 +95,7 @@ export function discoverResult() {
   return {
     resultType: "complete",
     supportedVersions: SUPPORTED,
-    capabilities: { tools: { listChanged: false } },
+    capabilities: CAPABILITIES,
     instructions: INSTRUCTIONS,
     ttlMs: 3_600_000,
     cacheScope: "public",
@@ -100,7 +103,7 @@ export function discoverResult() {
   };
 }
 
-export async function handleMcp(req: Request, env: Env, _deps: Deps, ctx: Ctx): Promise<Response> {
+export async function handleMcp(req: Request, env: Env, deps: Deps, ctx: Ctx): Promise<Response> {
   if (!originAllowed(req, env)) return rpcError(null, ERR.INVALID_REQUEST, "Origin not allowed", 403);
   if (req.method === "GET" || req.method === "DELETE") return new Response(null, { status: 405, headers: { Allow: "POST" } });
   if (req.method !== "POST") return new Response(null, { status: 405, headers: { Allow: "POST" } });
@@ -174,7 +177,7 @@ export async function handleMcp(req: Request, env: Env, _deps: Deps, ctx: Ctx): 
       case "initialize": {
         const asked = params.protocolVersion as string | undefined;
         const chosen = asked && LEGACY.includes(asked) ? asked : LEGACY[0];
-        return rpcResult(id, { protocolVersion: chosen, capabilities: { tools: { listChanged: false } }, serverInfo: SERVER_INFO, instructions: INSTRUCTIONS });
+        return rpcResult(id, { protocolVersion: chosen, capabilities: CAPABILITIES, serverInfo: SERVER_INFO, instructions: INSTRUCTIONS });
       }
       case "ping":
         if (modern) return rpcError(id, ERR.METHOD_NOT_FOUND, "Method not found: ping was removed in 2026-07-28", 404);
@@ -187,10 +190,17 @@ export async function handleMcp(req: Request, env: Env, _deps: Deps, ctx: Ctx): 
         const result = await callTool(name, params.arguments, caller!, env);
         return rpcResult(id, withServerMeta(result, modern));
       }
+      case "events/list":
+        return rpcResult(id, withServerMeta(eventsList(), modern));
+      case "events/subscribe":
+        return rpcResult(id, withServerMeta(await eventsSubscribe(params, caller!, env, deps), modern));
+      case "events/unsubscribe":
+        return rpcResult(id, withServerMeta(await eventsUnsubscribe(params, caller!, env), modern));
       default:
         return rpcError(id, ERR.METHOD_NOT_FOUND, `Method not found: ${method}`, modern ? 404 : 200);
     }
   } catch (e) {
+    if (e instanceof EventsError) return rpcError(id, e.code, e.message, 200, e.data);
     if (e instanceof UnknownToolError) return rpcError(id, ERR.INVALID_PARAMS, `Unknown tool: ${e.message}`);
     console.error("mcp error", e);
     return rpcError(id, ERR.INTERNAL, "Internal error");

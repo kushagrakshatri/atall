@@ -67,6 +67,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        BiometricApprovalSigner.current = java.lang.ref.WeakReference(this)
         resumes.intValue++
         graph.chatGpt.refresh()
         TextAgents.rescan()
@@ -85,6 +86,8 @@ class MainActivity : ComponentActivity() {
         val access = remember(tick) { TextAgents.hasNotificationAccess(this) }
         val peers = remember(agents, tick, messages.size) { g.peerUi() }
         var accessTried by remember { mutableStateOf(false) }
+        val pendingApprovals by g.approvals.pending.collectAsState()
+        var approvalNote by remember { mutableStateOf<String?>(null) }
         var licences by remember { mutableStateOf(false) }
 
         fun finishOnboarding() { g.prefs.onboarded = true; screen = Screen.Thread }
@@ -115,7 +118,11 @@ class MainActivity : ComponentActivity() {
                 }
             }
             Screen.Thread -> ThreadScreen(
-                ThreadUi(messages, peers, access),
+                ThreadUi(messages, peers, access,
+                    approvals = pendingApprovals.map { r ->
+                        r.approvalId to app.atall.core.WakeSetup.approvalLine(r.peerId?.let { id -> agents.firstOrNull { it.id == id }?.name } ?: app.atall.core.RelayCopy.agentName(r.relayAgentId), r.action, r.amount, r.currency)
+                    },
+                    approvalNote = approvalNote),
                 ThreadActions(
                     onSend = { text -> g.scope.launch { g.router.send(text) } },
                     onSendTalk = { text -> askForNotifications(); g.scope.launch { g.router.send(text, talk = true) } },
@@ -132,6 +139,8 @@ class MainActivity : ComponentActivity() {
                     onWrapUp = { runId -> g.scope.launch { g.juno.wrapUp(runId) } },
                     onLeaveOut = { runId, agent -> g.scope.launch { g.juno.leaveOut(runId, agent) } },
                     onChoice = { runId, choice -> g.scope.launch { g.juno.choiceTapped(runId, choice); g.router.send(choice) } },
+                    // The fingerprint prompt needs this activity: run in its scope.
+                    onAgentApproval = { id, yes -> lifecycleScope.launch { approvalNote = g.decideApproval(id, yes) } },
                 ),
             )
             Screen.Agents -> {
@@ -180,6 +189,7 @@ class MainActivity : ComponentActivity() {
                     askBeforeSharing = profile.sharesPrivately,
                     onAskBeforeSharing = { g.updateAgent(profile.copy(askBeforeSharing = it)) },
                     onRemove = { g.removeAgent(profile.id); screen = Screen.Agents },
+                    wake = wakeUi(profile),
                 )
             }
         }
@@ -203,6 +213,41 @@ class MainActivity : ComponentActivity() {
         )
     }
 
+    /** C3: Settings → Agents → the agent → Wake-up, for agents on the connector. */
+    @Composable
+    private fun wakeUi(profile: app.atall.core.AgentProfile): app.atall.ui.WakeUi? {
+        val g = graph
+        val relayId = g.relay.access.relayIdFor(profile) ?: profile.relayId ?: return null
+        val ws = g.wakeSettings
+        var cfg by remember(relayId) { mutableStateOf(ws.config(relayId)) }
+        var url by remember(relayId) { mutableStateOf(ws.saved.webhookUrls[relayId.lowercase()].orEmpty()) }
+        var window by remember(relayId) { mutableStateOf(((cfg.windowMs ?: 0L) / 60_000L).takeIf { it > 0 }?.toString().orEmpty()) }
+        var wa by remember(relayId) { mutableStateOf(ws.saved.museWhatsApp.orEmpty()) }
+        var copied by remember(relayId) { mutableStateOf(false) }
+        val textRoute = g.relay.hasTextRoute(profile.id)
+        val kinds = app.atall.coordinator.adapters.WakeDefaults.choices(relayId, textRoute)
+        fun save(c: app.atall.coordinator.adapters.WakeConfig) { cfg = c; ws.update { it.with(relayId, c) }; g.debugLog.add("wake", "setting", null, "$relayId ${c.kind}") }
+        return app.atall.ui.WakeUi(
+            labels = kinds.map { app.atall.core.WakeSetup.label(it) },
+            selected = kinds.indexOf(cfg.kind).coerceAtLeast(0),
+            caption = app.atall.core.WakeSetup.caption(relayId, cfg),
+            onSelect = { i -> save(cfg.copy(kind = kinds[i])) },
+            webhook = cfg.kind == app.atall.coordinator.adapters.WakeKind.WEBHOOK,
+            webhookUrl = url, onWebhookUrl = { v -> url = v; ws.update { it.withUrl(relayId, v) } },
+            webhookKeySaved = ws.hasWebhookKey(relayId), onWebhookKey = { v -> ws.setWebhookKey(relayId, v) },
+            windowMinutes = if (cfg.kind == app.atall.coordinator.adapters.WakeKind.SCHEDULE) window else null,
+            onWindow = { v -> window = v.filter(Char::isDigit).take(4); window.toLongOrNull()?.takeIf { it in 5..1440 }?.let { save(cfg.copy(windowMs = it * 60_000L)) } },
+            whatsApp = if (relayId.equals("muse", true)) wa else null,
+            onWhatsApp = { v -> wa = v; ws.update { it.copy(museWhatsApp = v.trim().ifBlank { null }) } },
+            onCopySetup = {
+                val cm = getSystemService(android.content.ClipboardManager::class.java)
+                runCatching { cm?.setPrimaryClip(android.content.ClipData.newPlainText("Atall setup", app.atall.core.WakeSetup.setupPrompt(relayId, cfg))) }
+                copied = true
+            },
+            copied = copied,
+        )
+    }
+
     /** Settings → Debugging. State lives here so the switch and the DSN field update as you use them. */
     @Composable
     private fun debugUi(): app.atall.ui.DebugUi {
@@ -211,6 +256,7 @@ class MainActivity : ComponentActivity() {
         var dsn by remember { mutableStateOf(g.prefs.sentryDsn) }
         var copied by remember { mutableStateOf<String?>(null) }
         var sentryOn by remember { mutableStateOf(g.telemetry.enabled) }
+        var relayDown by remember { mutableStateOf(g.wakeSettings.simulateOutage) }
         val dsnNote = when {
             g.buildTimeDsn -> "This build has its own DSN; this field is ignored."
             dsn.isBlank() -> "Paste a DSN to turn Sentry on. Stored on this phone only."
@@ -235,6 +281,8 @@ class MainActivity : ComponentActivity() {
                 if (!g.buildTimeDsn && SentryTelemetry.looksLikeDsn(typed)) sentryOn = g.startTelemetry()
             },
             dsnNote = dsnNote,
+            relayDown = relayDown,
+            onRelayDown = { v -> relayDown = v; g.wakeSettings.simulateOutage = v; g.debugLog.add("app", "setting", null, "simulate_relay_outage=$v") },
         )
     }
 

@@ -4,15 +4,17 @@
 
 import type { Env } from "./env.ts";
 import type { Caller } from "./oauth.ts";
-import { ANSWERED_STATES, type AgentStepResult, type Claim, isAddressedTo, overallState, type Question, type Result, type Store, type Task } from "./store.ts";
-import { newId, nowIso } from "./util.ts";
+import { ANSWERED_STATES, type AgentStepResult, type Approval, type Claim, isAddressedTo, overallState, type Question, type Result, type Store, type Task } from "./store.ts";
+import { b64url, newId, nowIso } from "./util.ts";
+import { canonicalJson, sha256 } from "./crypto.ts";
 
 export const INSTRUCTIONS =
   "Atall is Kush's private task inbox for his AI agents. When you see Atall work (or a short nudge like 'Atall #k3f9'), call atall_inbox, " +
   "read the card with atall_get_task, call atall_claim when you start, then post your answer with atall_post_result: a short summary plus claims, " +
   "each with a confidence and sources. Use atall_progress for an occasional status line and atall_ask when you need Kush to decide something; " +
   "his answer shows up in atall_inbox. Ask rather than guess. Never spend money, book, or change an account for an Atall task: " +
-  "call atall_request_approval instead and wait (approvals can't be granted yet in this version).";
+  "call atall_request_approval instead and wait: Kush approves on his phone with his fingerprint, and the decision (with a single-use token) " +
+  "shows up in atall_inbox and atall_get_task. Act only on an approved decision, once, before the token expires and within its max_amount.";
 
 export const PROGRESS_THROTTLE_S = 30;
 
@@ -193,7 +195,7 @@ export const TOOLS = [
     name: "atall_request_approval",
     title: "Request Kush's approval",
     description:
-      "Write: ask Kush to approve an action you must not take on your own (spending money, booking, changing an account). Your state becomes AUTH_REQUIRED. In this version Atall records and shows the request but cannot grant it yet: do not take the action.",
+      "Write: ask Kush to approve an action you must not take on your own (spending money, booking, changing an account). Your state becomes AUTH_REQUIRED. Kush approves or denies on his phone with his fingerprint; check atall_get_task (approvals) or atall_inbox for the decision. Don't act until it says approved, and then only once, before its token expires, and within max_amount.",
     inputSchema: {
       type: "object",
       properties: {
@@ -319,8 +321,22 @@ function questionView(q: Question) {
   return { question_id: q.question_id, question: q.text, choices: q.choices, asked_at: q.asked_at, answer: q.answer ?? null, answered_at: q.answered_at ?? null };
 }
 
-function card(t: Task, agentId: string, questions: Question[]) {
+/** What an agent sees about its approval requests: the decision and, when approved, the single-use token. */
+function approvalView(a: Approval) {
   return {
+    approval_id: a.approval_id,
+    action: a.payload.action,
+    ...(a.payload.amount !== undefined ? { amount: a.payload.amount } : {}),
+    ...(a.payload.currency !== undefined ? { currency: a.payload.currency } : {}),
+    status: a.status,
+    ...(a.decided_at ? { decided_at: a.decided_at } : {}),
+    ...(a.status === "approved" && a.token ? { token: a.token, token_sig: a.token_sig, expires_at: a.token.exp } : {}),
+  };
+}
+
+function card(t: Task, agentId: string, questions: Question[], approvals: Approval[] = []) {
+  return {
+    ...(approvals.length ? { approvals: approvals.map(approvalView) } : {}),
     ...summarize(t, agentId),
     goal: t.goal,
     constraints: t.constraints,
@@ -379,12 +395,16 @@ export async function callTool(name: string, rawArgs: unknown, caller: Caller, e
           ? `${tasks.length} Atall task(s) for ${caller.agent_id}:\n` + tasks.map((t) => `- #${t.ref} ${t.title} (task_id ${t.task_id}, ${t.my_state}${t.deadline ? `, due ${t.deadline}` : ""})`).join("\n")
           : `No open Atall tasks for ${caller.agent_id}.`;
         if (answers.length) text += `\nKush answered:\n` + answers.map((a) => `- #${a.ref} "${a.question}" → ${a.answer} (question_id ${a.question_id})`).join("\n");
-        return ok(text, { agent_id: caller.agent_id, tasks, ...(answers.length ? { answers } : {}) });
+        const decisions = (await store.listApprovals(caller.agent_id))
+          .filter((a) => a.status !== "pending" && open.has(a.task_id))
+          .map((a) => ({ ...approvalView(a), task_id: a.task_id, ref: (a.payload.ref as string) ?? "" }));
+        if (decisions.length) text += `\nKush decided:\n` + decisions.map((d) => `- #${d.ref} ${String(d.action)} → ${d.status}${d.status === "approved" ? ` (token valid until ${String(d.expires_at)}; read it with atall_get_task)` : ""} (approval_id ${d.approval_id})`).join("\n");
+        return ok(text, { agent_id: caller.agent_id, tasks, ...(answers.length ? { answers } : {}), ...(decisions.length ? { approvals: decisions } : {}) });
       }
       case "atall_get_task": {
         noExtra(args, ["task_id"]);
         const t = await findAddressedTask(store, str(args.task_id, "task_id", 64)!, caller.agent_id);
-        const c = card(t, caller.agent_id, await store.listQuestions(caller.agent_id, t.task_id));
+        const c = card(t, caller.agent_id, await store.listQuestions(caller.agent_id, t.task_id), await store.listApprovals(caller.agent_id, t.task_id));
         return ok(JSON.stringify(c, null, 2), c);
       }
       case "atall_claim": {
@@ -436,19 +456,22 @@ export async function callTool(name: string, rawArgs: unknown, caller: Caller, e
         const url = args.url !== undefined ? httpUrl(args.url, "url") : undefined;
         const t = await findAddressedTask(store, str(args.task_id, "task_id", 64)!, caller.agent_id);
         const approvalId = newId("apr");
+        const payload: Record<string, unknown> = {
+          ref: t.ref, state: "AUTH_REQUIRED", approval_id: approvalId, action,
+          ...(reason ? { reason } : {}), ...(args.amount !== undefined ? { amount: args.amount } : {}), ...(currency ? { currency } : {}), ...(url ? { url } : {}),
+        };
         const r = await store.agentStep({
           ...who(caller), task_id: t.task_id, state: "AUTH_REQUIRED", refuse_if_terminal: true,
-          event: {
-            type: "approval_request",
-            payload: {
-              ref: t.ref, state: "AUTH_REQUIRED", approval_id: approvalId, action,
-              ...(reason ? { reason } : {}), ...(args.amount !== undefined ? { amount: args.amount } : {}), ...(currency ? { currency } : {}), ...(url ? { url } : {}),
-            },
-          },
+          event: { type: "approval_request", payload },
         });
         if (!r.ok) stepError(r, t.ref);
+        // C3: kept so the phone's fingerprint-signed token can be checked against exactly this request.
+        await store.putApproval({
+          approval_id: approvalId, task_id: t.task_id, ref: t.ref, agent_id: caller.agent_id, conn_id: caller.conn_id, client_name: caller.client_name,
+          payload, action_hash: b64url(await sha256(canonicalJson(payload))), requested_at: nowIso(), status: "pending",
+        });
         return ok(
-          `Approval request ${approvalId} sent to Kush for #${t.ref}. This version of Atall records it but cannot grant it yet, so do not take the action. Post a partial result describing what you would do.`,
+          `Approval request ${approvalId} sent to Kush for #${t.ref}. Don't take the action yet: Kush approves on his phone with his fingerprint. Check atall_get_task or atall_inbox for the decision.`,
           { approval_id: approvalId, task_id: t.task_id, ref: t.ref, state: r.state, granted: false },
         );
       }

@@ -135,6 +135,7 @@ class Router(
             val packed = ContextPack.packed(ContextPack.Input(
                 kind = ContextPack.Kind.DIRECT, userName = userName(), recipientId = p.id, recipientName = p.name,
                 request = msg.text, recent = recent, names = names, others = others,
+                context = FollowUp.expand(msg.text, recent, userName(), names.values)?.context,
             ))
             // The send gate, at the transport: the user's own words go; nothing else may say buy / book / go ahead.
             if (app.atall.coordinator.SendGate.check(packed.segments, userName()).gated) { failure = failure ?: "Needs your OK first."; continue }

@@ -78,6 +78,11 @@ object ContextPack {
         val approved: Boolean = false,
         /** ROOM: the other agents' words quoted in [need] (and Juno's note), checked as relayed text. */
         val quoted: List<String> = emptyList(),
+        /**
+         * What a bare follow-up refers to ([FollowUp]): the user's words, Juno's plan, its open question. Goes in whole
+         * (never budget-trimmed) as quoted context, and replaces the Recent block it already covers.
+         */
+        val context: String? = null,
     )
 
     /** Every text from Atall starts with this; a tapback quoting it reacts to one of our texts. */
@@ -122,8 +127,9 @@ object ContextPack {
                 i.kind == Kind.CHALLENGE -> Provenance.PEER_RELAY
                 else -> Provenance.JUNO_REWRITE
             }
-            val text = (listOf(head) + listOfNotNull(need.ifBlank { null }) + tail).joinToString("\n")
-            return Packed(text, listOf(atall(head)) + listOfNotNull(need.ifBlank { null }?.let { Segment(it, prov) }) + tail.map(atall))
+            val ctx = i.context?.let { prose(it) }?.ifBlank { null }
+            val text = (listOf(head) + listOfNotNull(need.ifBlank { null }, ctx) + tail).joinToString("\n")
+            return Packed(text, listOf(atall(head)) + listOfNotNull(need.ifBlank { null }?.let { Segment(it, prov) }, ctx?.let(atall)) + tail.map(atall))
         }
 
         val request = squash(stripMentions(Markdown.plain(i.request), i.recipientName, i.names.values))
@@ -137,6 +143,11 @@ object ContextPack {
                     if (request.isNotEmpty() && (need == null || squash(need) != request)) add(Segment("$user asked: \"$request\"", Provenance.USER_VERBATIM))
                 }
             }
+        }
+        val ctx = i.context?.let { prose(it) }?.ifBlank { null }
+        if (ctx != null) {
+            val segs = core + atall(ctx) + tail.map(atall)
+            return Packed(segs.joinToString("\n") { it.text }, segs)
         }
         val recent = recentLines(i, user)
         // Keep the newest whole turns that fit; drop the rest, oldest first. A turn is never cut partway.

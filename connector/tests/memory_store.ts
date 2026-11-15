@@ -8,7 +8,11 @@ import {
   type AgentStepInput,
   type AgentStepResult,
   type AnswerResult,
+  type Approval,
+  type ApprovalKeyResult,
+  type DecideResult,
   type Device,
+  type EventSub,
   type EventType,
   type Manifest,
   type Question,
@@ -58,6 +62,9 @@ export class MemoryStore implements Store {
   events: (RelayEvent & { acked_at?: number; expires_at: number })[] = [];
   seq = 0;
   questions = new Map<string, Question & { answered_by?: string }>();
+  approvals = new Map<string, Approval>();
+  jtis = new Set<string>();
+  subs = new Map<string, EventSub>();
   manifests = new Map<string, Manifest>();
   /** Tests move this to simulate time passing for TTLs (ms added to Date.now()). */
   clockSkewMs = 0;
@@ -385,5 +392,52 @@ export class MemoryStore implements Store {
       }
     }
     return n;
+  }
+
+  // ---- C3 ----
+  async setApprovalKey(deviceId: string, spkiB64: string): Promise<ApprovalKeyResult> {
+    const d = this.devices.get(deviceId);
+    if (!d || d.revoked) return "no_device";
+    if (!d.approval_key_spki_b64) {
+      d.approval_key_spki_b64 = spkiB64;
+      return "set";
+    }
+    return d.approval_key_spki_b64 === spkiB64 ? "same" : "conflict";
+  }
+  async putApproval(a: Approval) {
+    this.approvals.set(a.approval_id, clone(a));
+  }
+  async getApproval(id: string) {
+    const a = this.approvals.get(id);
+    if (!a) return null;
+    const t = this.tasks.get(a.task_id);
+    return t && !this.expired(t) ? clone(a) : null;
+  }
+  async decideApproval(id: string, d: { status: "approved" | "denied"; device_id: string; token?: Record<string, unknown> | null; token_sig?: string | null; jti?: string | null }): Promise<DecideResult> {
+    const a = this.approvals.get(id);
+    if (!a) return { ok: false, reason: "not_found" };
+    if (a.status !== "pending" || (d.jti && this.jtis.has(d.jti))) return { ok: false, reason: "already_decided" };
+    if (d.jti) this.jtis.add(d.jti);
+    Object.assign(a, { status: d.status, decided_at: nowIso(), decided_by: d.device_id, token: d.token ?? null, token_sig: d.token_sig ?? null, jti: d.jti ?? null });
+    const t = this.tasks.get(a.task_id);
+    const e = t?.per_agent[a.agent_id];
+    if (e?.state === "AUTH_REQUIRED") {
+      const open = [...this.approvals.values()].some((x) => x.task_id === a.task_id && x.agent_id === a.agent_id && x.status === "pending");
+      if (!open) Object.assign(e, { state: "WORKING", updated_at: nowIso() });
+    }
+    return { ok: true, approval: clone(a) };
+  }
+  async listApprovals(agentId: string, taskId?: string) {
+    return [...this.approvals.values()].filter((a) => a.agent_id === agentId && (!taskId || a.task_id === taskId)).map(clone);
+  }
+  async putEventSub(sub: EventSub) {
+    this.subs.set(sub.sub_id, clone(sub));
+  }
+  async listEventSubs(agentIds: string[]) {
+    const now = this.now();
+    return [...this.subs.values()].filter((x) => agentIds.includes(x.agent_id) && Date.parse(x.expires_at) > now).map(clone);
+  }
+  async deleteEventSub(subId: string) {
+    return this.subs.delete(subId);
   }
 }

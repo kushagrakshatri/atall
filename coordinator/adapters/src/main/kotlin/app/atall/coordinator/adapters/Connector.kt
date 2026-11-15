@@ -44,8 +44,20 @@ data class ConnectorTask(
   val deadlineAt: Long,
   /** A result arrived, or Juno stopped waiting. Open tasks keep the events poller fast. */
   val doneAt: Long? = null,
+  /** C3: wake-ups sent for this task so far, the last one's time and how it went (the [WakeKind] name). */
+  val wakes: Int = 0,
+  val wokeAt: Long? = null,
+  val wakeVia: String? = null,
+  /** C3: the agent's last sign of life on this task (claim, progress, question, approval request). */
+  val activityAt: Long? = null,
+  /** C3 fallback ladder (protocol.md §8): when the same ask went by text (or a tap) instead, and why. */
+  val fellBackAt: Long? = null,
+  val fallback: String? = null,
 ) {
-  fun open(now: Long) = doneAt == null && now < deadlineAt
+  /** Waiting on the connector: polled fast. A task that fell back still takes a late result (slow poll). */
+  fun open(now: Long) = doneAt == null && fellBackAt == null && now < deadlineAt
+  /** Still worth waking or falling back for. */
+  fun live(now: Long) = doneAt == null && now < deadlineAt
 }
 
 /** Where [ConnectorTask]s are kept. A JSON file in the app (survives process death); memory in tests. */
@@ -66,6 +78,17 @@ class ConnectorLedger(private val file: File? = null, private val keepMs: Long =
   }
 
   fun remove(cid: String) = synchronized(lock) { tasks = tasks.filter { it.cid != cid }; save() }
+
+  fun live(now: Long): List<ConnectorTask> = synchronized(lock) { tasks.filter { it.live(now) } }
+
+  /** Changes the newest task for [cid] (no-op when there is none). Returns the updated task. */
+  fun update(cid: String, f: (ConnectorTask) -> ConnectorTask): ConnectorTask? = synchronized(lock) {
+    val cur = tasks.lastOrNull { it.cid == cid } ?: return@synchronized null
+    val next = f(cur)
+    tasks = tasks.map { if (it === cur) next else it }
+    save()
+    next
+  }
 
   fun markDone(cid: String, at: Long) = synchronized(lock) {
     tasks = tasks.map { if (it.cid == cid && it.doneAt == null) it.copy(doneAt = at) else it }
@@ -209,6 +232,10 @@ class ConnectorPump(
   private val clock: () -> Long = System::currentTimeMillis,
   private val isRunAsk: (String) -> Boolean = { "~a" in it },
   private val note: (PumpNote) -> Unit = {},
+  /** C3: any verified event for one of our tasks (claim, progress, question, approval, result): the ladder's clock. */
+  private val onActivity: (ConnectorTask, RelayEvent) -> Unit = { _, _ -> },
+  /** C3: a verified approval request on one of our tasks, for the fingerprint gate ([ApprovalGate]). */
+  private val onApproval: (ApprovalRequest) -> Unit = {},
 ) {
   suspend fun onEvents(events: List<RelayEvent>) { for (e in events) onEvent(e) }
 
@@ -221,6 +248,9 @@ class ConnectorPump(
     val task = e.taskId?.let { ledger.byTaskId(it) } ?: ref?.let { ledger.byRef(e.agentId, it) } ?: return log("not ours")
     if (task.relayAgentId != e.agentId) return log("wrong agent")
     if (!e.verified) return log("dropped: countersignature didn't verify")
+    ledger.update(task.cid) { it.copy(activityAt = maxOf(it.activityAt ?: 0L, clock())) }
+    onActivity(task, e)
+    if (e.type == RelayEvent.APPROVAL_REQUEST) ApprovalRequest.from(e, task.peerId, clock())?.let(onApproval)
     val signal = toSignal(e, payload, task, cursor) ?: return log("ignored")
     if (signal.final) ledger.markDone(task.cid, clock())
     if (isRunAsk(task.cid)) toJuno(signal) else toDirect(task.peerId, signal)

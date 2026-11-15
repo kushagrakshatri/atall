@@ -2,6 +2,7 @@ package app.atall.ui
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -70,7 +71,57 @@ data class DebugUi(
     val dsn: String = "",
     val onDsn: (String) -> Unit = {},
     val dsnNote: String = "",
+    /** C3: pretend the relay is down, to try the text fallback on the phone. */
+    val relayDown: Boolean = false,
+    val onRelayDown: (Boolean) -> Unit = {},
 )
+
+/** C3: Settings → Agents → the agent → Wake-up. Null for agents that aren't on the connector. */
+data class WakeUi(
+    val labels: List<String>,
+    val selected: Int,
+    val caption: String,
+    val onSelect: (Int) -> Unit,
+    /** Grok: the routine's webhook URL and key (the key is never shown back). */
+    val webhook: Boolean = false,
+    val webhookUrl: String = "",
+    val onWebhookUrl: (String) -> Unit = {},
+    val webhookKeySaved: Boolean = false,
+    val onWebhookKey: (String) -> Unit = {},
+    /** On its own schedule: how often it checks, in minutes (Duet's pickup window). */
+    val windowMinutes: String? = null,
+    val onWindow: (String) -> Unit = {},
+    /** Muse: its WhatsApp number, so a tap opens that chat. */
+    val whatsApp: String? = null,
+    val onWhatsApp: (String) -> Unit = {},
+    val onCopySetup: () -> Unit = {},
+    val copied: Boolean = false,
+)
+
+@Composable
+private fun WakeSection(w: WakeUi) {
+    val c = AppTheme.colors
+    SectionLabel("Wake-up")
+    Card {
+        Column(Modifier.padding(14.dp)) {
+            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                w.labels.forEachIndexed { i, l -> Chip(l, { w.onSelect(i) }, filled = i == w.selected) }
+            }
+            Spacer(Modifier.height(8.dp))
+            Text(w.caption, style = AppTheme.type.caption, color = c.ink3)
+            Spacer(Modifier.height(10.dp))
+            Chip(if (w.copied) "Copied" else "Copy setup", w.onCopySetup)
+        }
+    }
+    if (w.webhook) {
+        Spacer(Modifier.height(8.dp))
+        Field("Webhook URL", w.webhookUrl, w.onWebhookUrl, helper = "From the routine's Webhook section (POST to).")
+        var key by remember { mutableStateOf("") }
+        Field("Webhook key", key, { key = it; w.onWebhookKey(it) }, helper = if (w.webhookKeySaved && key.isEmpty()) "Saved. Paste a new one to replace it." else "Kept encrypted on this phone.")
+    }
+    w.windowMinutes?.let { Spacer(Modifier.height(8.dp)); Field("Checks about every (minutes)", it, w.onWindow) }
+    w.whatsApp?.let { Spacer(Modifier.height(8.dp)); Field("Muse's WhatsApp number", it, w.onWhatsApp, helper = "Optional. A tap opens that chat.") }
+}
 
 @Composable
 fun AgentsScreen(
@@ -175,6 +226,19 @@ fun AgentsScreen(
                     }
                 }
                 if (relay.ui.paired) TestTaskRow(relay)
+                if (relay.ui.paired) {
+                    HorizontalDivider(color = c.hairline)
+                    Row(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text("Pretend the relay is down", style = AppTheme.type.body, color = c.ink)
+                            Text("Tests the fallback by text", style = AppTheme.type.caption, color = c.ink3)
+                        }
+                        Switch(
+                            checked = debug.relayDown, onCheckedChange = debug.onRelayDown,
+                            colors = SwitchDefaults.colors(checkedTrackColor = c.ink, checkedThumbColor = c.onInk, uncheckedTrackColor = c.sunken, uncheckedBorderColor = c.hairlineStrong, uncheckedThumbColor = c.ink3),
+                        )
+                    }
+                }
             }
             SectionLabel("About")
             var taps by remember { mutableStateOf(0) }
@@ -221,6 +285,7 @@ fun AgentDetailScreen(
     peer: PeerUi, form: AgentFormState, existing: List<AgentProfile>,
     onBack: () -> Unit, onSave: () -> Unit, onPause: (Boolean) -> Unit, onRemove: () -> Unit,
     askBeforeSharing: Boolean = false, onAskBeforeSharing: (Boolean) -> Unit = {},
+    wake: WakeUi? = null,
 ) {
     val c = AppTheme.colors
     var confirm by remember { mutableStateOf(false) }
@@ -254,6 +319,7 @@ fun AgentDetailScreen(
                     )
                 }
             }
+            wake?.let { WakeSection(it) }
             SectionLabel("Talking it over")
             Card {
                 Row(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {

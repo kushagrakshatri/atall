@@ -120,6 +120,62 @@ class JunoBridgeTest {
         assertEquals(Main.AUTHOR, l.last().author)
     }
 
+    /**
+     * Device bug (v0.1.6): right after Juno's dinner-plan answer, "try to bring in @all" reached every agent as just
+     * "try to bring in". A bare follow-up must carry what it refers to: the intent, Juno's plan and its open question.
+     */
+    @Test fun aBareAtAllFollowUpCarriesJunosPlanAndTheIntent() = runTest {
+        val r = Rig(this, mapOf("Nova" to { _ -> listOf("Sakoon is great, book early") }, "Scout" to { _ -> listOf("ROOH as a backup") }))
+        val plan = "Go with Sakoon at 7:30 on Saturday: it's mostly vegetarian, with chicken and seafood, and has tables for 4. " +
+            "ROOH at 7:15 is the backup. Want me to hold Sakoon?"
+        r.thread.upsert(ThreadMessage("u1", T0 - 120_000, ThreadMessage.USER, "plan Saturday dinner for four, no pork or beef"))
+        r.thread.upsert(ThreadMessage("j1", T0 - 60_000, Main.AUTHOR, plan))
+        var blindAsked: String? = null
+        r.llm.on("blind") { req, _ -> blindAsked = FakeLlm.userTexts(req).joinToString("\n"); FakeLlm.text("Sakoon") }
+        r.llm.on("claims") { _, _ -> FakeLlm.text("not json") }
+        r.router.send("try to bring in @all")
+        settle()
+
+        for (a in r.agents.values) {
+            val text = a.sent.single().second
+            // Never just the stripped words.
+            assertFalse(text, text.lines().any { it.trim() == "Juno needs: try to bring in" })
+            assertTrue(text, text.contains("Juno needs: Weigh in on Juno's plan below: agree, push back, or add what's missing."))
+            assertTrue(text, text.contains("Kush asked earlier: \"plan Saturday dinner for four, no pork or beef\""))
+            assertTrue(text, text.contains("Juno's plan: Go with Sakoon at 7:30 on Saturday"))
+            assertTrue(text, text.contains("ROOH at 7:15 is the backup."))
+            assertTrue(text, text.contains("Open question: Want me to hold Sakoon?"))
+            assertTrue(text, text.contains("(answer on your own)"))
+            assertFalse("no @all left in the text", text.contains("@all"))
+        }
+        // Juno's own blind answer and the run's question see the same plan.
+        assertTrue(blindAsked!!, blindAsked!!.contains("Juno's plan: Go with Sakoon"))
+        val sub = r.lines().first { it.kind == MessageKind.SUBTASK }
+        assertTrue(sub.text, sub.text.startsWith("Weigh in on Juno's plan"))
+    }
+
+    @Test fun aBareDirectMentionCarriesTheContextToo() = runTest {
+        val r = Rig(this)
+        r.thread.upsert(ThreadMessage("u1", T0 - 120_000, ThreadMessage.USER, "plan Saturday dinner for four, no pork or beef"))
+        r.thread.upsert(ThreadMessage("j1", T0 - 60_000, Main.AUTHOR, "Go with Sakoon at 7:30. Want me to hold it?"))
+        r.router.send("@Nova thoughts?")
+        settle()
+        val text = r.agents.getValue(r.nova.id).sent.single().second
+        assertTrue(text, text.contains("Kush: thoughts?"))
+        assertTrue(text, text.contains("Juno's plan: Go with Sakoon at 7:30. Want me to hold it?"))
+        assertTrue(text, text.contains("Open question: Want me to hold it?"))
+    }
+
+    @Test fun aMessageThatStandsOnItsOwnIsNotExpanded() = runTest {
+        val r = Rig(this, mapOf("Nova" to { _ -> listOf("Saturday") }, "Scout" to { _ -> listOf("Sunday") }))
+        r.thread.upsert(ThreadMessage("j1", T0 - 60_000, Main.AUTHOR, "Go with Sakoon at 7:30."))
+        r.llm.on("blind") { _, _ -> FakeLlm.text("Sunday") }
+        r.llm.on("claims") { _, _ -> FakeLlm.text("not json") }
+        r.router.send("@all which day is best for a long hike near San Jose this weekend?")
+        settle()
+        for (a in r.agents.values) assertFalse(a.sent.single().second.contains("Juno's plan"))
+    }
+
     @Test fun atAllFansOutBlindAndBuildsTheAgreementMap() = runTest {
         val r = Rig(this, mapOf("Nova" to { _ -> listOf("Saturday") }, "Scout" to { _ -> listOf("Sunday, it's drier") }))
         r.llm.on("blind") { _, _ -> FakeLlm.text("Sunday") }

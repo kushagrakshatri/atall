@@ -134,7 +134,7 @@ describe("Modern (2026-07-28) stateless transport", () => {
     const c = await connected("kdot");
     const r = await c.callTool("atall_inbox");
     expect(r.body.result.resultType).toBe("complete");
-    expect(r.body.result._meta["io.modelcontextprotocol/serverInfo"].version).toBe("0.2.0-c1");
+    expect(r.body.result._meta["io.modelcontextprotocol/serverInfo"].version).toBe("0.3.0-c3");
   });
 });
 

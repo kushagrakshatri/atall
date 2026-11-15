@@ -114,6 +114,29 @@ class RelayClient(
         call("POST", "/phone/connections/" + URLEncoder.encode(connId, "UTF-8").replace("+", "%20") + "/revoke", ByteArray(0))
     }
 
+    /**
+     * C3: asks the relay to wake [agentId] for [taskId] through the agent's own event subscription (MCP Events: kDot's
+     * dot subscribes to `task.assigned`). Returns how many subscriptions got the event; 0 means the agent has none.
+     */
+    suspend fun wake(taskId: String, agentId: String): Int {
+        val body = buildJsonObject { put("task_id", taskId); put("agent_id", agentId) }
+        val res = call("POST", "/phone/wake", JSON.encodeToString(JsonObject.serializer(), body).toByteArray())
+        return ((res as? JsonObject)?.get("delivered") as? JsonPrimitive)?.contentOrNull?.toIntOrNull() ?: 0
+    }
+
+    /**
+     * C3: registers this phone's approval key (a separate Keystore key that signs only after a fingerprint). The relay
+     * pins the first one per device; a different key later is refused (409) until the phone pairs again.
+     */
+    suspend fun registerApprovalKey(publicKeySpkiB64: String) {
+        val body = buildJsonObject { put("public_key_spki_b64", publicKeySpkiB64) }
+        call("POST", "/phone/approval-key", JSON.encodeToString(JsonObject.serializer(), body).toByteArray())
+    }
+
+    /** C3: Kush's decision on an approval request: {approval_id, decision, token?, token_sig?}. */
+    suspend fun decideApproval(body: JsonObject): JsonElement =
+        call("POST", "/phone/approvals", JSON.encodeToString(JsonObject.serializer(), body).toByteArray())
+
     private suspend fun call(method: String, pathAndQuery: String, body: ByteArray, signed: Boolean = true): JsonElement =
         withContext(Dispatchers.IO) {
             val rb = Request.Builder().url(base + pathAndQuery)

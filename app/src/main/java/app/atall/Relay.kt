@@ -9,7 +9,16 @@ import app.atall.core.ConnectorRouting
 import app.atall.core.DebugLog
 import app.atall.core.RelayCopy
 import app.atall.coordinator.PeerSignal
+import app.atall.api.PeerDirectory
+import app.atall.coordinator.PeerSend
+import app.atall.coordinator.adapters.ApprovalRequest
 import app.atall.coordinator.adapters.CardPeer
+import app.atall.coordinator.adapters.ConnectorTask
+import app.atall.coordinator.adapters.FallbackLadder
+import app.atall.coordinator.adapters.LadderPolicy
+import app.atall.coordinator.adapters.WakeCopy
+import app.atall.coordinator.adapters.WakeDispatcher
+import app.atall.coordinator.adapters.WakeOutcome
 import app.atall.coordinator.adapters.ConnectorAgent
 import app.atall.coordinator.adapters.ConnectorDirectory
 import app.atall.coordinator.adapters.ConnectorLedger
@@ -69,6 +78,9 @@ class Relay(
     private val log: DebugLog,
     dataDir: File,
     private val registry: AgentRegistry,
+    /** C3: per-agent wake settings (Settings → Agents → Wake-up). */
+    val wake: WakeSettings = WakeSettings(context),
+    private val peerDirectory: () -> PeerDirectory? = { null },
 ) {
     private val key = KeystoreDeviceKey()
     private val store = PrefsRelayStore(context)
@@ -91,6 +103,39 @@ class Relay(
     /** Called after the connected agents change, so the registry and the thread roster follow. */
     var onAgentsChanged: () -> Unit = {}
 
+    // ---- C3: wake-ups, the fallback ladder, approvals --------------------------------------------------------------
+    /** When the relay started failing (null while it answers). A minute of this is an outage (§8). */
+    @Volatile var downSince: Long? = null; private set
+    /** An agent asked for approval on one of our tasks. */
+    var onApproval: (ApprovalRequest) -> Unit = {}
+    /** The ladder's text rung: sends the ask for this task by text (Graph wires it to Juno). */
+    var fallbackText: suspend (ConnectorTask, String) -> Boolean = { _, _ -> false }
+    /** The whole ask's text for the tap rung. */
+    var fullAsk: suspend (cid: String) -> String? = { null }
+    var hasTextRoute: (peerId: String) -> Boolean = { false }
+    private val sinks by lazy {
+        AndroidWakeSinks(context, wake, client, object : PeerDirectory {
+            override fun peers(): List<app.atall.api.PeerInfo> = peerDirectory()?.peers().orEmpty()
+            override fun agent(peerId: String): app.atall.agents.text.Agent? = peerDirectory()?.agent(peerId)
+        }, subscribed = { id -> directory.agents.orEmpty().any { it.agentId.equals(id, true) && it.events == true } },
+            names = { id -> registry.get(id)?.name ?: id }, log = log)
+    }
+    private val ladder by lazy {
+        FallbackLadder(
+            ledger, WakeDispatcher({ wake.config(it) }, sinks) { hasTextRoute(it) },
+            policyFor = { t ->
+                val cfg = wake.config(t.relayAgentId)
+                val p = LadderPolicy.of(cfg, ConnectorRouting.timeouts(t.relayAgentId).softMs)
+                // Direct @mentions: wake-ups only (their text fallback is the Router's own retry).
+                if ("~a" in t.cid) p else p.copy(fallbackAfterMs = null)
+            },
+            hasTextRoute = { hasTextRoute(it) },
+            byText = { t, why -> fallbackText(t, why) },
+            tapFull = { t, _ -> val full = fullAsk(t.cid); full != null && sinks.tap(t, WakeCopy.prompt(t.ref), full) == WakeOutcome.TAP },
+            note = { n -> log.add("wake", n.step.substringBefore(' '), n.cid.substringBefore('~').takeIf { "~" in n.cid }, "#${n.ref} ${n.relayAgentId}: ${n.step}") },
+        )
+    }
+
     /** What Juno and the Router use: the connector route for an agent, when there is one right now. */
     val access = object : ConnectorAccess {
         override fun relayIdFor(p: AgentProfile): String? {
@@ -102,8 +147,11 @@ class Relay(
             val relayId = relayIdFor(p) ?: return null
             val agent = ConnectorAgent(p.id, relayId, client, ledger, ConnectorRouting.timeouts(relayId).hardMs)
             return object : CardPeer by agent {
-                override suspend fun sendCard(correlationId: String, title: String, goal: String) =
-                    agent.sendCard(correlationId, title, goal).also { kick.value = System.currentTimeMillis() }
+                override suspend fun sendCard(correlationId: String, title: String, goal: String): PeerSend {
+                    // Debug "Pretend the relay is down": the post fails the way an unreachable relay does.
+                    if (wake.simulateOutage) return PeerSend.Failed(ConnectorAgent.RELAY_UNREACHABLE)
+                    return agent.sendCard(correlationId, title, goal).also { kick.value = System.currentTimeMillis() }
+                }
             }
         }
 
@@ -119,7 +167,8 @@ class Relay(
      */
     fun start(toJuno: suspend (PeerSignal) -> Unit, toDirect: suspend (String, PeerSignal.Message) -> Unit) {
         if (loop != null) return
-        pump = ConnectorPump(ledger, toJuno, toDirect, note = { n -> log.add("connector", "event", null, "#${n.cursor} ${n.type} ${n.agentId}: ${n.outcome}") })
+        pump = ConnectorPump(ledger, toJuno, toDirect, note = { n -> log.add("connector", "event", null, "#${n.cursor} ${n.type} ${n.agentId}: ${n.outcome}") },
+            onApproval = { r -> runCatching { onApproval(r) } })
         loop = scope.launch {
             var lastAgents = 0L
             var backoff = FAST_MS
@@ -131,14 +180,20 @@ class Relay(
                     val busy = ledger.open(now).isNotEmpty() || testJob?.isActive == true
                     ConnectorService.keep(context, busy) { waitingNames(now) }
                     wait = try {
+                        if (wake.simulateOutage) throw IOException("simulated relay outage (debug)")
                         val got = poller.pollOnce()
                         backoff = FAST_MS
+                        downSince = null
                         when { got.isNotEmpty() -> 0L; busy -> FAST_MS; else -> SLOW_MS }
                     } catch (e: CancellationException) { throw e } catch (e: Throwable) {
+                        if (downSince == null) downSince = System.currentTimeMillis()
                         log.add("connector", "poll.error", null, describe(e))
-                        backoff = (backoff * 2).coerceAtMost(SLOW_MS)
+                        // While tasks are open, keep checking often enough for the ladder's one-minute outage rule.
+                        backoff = (backoff * 2).coerceAtMost(if (busy) 15_000L else SLOW_MS)
                         backoff
                     }
+                    // C3: wake new tasks, nudge, and fall back by text (§8). Never lets a failure stop the loop.
+                    try { ladder.tick(downSince) } catch (e: CancellationException) { throw e } catch (e: Throwable) { log.add("wake", "ladder.error", null, describe(e)) }
                 }
                 if (wait > 0) {
                     val k = kick.value

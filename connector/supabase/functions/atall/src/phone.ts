@@ -1,9 +1,10 @@
 // C1 phone API: pairing, ES256-signed phone requests with a replay guard, phone-signed tasks,
 // countersigned events, acks, answers, the agents list and revocation. See C1-CONTRACT.md at the connector root.
 
-import type { Env } from "./env.ts";
-import { countersign, importDeviceKey, loadRelayKey, phoneSignedString, type RelayKey, verifyEs256 } from "./crypto.ts";
-import { AGENT_ID_RE, type Device, RefTakenError, taskExpiry } from "./store.ts";
+import type { Ctx, Deps, Env } from "./env.ts";
+import { canonicalJson, countersign, importDeviceKey, loadRelayKey, phoneSignedString, type RelayKey, sha256, verifyEs256 } from "./crypto.ts";
+import { deliverTaskAssigned } from "./events.ts";
+import { AGENT_ID_RE, type Device, isAddressedTo, RefTakenError, taskExpiry } from "./store.ts";
 import { b64url, clientIp, json, newId, nowIso, safeEqual } from "./util.ts";
 
 export const MAX_SKEW_S = 120;
@@ -109,7 +110,7 @@ async function pair(req: Request, env: Env, body: Uint8Array): Promise<Response>
   return json({ device_id: device.device_id, relay_public_key_spki_b64: key.publicSpkiB64, relay_key_alg: "ES256" }, 201);
 }
 
-async function postTask(env: Env, device: Device, body: Uint8Array, signed: { sig: string; signed_string: string }): Promise<Response> {
+async function postTask(env: Env, device: Device, body: Uint8Array, signed: { sig: string; signed_string: string }, ctx?: Ctx, deps?: Deps): Promise<Response> {
   const b = parseJson(body);
   if (!b) return err("body must be a JSON object", 400);
   const known = ["ref", "title", "goal", "to", "context", "constraints", "done_criteria", "dont_share", "deadline", "output"];
@@ -161,6 +162,11 @@ async function postTask(env: Env, device: Device, body: Uint8Array, signed: { si
         body: new TextDecoder().decode(body),
       },
     }, "phone", undefined, b.ref);
+    // C3: wake agents that subscribed to MCP Events (kDot's dot). No content in the event, only the id and ref.
+    if (ctx && deps) {
+      const agentsTo = to.includes("@all") ? (await env.store.listConnections()).filter((c) => !c.revoked).map((c) => c.agent_id) : to;
+      ctx.waitUntil(deliverTaskAssigned(env, deps, t, [...new Set(agentsTo)], 1).catch(() => 0));
+    }
     return json({ task_id: t.task_id, ref: t.ref }, 201);
   } catch (e) {
     if (e instanceof RefTakenError) return err(`ref ${b.ref} is already used by a live task`, 409);
@@ -184,19 +190,21 @@ async function events(env: Env, url: URL): Promise<Response> {
 
 async function agents(env: Env): Promise<Response> {
   const [conns, presence] = await Promise.all([env.store.listConnections(), env.store.listPresence()]);
+  // C3: which agents can be woken by an MCP event (kDot's dot after it subscribes to task.assigned).
+  const subscribed = new Set((await env.store.listEventSubs(conns.filter((c) => !c.revoked).map((c) => c.agent_id))).map((s) => s.agent_id));
   const byAgent = new Map(presence.map((p) => [p.agent_id, p]));
   const out = conns
     .filter((c) => !c.revoked)
     .map((c) => {
       const p = byAgent.get(c.agent_id);
       const mine = p && p.conn_id === c.conn_id;
-      return { agent_id: c.agent_id, conn_id: c.conn_id, client_name: c.client_name, kind: c.kind, created_at: c.created_at, last_seen: mine ? p.last_seen : null, last_tool: mine ? p.last_tool : null };
+      return { agent_id: c.agent_id, conn_id: c.conn_id, client_name: c.client_name, kind: c.kind, created_at: c.created_at, last_seen: mine ? p.last_seen : null, last_tool: mine ? p.last_tool : null, events: subscribed.has(c.agent_id) };
     });
   return json(out);
 }
 
 /** Routes /phone/*. `p` is the route inside the function (no /atall prefix). */
-export async function handlePhone(req: Request, env: Env, p: string): Promise<Response> {
+export async function handlePhone(req: Request, env: Env, p: string, ctx?: Ctx, deps?: Deps): Promise<Response> {
   const url = new URL(req.url);
   const buf = new Uint8Array(await req.arrayBuffer());
   if (buf.length > MAX_BODY) return err("request too large", 413);
@@ -215,7 +223,7 @@ export async function handlePhone(req: Request, env: Env, p: string): Promise<Re
   if (p === "/phone/tasks" && req.method === "POST") {
     const sig = req.headers.get("X-Atall-Sig")!.trim();
     const signed_string = await phoneSignedString(req.method, signedPath, req.headers.get("X-Atall-Ts")!.trim(), buf);
-    return postTask(env, device, buf, { sig, signed_string });
+    return postTask(env, device, buf, { sig, signed_string }, ctx, deps);
   }
   if (p === "/phone/events" && req.method === "GET") return events(env, url);
   if (p === "/phone/agents" && req.method === "GET") return agents(env);
@@ -243,6 +251,41 @@ export async function handlePhone(req: Request, env: Env, p: string): Promise<Re
     return json({ ok: true, task_id: taskId, question_id: qid, agent_id: r.agent_id, ref: r.ref });
   }
 
+  // C3: nudge an agent through its MCP Events subscription. Answers how many subscriptions took the event.
+  if (p === "/phone/wake" && req.method === "POST") {
+    const b = parseJson(buf);
+    if (!b) return err("body must be a JSON object", 400);
+    const taskId = strField(b.task_id, "task_id", 64, true);
+    if (taskId instanceof Response) return taskId;
+    const agentId = strField(b.agent_id, "agent_id", 32, true);
+    if (agentId instanceof Response) return agentId;
+    const t = await store.getTask(taskId!);
+    if (!t || (t.expires_at && Date.parse(t.expires_at) < Date.now())) return err("no such task", 404);
+    if (!isAddressedTo(t, agentId!)) return err("that task isn't addressed to this agent", 400);
+    const attempt = Math.floor(Date.now() / 1000);
+    const delivered = deps ? await deliverTaskAssigned(env, deps, t, [agentId!], attempt) : 0;
+    return json({ ok: true, task_id: t.task_id, agent_id: agentId, delivered });
+  }
+
+  // C3: the phone's approval key (signs only after a fingerprint). Pinned on first use per device.
+  if (p === "/phone/approval-key" && req.method === "POST") {
+    const b = parseJson(buf);
+    const spki = typeof b?.public_key_spki_b64 === "string" ? b.public_key_spki_b64.trim() : "";
+    if (!spki || spki.length > 400) return err("public_key_spki_b64 is required", 400);
+    try {
+      await importDeviceKey(spki);
+    } catch {
+      return err("public_key_spki_b64 must be a P-256 SubjectPublicKeyInfo (DER, base64)", 400);
+    }
+    const r = await store.setApprovalKey(device.device_id, spki);
+    if (r === "conflict") return err("this phone already has a different approval key; pair again to replace it", 409);
+    if (r === "no_device") return err("unknown or revoked device", 401);
+    return json({ ok: true, status: r });
+  }
+
+  // C3: Kush's decision on an approval request. "approve" needs a token signed with the approval key.
+  if (p === "/phone/approvals" && req.method === "POST") return decideApproval(env, device, buf);
+
   let m = /^\/phone\/connections\/([A-Za-z0-9_]{1,64})\/revoke$/.exec(p);
   if (m && req.method === "POST") {
     const conn = await store.getConnection(m[1]);
@@ -259,4 +302,64 @@ export async function handlePhone(req: Request, env: Env, p: string): Promise<Re
   }
 
   return err("not found", 404);
+}
+
+export const APPROVAL_MAX_TTL_S = 15 * 60;
+
+/**
+ * Checks and records a decision. An approval needs: the phone's pinned approval key; a token whose ES256 signature
+ * (over its canonical JSON) verifies with that key; the token bound to this approval, task, agent and action hash; a
+ * single use; not yet expired, valid for at most 15 minutes; and a max_amount that covers what the agent asked for.
+ */
+async function decideApproval(env: Env, device: Device, buf: Uint8Array): Promise<Response> {
+  const b = parseJson(buf);
+  if (!b) return err("body must be a JSON object", 400);
+  const id = strField(b.approval_id, "approval_id", 64, true);
+  if (id instanceof Response) return id;
+  const decision = b.decision;
+  if (decision !== "approve" && decision !== "deny") return err("decision must be approve or deny", 400);
+  const a = await env.store.getApproval(id!);
+  if (!a) return err("no such approval request", 404);
+  if (a.status !== "pending") return err("that request was already decided", 409);
+  if (decision === "deny") {
+    const r = await env.store.decideApproval(a.approval_id, { status: "denied", device_id: device.device_id });
+    if (!r.ok) return r.reason === "not_found" ? err("no such approval request", 404) : err("that request was already decided", 409);
+    return json({ ok: true, approval_id: a.approval_id, decision: "deny" });
+  }
+  if (!device.approval_key_spki_b64) return err("register an approval key first (POST /phone/approval-key)", 412);
+  const token = b.token;
+  if (!token || typeof token !== "object" || Array.isArray(token)) return err("token is required to approve", 400);
+  const sig = typeof b.token_sig === "string" ? b.token_sig.trim() : "";
+  if (!sig) return err("token_sig is required to approve", 400);
+  let key: CryptoKey;
+  try {
+    key = await importDeviceKey(device.approval_key_spki_b64);
+  } catch {
+    return err("this phone's approval key is unusable; pair again", 409);
+  }
+  const tk = token as Record<string, unknown>;
+  if (!(await verifyEs256(key, sig, canonicalJson(tk)))) return err("bad token signature", 401);
+  const actionHash = b64url(await sha256(canonicalJson(a.payload)));
+  const nbf = Date.parse(String(tk.nbf ?? ""));
+  const exp = Date.parse(String(tk.exp ?? ""));
+  const now = Date.now();
+  const problems: string[] = [];
+  if (tk.approval_id !== a.approval_id) problems.push("approval_id");
+  if (tk.task_id !== a.task_id) problems.push("task_id");
+  if (tk.agent_id !== a.agent_id) problems.push("agent_id");
+  if (tk.action_hash !== actionHash || a.action_hash !== actionHash) problems.push("action_hash");
+  if (tk.decision !== "approve") problems.push("decision");
+  if (tk.uses !== 1) problems.push("uses");
+  if (typeof tk.jti !== "string" || !/^apv_[A-Za-z0-9_-]{8,64}$/.test(tk.jti)) problems.push("jti");
+  if (!Number.isFinite(nbf) || !Number.isFinite(exp) || nbf > now + MAX_SKEW_S * 1000 || exp <= now || exp - nbf > APPROVAL_MAX_TTL_S * 1000) problems.push("time");
+  const asked = typeof a.payload.amount === "number" ? a.payload.amount : null;
+  if (asked !== null) {
+    const max = (tk.max_amount ?? {}) as Record<string, unknown>;
+    if (typeof max.value !== "number" || max.value < asked) problems.push("max_amount");
+    if (typeof a.payload.currency === "string" && max.currency !== a.payload.currency) problems.push("currency");
+  }
+  if (problems.length) return err(`token doesn't match this request (${problems.join(", ")})`, 400);
+  const r = await env.store.decideApproval(a.approval_id, { status: "approved", device_id: device.device_id, token: tk, token_sig: sig, jti: tk.jti as string });
+  if (!r.ok) return r.reason === "not_found" ? err("no such approval request", 404) : err("that request was already decided", 409);
+  return json({ ok: true, approval_id: a.approval_id, decision: "approve", expires_at: tk.exp });
 }

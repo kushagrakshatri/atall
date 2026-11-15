@@ -196,6 +196,31 @@ class JunoBridge(
         }
     }
 
+    /**
+     * C3 fallback ladder (§8), text rung: the ask [cid] that went over the connector goes by text instead (no claim or
+     * progress by the agent's soft timeout, or the relay down a minute). Same packed text, same ask id, tagged so the
+     * reply correlates. False when the agent has no live text route, the send gate holds it, or it needs a tap.
+     */
+    suspend fun sendAskByText(cid: String, reason: String): Boolean {
+        val runId = PeerLines.runIdOf(cid)
+        val ask = safe { juno.state(runId) }?.ask(cid) ?: return false
+        if (ask.status.settled) return true
+        val profile = registry.get(ask.agentId) ?: return false
+        val agent = (if (textRoute(profile) && !profile.paused) peers.agent(profile.id) else null) ?: return false
+        val p = packed(ask.agentId, ask.text, cid)
+        if (SendGate.check(p.segments, userName()).gated) return false
+        val r = TextAgentPeer(agent, replyWindowMs = 30 * 60_000L, tag = true, allowDraft = false).send(p.text, cid)
+        log.add("connector", "fallback", runId, "${cid.substringAfter('~')} to ${profile.name} by text ($reason): ${r.javaClass.simpleName}")
+        return r is PeerSend.Sent || r is PeerSend.Duplicate
+    }
+
+    /** The whole text an agent would get for ask [cid] (the tap rung shares it), or null when the ask is gone or done. */
+    suspend fun fullAskText(cid: String): String? {
+        val ask = safe { juno.state(PeerLines.runIdOf(cid)) }?.ask(cid)?.takeIf { !it.status.settled } ?: return null
+        val p = packed(ask.agentId, ask.text, cid)
+        return p.text.takeIf { !SendGate.check(p.segments, userName()).gated }
+    }
+
     /** The text that actually goes to agent [agentId] for ask [askId]: Juno's sub-task wrapped in compact context. */
     suspend fun pack(agentId: String, need: String, askId: String): String = packed(agentId, need, askId).text
 
@@ -216,9 +241,14 @@ class JunoBridge(
         val chrono = thread.chronological()
         val request = chrono.firstOrNull { it.runId == runId && it.author == ThreadMessage.USER }
         val recent = if (request == null) emptyList() else Router.recentBefore(chrono, request)
+        // A bare follow-up ("try to bring in @all") carries what it refers to: the intent, Juno's plan, its question.
+        val follow = if (request == null || kind == ContextPack.Kind.ROOM || kind == ContextPack.Kind.CHALLENGE) null
+            else FollowUp.expand(request.text, recent, userName(), registry.all().map { it.name })
         return ContextPack.packed(ContextPack.Input(
             kind = kind, userName = userName(), recipientId = agentId, recipientName = r.nameOf(agentId),
-            request = request?.text ?: st?.userText.orEmpty(), need = need, recent = recent,
+            request = request?.text ?: st?.userText.orEmpty(),
+            need = if (follow != null && kind == ContextPack.Kind.BLIND) follow.intent else need,
+            recent = recent, context = follow?.context,
             names = registry.all().associate { it.id to it.name }, others = if (kind == ContextPack.Kind.ROOM) emptyList() else others,
             approved = ask?.approved == true, quoted = ask?.quoted.orEmpty(),
         ))
@@ -234,11 +264,15 @@ class JunoBridge(
         val chrono = thread.chronological()
         val recent = Router.recentBefore(chrono, msg, limit = JunoConfig().maxContextLines)
         val r = roster()
+        // A bare follow-up becomes the question it stands for (v0.1.6 bug: "try to bring in @all" went out as just
+        // "try to bring in"). Juno's own model gets the whole expansion; each agent's text gets it through [packed].
+        val follow = FollowUp.expand(msg.text, recent, userName(), registry.all().map { it.name })
+        fun asked(text: String) = follow?.full ?: text
         val runId = when (route) {
-            is Route.All -> juno.startAll(route.text, r.activePeers)
-            is Route.Talk -> juno.startTalk(route.text, route.peerIds.mapNotNull { r.byId(it) }.filter { !it.paused }.ifEmpty { r.activePeers })
+            is Route.All -> juno.startAll(asked(route.text), r.activePeers)
+            is Route.Talk -> juno.startTalk(asked(route.text), route.peerIds.mapNotNull { r.byId(it) }.filter { !it.paused }.ifEmpty { r.activePeers })
             is Route.ToMain -> juno.startCoordinated(
-                route.text,
+                if (route.mentionedPeers.isNotEmpty()) asked(route.text) else route.text,
                 mustAsk = route.mentionedPeers.mapNotNull { r.byId(it) }.filter { !it.paused },
                 context = recent.map { JunoLine(displayName(it.author), it.text) },
             )

@@ -58,6 +58,8 @@ data class RelayAgent(
     @SerialName("created_at") val createdAt: String? = null,
     @SerialName("last_seen") val lastSeen: String? = null,
     @SerialName("last_tool") val lastTool: String? = null,
+    /** C3: the agent subscribed to MCP Events (`task.assigned`), so the relay wakes it when a card is posted. */
+    val events: Boolean? = null,
 )
 
 /**

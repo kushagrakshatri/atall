@@ -8,7 +8,11 @@ import {
   type AgentStepInput,
   type AgentStepResult,
   type AnswerResult,
+  type Approval,
+  type ApprovalKeyResult,
+  type DecideResult,
   type Device,
+  type EventSub,
   type Manifest,
   type Question,
   RefTakenError,
@@ -267,5 +271,31 @@ export class PgStore implements Store {
   }
   async ackEvents(cursor: number) {
     return Number(await this.call<number>("ack_events", { cursor }));
+  }
+
+  // ---- C3: approval tokens, MCP Events subscriptions ---------------------------------
+  setApprovalKey(deviceId: string, spkiB64: string) {
+    return this.call<ApprovalKeyResult>("set_approval_key", { device_id: deviceId, spki: spkiB64 });
+  }
+  async putApproval(a: Approval) {
+    await this.call("put_approval", a as unknown as Record<string, unknown>);
+  }
+  getApproval(id: string) {
+    return this.call<Approval | null>("get_approval", { approval_id: id });
+  }
+  decideApproval(id: string, d: { status: "approved" | "denied"; device_id: string; token?: Record<string, unknown> | null; token_sig?: string | null; jti?: string | null }) {
+    return this.call<DecideResult>("decide_approval", { approval_id: id, ...d });
+  }
+  listApprovals(agentId: string, taskId?: string) {
+    return this.call<Approval[]>("list_approvals", taskId ? { agent_id: agentId, task_id: taskId } : { agent_id: agentId });
+  }
+  async putEventSub(sub: EventSub) {
+    await this.call("put_event_sub", sub as unknown as Record<string, unknown>);
+  }
+  listEventSubs(agentIds: string[]) {
+    return this.call<EventSub[]>("list_event_subs", { agent_ids: agentIds });
+  }
+  deleteEventSub(subId: string) {
+    return this.call<boolean>("delete_event_sub", { sub_id: subId });
   }
 }

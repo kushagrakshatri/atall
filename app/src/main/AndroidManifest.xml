@@ -7,8 +7,23 @@
     <!-- C2: keep running while Juno waits on agents over the Atall connector (one silent notification). -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- C3: Approve on an agent's purchase/booking request needs a fingerprint (BiometricPrompt + Keystore). -->
+    <uses-permission android:name="android.permission.USE_BIOMETRIC" />
 
     <queries>
+        <!-- C3: a wake tap opens the agent's own app when it's installed. -->
+        <package android:name="com.anthropic.claude" />
+        <package android:name="ai.x.grok" />
+        <package android:name="com.openai.chatgpt" />
+        <package android:name="com.whatsapp" />
+        <intent>
+            <action android:name="android.intent.action.SEND" />
+            <data android:mimeType="text/plain" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.SENDTO" />
+            <data android:scheme="smsto" />
+        </intent>
         <!-- Custom Tabs for Sign in with ChatGPT (Android 11+ package visibility). -->
         <intent>
             <action android:name="android.support.customtabs.action.CustomTabsService" />
@@ -49,6 +64,14 @@
                 <data android:scheme="atall-signin" android:host="signin" />
             </intent-filter>
         </activity>
+        <!-- C3: the tap on a wake notification (copies the prompt, opens the agent's app, closes at once). -->
+        <activity
+            android:name=".WakeTapActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
         <service
             android:name=".ConnectorService"
             android:exported="false"

@@ -179,7 +179,45 @@ export interface Device {
   last_seen?: string | null;
   revoked?: boolean;
   revoked_reason?: string | null;
+  /** C3: the phone's approval key (P-256 SPKI, base64). Pinned on first registration; it signs only after a fingerprint. */
+  approval_key_spki_b64?: string | null;
 }
+
+/** C3: one atall_request_approval and Kush's decision on it. */
+export interface Approval {
+  approval_id: string;
+  task_id: string;
+  ref: string;
+  agent_id: string;
+  conn_id: string;
+  client_name: string;
+  /** The approval_request event payload exactly as emitted: the token's action_hash is sha256 of its canonical JSON. */
+  payload: Record<string, unknown>;
+  action_hash: string;
+  requested_at: string;
+  status: "pending" | "approved" | "denied";
+  decided_at?: string | null;
+  decided_by?: string | null;
+  token?: Record<string, unknown> | null;
+  token_sig?: string | null;
+  jti?: string | null;
+}
+
+/** C3: an MCP Events subscription (ChatGPT dots: `task.assigned`). */
+export interface EventSub {
+  sub_id: string;
+  agent_id: string;
+  conn_id: string;
+  name: string;
+  arguments: Record<string, unknown>;
+  url: string;
+  secret: string;
+  created_at: string;
+  expires_at: string;
+}
+
+export type ApprovalKeyResult = "set" | "same" | "conflict" | "no_device";
+export type DecideResult = { ok: true; approval: Approval } | { ok: false; reason: "not_found" | "already_decided" };
 
 export type EventType = "result" | "progress" | "question" | "claim" | "approval_request" | "presence" | "manifest";
 
@@ -321,6 +359,20 @@ export interface Store {
   listEvents(after: number, limit: number): Promise<RelayEvent[]>;
   /** Marks events <= cursor acknowledged; they are deleted 24 h later. Returns how many were newly acked. */
   ackEvents(cursor: number): Promise<number>;
+
+  // ---- C3 ----
+  /** Pins the device's approval key: "set" the first time, "same" for the same key again, "conflict" for another key. */
+  setApprovalKey(deviceId: string, spkiB64: string): Promise<ApprovalKeyResult>;
+  putApproval(a: Approval): Promise<void>;
+  getApproval(id: string): Promise<Approval | null>;
+  /** Atomically records the decision once; a second decision gets already_decided (and a reused jti too). */
+  decideApproval(id: string, d: { status: "approved" | "denied"; device_id: string; token?: Record<string, unknown> | null; token_sig?: string | null; jti?: string | null }): Promise<DecideResult>;
+  listApprovals(agentId: string, taskId?: string): Promise<Approval[]>;
+  /** Insert or refresh (same sub_id). */
+  putEventSub(s: EventSub): Promise<void>;
+  /** Live (unexpired) subscriptions for these agents. */
+  listEventSubs(agentIds: string[]): Promise<EventSub[]>;
+  deleteEventSub(subId: string): Promise<boolean>;
 }
 
 export const TASK_TTL_NO_DEADLINE_S = 7 * 24 * 3600;
