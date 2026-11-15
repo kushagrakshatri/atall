@@ -12,8 +12,14 @@ import java.util.Locale
 /** How Atall wakes an agent for a new task card. A wake carries no content: only the task's ref. */
 @Serializable
 enum class WakeKind {
-  /** An "Atall #ref" text over the agent's text route (text-agents). Hark, kDot. */
+  /** An "Atall #ref" text over the agent's text route (text-agents). kDot's backup; Hark before C3.1. */
   TEXT,
+  /**
+   * C3.1 "Full text": no task card at all. The whole ask (the same packed text the ladder's text rung sends) goes by
+   * text at once and the agent's text reply is its answer, as in v0.1.4. No relay task, no "Atall #ref" nudge, no
+   * ladder. Hark's default (Hark won't pull tasks from an outside board); pickable for kDot.
+   */
+  FULL_TEXT,
   /** The phone POSTs to the agent's routine webhook (Grok Bot: a webhook-triggered routine). */
   WEBHOOK,
   /** The relay delivers an MCP event to the agent's subscription (kDot: MCP Events `task.assigned`). */
@@ -72,7 +78,8 @@ object WakeDefaults {
 
   /** Best real path per agent (new-product/c3/wake-paths.md); the user changes it in Settings → Agents. */
   fun forAgent(relayId: String): WakeConfig = when (relayId.lowercase(Locale.ROOT)) {
-    "hark" -> WakeConfig(WakeKind.TEXT, backup = WakeKind.TAP)
+    // C3.1: Hark won't take tasks from the connector, so it gets the whole ask by text and its reply is the answer.
+    "hark" -> WakeConfig(WakeKind.FULL_TEXT)
     "kdot" -> WakeConfig(WakeKind.EVENTS, backup = WakeKind.TEXT)
     "grok" -> WakeConfig(WakeKind.WEBHOOK, backup = WakeKind.TAP)
     // Duet checks its connected accounts "every few hours"; the pickup window is Kush's call (default 3 h).
@@ -82,12 +89,15 @@ object WakeDefaults {
     else -> WakeConfig(WakeKind.TAP)
   }
 
-  /** The paths that make sense for this agent (the Settings picker). */
+  /**
+   * The paths that make sense for this agent (the Settings picker). [WakeKind.TEXT] needs a text route. Full text is
+   * always listed for Hark and kDot (it's Hark's default; without a text route the agent shows it needs its number).
+   */
   fun choices(relayId: String, hasTextRoute: Boolean): List<WakeKind> {
     val id = relayId.lowercase(Locale.ROOT)
     val base = when (id) {
-      "kdot" -> listOf(WakeKind.EVENTS, WakeKind.TEXT, WakeKind.TAP)
-      "hark" -> listOf(WakeKind.TEXT, WakeKind.TAP, WakeKind.SCHEDULE)
+      "kdot" -> listOf(WakeKind.EVENTS, WakeKind.FULL_TEXT, WakeKind.TEXT, WakeKind.TAP)
+      "hark" -> listOf(WakeKind.FULL_TEXT, WakeKind.TEXT, WakeKind.TAP, WakeKind.SCHEDULE)
       "grok" -> listOf(WakeKind.WEBHOOK, WakeKind.TAP, WakeKind.SCHEDULE)
       else -> listOf(WakeKind.SCHEDULE, WakeKind.TAP)
     }
@@ -116,6 +126,8 @@ data class LadderPolicy(
     fun of(cfg: WakeConfig, softTimeoutMs: Long, typicalLatencyMs: Long = 60_000L): LadderPolicy = when (cfg.kind) {
       WakeKind.SCHEDULE -> LadderPolicy(nudgeAfterMs = (cfg.windowMs ?: 180 * MIN) + 30 * MIN, fallbackAfterMs = null, maxWakes = if (cfg.backup != null) 2 else 1)
       WakeKind.OFF -> LadderPolicy(nudgeAfterMs = Long.MAX_VALUE, fallbackAfterMs = softTimeoutMs, maxWakes = 0)
+      // Full text never posts a card. One left over from before the switch goes by text on the next tick, unwoken.
+      WakeKind.FULL_TEXT -> LadderPolicy(nudgeAfterMs = Long.MAX_VALUE, fallbackAfterMs = 0L, maxWakes = 0)
       WakeKind.TAP -> LadderPolicy(nudgeAfterMs = maxOf(2 * typicalLatencyMs, 3 * MIN), fallbackAfterMs = softTimeoutMs, maxWakes = 1)
       else -> LadderPolicy(nudgeAfterMs = maxOf(2 * typicalLatencyMs, 3 * MIN), fallbackAfterMs = softTimeoutMs, maxWakes = 2)
     }
@@ -154,7 +166,8 @@ class WakeDispatcher(
     WakeKind.TAP -> sinks.tap(task, WakeCopy.prompt(task.ref))
     // Nothing to send: the agent looks on its own. Counts as handed off.
     WakeKind.SCHEDULE -> WakeOutcome.SENT
-    WakeKind.OFF -> WakeOutcome.UNAVAILABLE
+    // Full text has no wake: the ask itself goes by text (never a card, so never a nudge).
+    WakeKind.FULL_TEXT, WakeKind.OFF -> WakeOutcome.UNAVAILABLE
   }
 }
 
@@ -185,6 +198,8 @@ class FallbackLadder(
   /** The relay failing this long counts as an outage. */
   private val outageMs: Long = 60_000L,
   private val note: (LadderNote) -> Unit = {},
+  /** Tasks to leave alone for now: the agent is paused (no wake, nudge, text or tap; picked up again if unpaused). */
+  private val skip: (ConnectorTask) -> Boolean = { false },
 ) {
   private val lock = kotlinx.coroutines.sync.Mutex()
 
@@ -194,7 +209,7 @@ class FallbackLadder(
     val now = clock()
     val outage = relayDownSince != null && now - relayDownSince >= outageMs
     for (t in ledger.live(now)) {
-      if (t.taskId == null || t.fellBackAt != null) continue
+      if (t.taskId == null || t.fellBackAt != null || skip(t)) continue
       val p = policyFor(t)
       val quietSince = t.activityAt ?: t.postedAt
       val textRoute = hasTextRoute(t.peerId)

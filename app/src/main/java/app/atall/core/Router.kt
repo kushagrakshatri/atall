@@ -124,6 +124,7 @@ class Router(
             val problem = when {
                 p.paused -> "${p.name} is paused."
                 conn != null -> null
+                p.channel == app.atall.api.ChannelType.CONNECTOR && connector().byFullText(p) -> "${p.name} needs a text number for Full text."
                 p.channel == app.atall.api.ChannelType.CONNECTOR -> "${p.name} isn't connected right now."
                 !p.channel.implemented -> "${p.name} can't be reached from Atall yet."
                 else -> null

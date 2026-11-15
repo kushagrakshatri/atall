@@ -225,6 +225,8 @@ class Graph(private val context: Context) {
     /** Listening · Can reply now · Needs a tap · Paused · Not available yet. */
     fun statusOf(p: AgentProfile): String = when {
         p.paused -> "Paused"
+        // C3.1: set to Full text but nothing to text: it needs a number (an agent added from the relay has none).
+        p.channel == ChannelType.CONNECTOR && relay.access.byFullText(p) -> "Needs a text number"
         // C2: reachable over the Atall connector (paired, and the agent has a live connection).
         relay.access.relayIdFor(p) != null -> "Connected"
         p.channel == ChannelType.CONNECTOR -> "Not connected"

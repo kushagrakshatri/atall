@@ -689,7 +689,8 @@ class JunoBridge(
         }
 
         private fun baseStatus(a: AskState, st: RunState): String = when (a.status) {
-            AskStatus.QUEUED -> "Queued"
+            // Waits for the agent's earlier text to be answered (one open text per agent), then goes out by itself.
+            AskStatus.QUEUED -> "Waiting on its earlier ask"
             AskStatus.SENDING -> "Sending"
             AskStatus.PENDING -> if (st.phase.terminal) "Didn't answer yet" else "Waiting"
             AskStatus.DRAFTED -> "Draft open in Messages"

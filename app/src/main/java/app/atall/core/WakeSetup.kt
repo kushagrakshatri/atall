@@ -18,6 +18,7 @@ object WakeSetup {
   /** Settings → Agents → the agent → Wake-up: one short label per path. */
   fun label(kind: WakeKind): String = when (kind) {
     WakeKind.TEXT -> "Text"
+    WakeKind.FULL_TEXT -> "Full text"
     WakeKind.WEBHOOK -> "Webhook"
     WakeKind.EVENTS -> "ChatGPT event"
     WakeKind.TAP -> "Tap"
@@ -28,12 +29,18 @@ object WakeSetup {
   /** The caption under the picker, for the chosen path. */
   fun caption(relayId: String, cfg: WakeConfig): String = when (cfg.kind) {
     WakeKind.TEXT -> "Texts \"Atall #ref\" when there's a task."
+    WakeKind.FULL_TEXT -> FULL_TEXT_CAPTION
     WakeKind.WEBHOOK -> "Starts its routine when there's a task."
     WakeKind.EVENTS -> "ChatGPT gets an event when there's a task."
     WakeKind.TAP -> "A notification opens ${appName(relayId)} ready to check."
     WakeKind.SCHEDULE -> "Checks on its own about every ${minutes(cfg.windowMs ?: (180 * MIN))}."
     WakeKind.OFF -> "Atall won't wake it."
   }
+
+  const val FULL_TEXT_CAPTION = "Texts the whole ask; reads the reply."
+
+  /** Whether "Copy setup" applies: Full text needs no instruction (the ask is the text), so the chip is hidden. */
+  fun needsSetup(cfg: WakeConfig): Boolean = cfg.kind != WakeKind.FULL_TEXT
 
   private fun minutes(ms: Long): String = (ms / MIN).let { if (it >= 120 && it % 60 == 0L) "${it / 60} hours" else "$it min" }
 
@@ -53,6 +60,7 @@ object WakeSetup {
   fun setupPrompt(relayId: String, cfg: WakeConfig): String {
     val id = relayId.lowercase(Locale.ROOT)
     return when {
+      cfg.kind == WakeKind.FULL_TEXT -> "Nothing to set up. Atall texts ${appName(relayId)} the whole ask and reads the reply."
       cfg.kind == WakeKind.WEBHOOK ->
         "Create a routine called \"Atall inbox\" with a webhook trigger. Instruction: call atall_inbox on the Atall connector, " +
           "then for each open task call atall_get_task, atall_claim, do it, and post with atall_post_result. Never spend money, book, " +
@@ -110,15 +118,28 @@ object WakeSetup {
     val configs: Map<String, WakeConfig> = emptyMap(),
     val webhookUrls: Map<String, String> = emptyMap(),
     val museWhatsApp: String? = null,
+    /** Settings format: 1 = C3.1 (Hark's default moved to Full text). */
+    val version: Int = 0,
   ) {
     fun config(relayId: String): WakeConfig = configs[relayId.lowercase(Locale.ROOT)] ?: WakeDefaults.forAgent(relayId)
-    fun with(relayId: String, cfg: WakeConfig) = copy(configs = configs + (relayId.lowercase(Locale.ROOT) to cfg))
+    fun with(relayId: String, cfg: WakeConfig) = copy(configs = configs + (relayId.lowercase(Locale.ROOT) to cfg), version = Companion.VERSION)
     fun withUrl(relayId: String, url: String) = copy(webhookUrls = if (url.isBlank()) webhookUrls - relayId.lowercase(Locale.ROOT) else webhookUrls + (relayId.lowercase(Locale.ROOT) to url.trim()))
     fun encode(): String = JSON.encodeToString(serializer(), this)
 
     companion object {
       private val JSON = Json { ignoreUnknownKeys = true; encodeDefaults = false }
-      fun decode(s: String?): Saved = runCatching { if (s.isNullOrBlank()) Saved() else JSON.decodeFromString(serializer(), s) }.getOrDefault(Saved())
+      const val VERSION = 1
+      fun decode(s: String?): Saved = runCatching { if (s.isNullOrBlank()) Saved() else JSON.decodeFromString(serializer(), s).migrated() }.getOrDefault(Saved())
+
+      /**
+       * C3.1, once: a Hark wake saved as Text (C3's default, which needs a standing instruction Hark declined) goes back
+       * to the default, Full text. Every other choice is kept.
+       */
+      private fun Saved.migrated(): Saved {
+        if (version >= VERSION) return this
+        val hark = configs["hark"]
+        return copy(configs = if (hark?.kind == WakeKind.TEXT) configs - "hark" else configs, version = VERSION)
+      }
     }
   }
 

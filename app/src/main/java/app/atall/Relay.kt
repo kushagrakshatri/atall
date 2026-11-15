@@ -133,11 +133,19 @@ class Relay(
             byText = { t, why -> fallbackText(t, why) },
             tapFull = { t, _ -> val full = fullAsk(t.cid); full != null && sinks.tap(t, WakeCopy.prompt(t.ref), full) == WakeOutcome.TAP },
             note = { n -> log.add("wake", n.step.substringBefore(' '), n.cid.substringBefore('~').takeIf { "~" in n.cid }, "#${n.ref} ${n.relayAgentId}: ${n.step}") },
+            // A paused agent (kDot after his ChatGPT Pro ended) gets no wake, nudge, text or tap for its open cards.
+            skip = { t -> registry.get(t.peerId)?.paused != false },
         )
     }
 
-    /** What Juno and the Router use: the connector route for an agent, when there is one right now. */
-    val access = object : ConnectorAccess {
+    /**
+     * What Juno and the Router use: the connector route for an agent, when there is one right now. C3.1: an agent set to
+     * Full text (Hark by default) has none, so its asks go by text at once ([app.atall.core.FullTextRouting]).
+     */
+    val access: ConnectorAccess by lazy { app.atall.core.FullTextRouting(connected) { wake.config(it) } }
+
+    /** Connected on the relay (paired, live connection), whatever the agent's route. */
+    private val connected = object : ConnectorAccess {
         override fun relayIdFor(p: AgentProfile): String? {
             val ids = directory.agents?.map { it.agentId } ?: return null
             return if (directory.paired) ConnectorRouting.relayIdOf(p, ids) else null

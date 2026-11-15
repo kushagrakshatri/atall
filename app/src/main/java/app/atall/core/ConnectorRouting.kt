@@ -1,6 +1,8 @@
 package app.atall.core
 
 import app.atall.coordinator.adapters.CardPeer
+import app.atall.coordinator.adapters.WakeConfig
+import app.atall.coordinator.adapters.WakeKind
 import java.util.Locale
 
 /**
@@ -17,12 +19,36 @@ interface ConnectorAccess {
     /** Runs started by "Run Story 1": never fall back to text. */
     fun connectorOnly(runId: String): Boolean = false
 
+    /**
+     * The agent's relay id when it is connected on the relay, whatever its route (Settings → Wake-up shows for it even
+     * when its asks go by text). Same as [relayIdFor] unless a route like Full text keeps it off the connector.
+     */
+    fun linkedRelayId(p: AgentProfile): String? = relayIdFor(p)
+
+    /** C3.1: [p] is connected but set to Full text, so its asks go by text (never a card). */
+    fun byFullText(p: AgentProfile): Boolean = false
+
     companion object {
         val NONE = object : ConnectorAccess {
             override fun relayIdFor(p: AgentProfile): String? = null
             override fun peer(p: AgentProfile): CardPeer? = null
         }
     }
+}
+
+/**
+ * C3.1 "Full text": an agent whose route ([WakeConfig.kind]) is [WakeKind.FULL_TEXT] is never reached over the
+ * connector. [relayIdFor] and [peer] say "no connector route", so Juno (@all, Juno asks) and the Router (@mentions) send
+ * the whole packed ask by text at once and the text reply is the answer: no relay task, no "Atall #ref" nudge, no
+ * fallback ladder. [linkedRelayId] still names the connection, for Settings.
+ */
+class FullTextRouting(private val base: ConnectorAccess, private val config: (relayId: String) -> WakeConfig) : ConnectorAccess {
+    private fun fullText(relayId: String) = config(relayId).kind == WakeKind.FULL_TEXT
+    override fun relayIdFor(p: AgentProfile): String? = base.relayIdFor(p)?.takeUnless(::fullText)
+    override fun peer(p: AgentProfile): CardPeer? = if (base.relayIdFor(p)?.let(::fullText) == true) null else base.peer(p)
+    override fun connectorOnly(runId: String): Boolean = base.connectorOnly(runId)
+    override fun linkedRelayId(p: AgentProfile): String? = base.linkedRelayId(p)
+    override fun byFullText(p: AgentProfile): Boolean = base.linkedRelayId(p)?.let(::fullText) == true
 }
 
 /** Pure rules: name matching between the user's agents and relay ids, per-agent connector timeouts. */

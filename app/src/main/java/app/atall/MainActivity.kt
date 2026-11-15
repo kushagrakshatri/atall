@@ -217,7 +217,8 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun wakeUi(profile: app.atall.core.AgentProfile): app.atall.ui.WakeUi? {
         val g = graph
-        val relayId = g.relay.access.relayIdFor(profile) ?: profile.relayId ?: return null
+        // linkedRelayId: an agent on Full text has no connector route but still gets its Wake-up section.
+        val relayId = g.relay.access.linkedRelayId(profile) ?: profile.relayId ?: return null
         val ws = g.wakeSettings
         var cfg by remember(relayId) { mutableStateOf(ws.config(relayId)) }
         var url by remember(relayId) { mutableStateOf(ws.saved.webhookUrls[relayId.lowercase()].orEmpty()) }
@@ -245,6 +246,7 @@ class MainActivity : ComponentActivity() {
                 copied = true
             },
             copied = copied,
+            setup = app.atall.core.WakeSetup.needsSetup(cfg),
         )
     }
 

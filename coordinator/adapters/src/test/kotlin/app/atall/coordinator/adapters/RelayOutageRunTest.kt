@@ -95,7 +95,8 @@ class RelayOutageRunTest {
       override suspend fun events(task: ConnectorTask, first: Boolean) = WakeOutcome.UNAVAILABLE
       override suspend fun tap(task: ConnectorTask, prompt: String, full: String?) = WakeOutcome.TAP.also { wakes += "tap ${task.relayAgentId}" }
     }
-    val cfg: (String) -> WakeConfig = { WakeDefaults.forAgent(it) }
+    // Hark on the C3 text wake (C3.1's default for Hark is Full text, which never posts a card).
+    val cfg: (String) -> WakeConfig = { if (it == "hark") WakeConfig(WakeKind.TEXT, backup = WakeKind.TAP) else WakeDefaults.forAgent(it) }
     val ladder = FallbackLadder(
       ledger, WakeDispatcher(cfg, sinks) { it == "a-hark" },
       policyFor = { LadderPolicy.of(cfg(it.relayAgentId), softTimeoutMs = 6 * 60_000) },

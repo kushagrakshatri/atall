@@ -12,6 +12,13 @@ below. A wake carries no content: only the ref (`Atall #k3f9`) or `{task_id, ref
 | **Claude Duet** | **Its own schedule.** Duet "checks your connected accounts every few hours" (default window 3 h, editable). Nothing is sent. | After window + 30 min: one-tap → `claude.ai/new?q=Check your Atall inbox for #ref` (copied to the clipboard too). | Every-few-hours checks, connectors shared with the Claude account: **verified** (claude.com Introducing Claude Duet; support "Get started with Claude Duet"). `claude://claude.ai/new?q=` prefill: **verified for Claude Desktop**; the Android app's `claude://` links are documented only for Code, so the app opens the https link and relies on Claude's app link: **assumed**. Claude app scheduled tasks (hourly, cloud, connectors) exist on paid plans: **verified** (support.claude.com scheduled tasks) but they run in Claude, not Duet; not used by default. |
 | **Meta Muse** | **Its own schedule.** A Muse recurring task ("Every 15 minutes, call atall_inbox…", "Copy setup"). Nothing is sent. | One-tap → Muse's WhatsApp chat (`wa.me/<number>?text=…` when Kush saves Muse's WhatsApp number) or the share sheet. | Recurring tasks on a custom interval: **verified** (meta.com Help, reminders and scheduled tasks). A scheduled run calling a custom MCP connector: third-party only (livewithbonsai.com docs), **assumed**. Muse lives in WhatsApp: **verified** (faq.whatsapp.com); Atall's WhatsApp reply path isn't built (text-agents is Google Messages only), so WhatsApp is a tap, not automatic. No webhook/event trigger documented. |
 
+## C3.1 (2026-11-15): Hark is a pure text agent ("Full text")
+Hark declined the standing instruction: it won't pull tasks from an outside board or post results there. New route
+**Full text** (`WakeKind.FULL_TEXT`), Hark's default and pickable for kDot: the whole packed ask (the same text the
+ladder's text rung sends) goes by text at once and the text reply is the answer, as in v0.1.4. No relay task, no
+`Atall #ref` nudge, no ladder; "Copy setup" is hidden. A saved C3 "Text" wake for Hark resets to Full text once. The Hark
+row above describes C3's Text wake, which stays pickable.
+
 ## Fallback ladder (protocol.md §8), as built
 `connector + wake → one nudge (backup path) → same ask by text (tagged) → tap with the whole ask`
 - Nudge after max(2 × latency, 3 min) with no claim/progress; schedule agents: window + 30 min.

@@ -788,7 +788,7 @@ class Juno(
     val events = mutableListOf<ScoreEvent>()
     val closes = mutableListOf<Pair<String, String>>()
     val busy = busyAgentsL(exceptRun = runId).toMutableSet()
-    s0.asks.filter { it.status.inFlight && roster.byId(it.agentId)?.kind == AgentKind.TEXT }.forEach { busy += it.agentId }
+    s0.asks.filter(::holdsTextSlot).forEach { busy += it.agentId }
     val asks = s0.asks.map { a ->
       when {
         a.status == AskStatus.REPLYING && now >= a.lastReplyAt + config.quietWindowMs -> settle(a, AskStatus.ANSWERED, now, events)
@@ -1686,7 +1686,16 @@ class Juno(
 
   /** Texting agents with an in-flight ask in any run in memory (one at a time per texting agent). */
   private fun busyAgentsL(exceptRun: String? = null): Set<String> = cache.values.filter { it.runId != exceptRun }
-    .flatMap { s -> s.asks.filter { it.status.inFlight && roster.byId(it.agentId)?.kind == AgentKind.TEXT }.map { it.agentId } }.toSet()
+    .flatMap { s -> s.asks.filter(::holdsTextSlot).map { it.agentId } }.toSet()
+
+  /**
+   * Whether [a] keeps its agent's one text slot (design.md rule 1: one open text per agent, so a reply can be told
+   * apart). A task card over the connector correlates by its task id, so it never holds the slot: on 2026-11-15 a Muse
+   * card from 12:58 that was still open (Muse had asked a question, hard timeout 2 h) left Muse's 2:23 PM @all ask
+   * "Queued" and never sent.
+   */
+  private fun holdsTextSlot(a: AskState): Boolean =
+    a.status.inFlight && a.via != Via.CONNECTOR && roster.byId(a.agentId)?.kind == AgentKind.TEXT
 
   private fun runIdOf(askId: String) = askId.substringBefore("~a")
 

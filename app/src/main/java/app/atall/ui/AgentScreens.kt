@@ -96,6 +96,8 @@ data class WakeUi(
     val onWhatsApp: (String) -> Unit = {},
     val onCopySetup: () -> Unit = {},
     val copied: Boolean = false,
+    /** False for Full text: nothing to give the agent, so no "Copy setup". */
+    val setup: Boolean = true,
 )
 
 @Composable
@@ -109,8 +111,10 @@ private fun WakeSection(w: WakeUi) {
             }
             Spacer(Modifier.height(8.dp))
             Text(w.caption, style = AppTheme.type.caption, color = c.ink3)
-            Spacer(Modifier.height(10.dp))
-            Chip(if (w.copied) "Copied" else "Copy setup", w.onCopySetup)
+            if (w.setup) {
+                Spacer(Modifier.height(10.dp))
+                Chip(if (w.copied) "Copied" else "Copy setup", w.onCopySetup)
+            }
         }
     }
     if (w.webhook) {

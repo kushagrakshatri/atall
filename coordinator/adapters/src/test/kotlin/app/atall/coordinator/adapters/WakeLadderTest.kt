@@ -30,11 +30,15 @@ class WakeLadderTest {
   }
 
   private val textRoutes = setOf("p-hark", "p-kdot")
+
+  /** These tests exercise the C3 "Atall #ref" text wake on Hark (C3.1 made Full text Hark's default; Text stays pickable). */
+  private fun c3Wakes(relayId: String): WakeConfig =
+    if (relayId == "hark") WakeConfig(WakeKind.TEXT, backup = WakeKind.TAP) else WakeDefaults.forAgent(relayId)
   private fun task(cid: String, peer: String, relay: String, ref: String = cid.takeLast(4).padStart(4, 'x')) =
     ConnectorTask(cid, peer, relay, ref, "tsk_$cid", postedAt = now, deadlineAt = now + 60 * MIN)
 
   private fun ladder(ledger: ConnectorLedger, sinks: Sinks, texted: MutableList<String>, tapped: MutableList<String> = CopyOnWriteArrayList(), textOk: Boolean = true): FallbackLadder {
-    val cfg: (String) -> WakeConfig = { WakeDefaults.forAgent(it) }
+    val cfg: (String) -> WakeConfig = ::c3Wakes
     val d = WakeDispatcher(cfg, sinks) { it in textRoutes }
     return FallbackLadder(
       ledger, d,
@@ -48,7 +52,7 @@ class WakeLadderTest {
 
   @Test fun eachAgentIsWokenByItsBestPath() = runBlocking {
     val sinks = Sinks()
-    val d = WakeDispatcher({ WakeDefaults.forAgent(it) }, sinks) { it in textRoutes }
+    val d = WakeDispatcher(::c3Wakes, sinks) { it in textRoutes }
     assertEquals(WakeKind.TEXT, d.wake(task("r~a0", "p-hark", "hark", "k3f9"), 1).kind)
     assertEquals(WakeKind.EVENTS, d.wake(task("r~a1", "p-kdot", "kdot"), 1).kind)
     assertEquals(WakeKind.WEBHOOK, d.wake(task("r~a2", "p-grok", "grok", "g7h8"), 1).kind)
@@ -66,7 +70,7 @@ class WakeLadderTest {
     val sinks = Sinks()
     sinks.answers[WakeKind.WEBHOOK] = WakeOutcome.UNAVAILABLE // no webhook set for Grok yet
     sinks.answers[WakeKind.EVENTS] = WakeOutcome.UNAVAILABLE  // kDot hasn't subscribed
-    val d = WakeDispatcher({ WakeDefaults.forAgent(it) }, sinks) { it in textRoutes }
+    val d = WakeDispatcher(::c3Wakes, sinks) { it in textRoutes }
     val g = d.wake(task("r~a0", "p-grok", "grok"), 1)
     assertEquals(WakeKind.TAP, g.kind)
     assertEquals(listOf(WakeKind.WEBHOOK, WakeKind.TAP), g.tried.map { it.first })
@@ -220,10 +224,73 @@ class WakeLadderTest {
   }
 
   @Test fun theSettingsPickerOnlyOffersRealPaths() {
-    assertEquals(listOf(WakeKind.EVENTS, WakeKind.TEXT, WakeKind.TAP, WakeKind.OFF), WakeDefaults.choices("kdot", hasTextRoute = true))
-    assertEquals(listOf(WakeKind.EVENTS, WakeKind.TAP, WakeKind.OFF), WakeDefaults.choices("kdot", hasTextRoute = false))
+    assertEquals(listOf(WakeKind.EVENTS, WakeKind.FULL_TEXT, WakeKind.TEXT, WakeKind.TAP, WakeKind.OFF), WakeDefaults.choices("kdot", hasTextRoute = true))
+    assertEquals(listOf(WakeKind.EVENTS, WakeKind.FULL_TEXT, WakeKind.TAP, WakeKind.OFF), WakeDefaults.choices("kdot", hasTextRoute = false))
+    assertEquals(listOf(WakeKind.FULL_TEXT, WakeKind.TEXT, WakeKind.TAP, WakeKind.SCHEDULE, WakeKind.OFF), WakeDefaults.choices("hark", hasTextRoute = true))
+    assertEquals(WakeKind.FULL_TEXT, WakeDefaults.choices("hark", hasTextRoute = false).first())
     assertEquals(listOf(WakeKind.WEBHOOK, WakeKind.TAP, WakeKind.SCHEDULE, WakeKind.OFF), WakeDefaults.choices("grok", hasTextRoute = false))
     assertEquals(listOf(WakeKind.SCHEDULE, WakeKind.TAP, WakeKind.OFF), WakeDefaults.choices("duet", hasTextRoute = false))
     assertEquals(180 * MIN, WakeDefaults.forAgent("duet").windowMs)
+  }
+
+  @Test fun fullTextIsHarksDefaultAndNeverWakes() = runBlocking {
+    assertEquals(WakeConfig(WakeKind.FULL_TEXT), WakeDefaults.forAgent("hark"))
+    val sinks = Sinks()
+    val d = WakeDispatcher({ WakeDefaults.forAgent(it) }, sinks) { it in textRoutes }
+    val a = d.wake(task("r~a0", "p-hark", "hark", "k3f9"), 1)
+    assertEquals(WakeOutcome.UNAVAILABLE, a.outcome)
+    assertTrue("no \"Atall #ref\" nudge, no tap", sinks.calls.isEmpty())
+    val p = LadderPolicy.of(WakeDefaults.forAgent("hark"), softTimeoutMs = 6 * MIN)
+    assertEquals(0, p.maxWakes)
+    assertEquals(0L, p.fallbackAfterMs)
+  }
+
+  @Test fun aCardLeftOverFromBeforeTheSwitchGoesByTextAtOnceUnwoken() = runBlocking {
+    // A Hark card posted under C3's Text wake; the user is now on C3.1 (Full text).
+    val ledger = ConnectorLedger(null)
+    val sinks = Sinks()
+    val texted = CopyOnWriteArrayList<String>()
+    val l = FallbackLadder(
+      ledger, WakeDispatcher({ WakeDefaults.forAgent(it) }, sinks) { it in textRoutes },
+      policyFor = { t -> LadderPolicy.of(WakeDefaults.forAgent(t.relayAgentId), softTimeoutMs = 6 * MIN) },
+      hasTextRoute = { it in textRoutes },
+      byText = { t, why -> texted += "${t.cid} $why"; true },
+      clock = { now },
+    )
+    ledger.put(task("run~a0", "p-hark", "hark", "h1k2"))
+    l.tick()
+    assertEquals(listOf("run~a0 no_claim"), texted.toList())
+    assertTrue(sinks.calls.isEmpty())
+    assertEquals(0, ledger.get("run~a0")!!.wakes)
+    now += 10 * MIN
+    l.tick()
+    assertEquals(1, texted.size)
+  }
+
+  @Test fun aPausedAgentsOpenCardIsNeitherWokenNorFallenBack() = runBlocking {
+    // kDot paused (his ChatGPT Pro ended) with a card still open from earlier.
+    val ledger = ConnectorLedger(null)
+    val sinks = Sinks()
+    val texted = CopyOnWriteArrayList<String>()
+    val tapped = CopyOnWriteArrayList<String>()
+    var paused = true
+    val l = FallbackLadder(
+      ledger, WakeDispatcher(::c3Wakes, sinks) { it in textRoutes },
+      policyFor = { t -> LadderPolicy.of(c3Wakes(t.relayAgentId), softTimeoutMs = 6 * MIN) },
+      hasTextRoute = { it in textRoutes },
+      byText = { t, why -> texted += "${t.cid} $why"; true },
+      tapFull = { t, why -> tapped += "${t.cid} $why"; true },
+      clock = { now },
+      skip = { t -> paused && t.peerId == "p-kdot" },
+    )
+    ledger.put(task("run~a1", "p-kdot", "kdot"))
+    l.tick()
+    now += 10 * MIN
+    l.tick(relayDownSince = now - 2 * MIN)
+    assertTrue(sinks.calls.isEmpty() && texted.isEmpty() && tapped.isEmpty())
+    assertEquals(0, ledger.get("run~a1")!!.wakes)
+    paused = false // unpaused: the ladder picks it up again
+    l.tick()
+    assertEquals(listOf("run~a1 no_claim"), texted.toList())
   }
 }
