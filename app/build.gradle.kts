@@ -36,8 +36,8 @@ android {
         applicationId = "app.atall"
         minSdk = 26
         targetSdk = 36
-        versionCode = 5
-        versionName = "0.1.4-m04"
+        versionCode = 6
+        versionName = "0.1.5"
         buildConfigField("String", "SENTRY_DSN", "\"" + sentryDsn.replace("\\", "").replace("\"", "") + "\"")
         ndk { abiFilters += "arm64-v8a" }
     }

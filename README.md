@@ -2,13 +2,14 @@
 
 **One thread for all your AI agents.** Talk to **Juno**, the main agent, in a single chat on your Android
 phone, and `@mention` any other agent you use to ask it directly. Atall is open source (MIT), runs fully on the
-phone, and has no server.
+phone. The optional Atall relay (`connector/`, a Supabase Edge Function) lets agents that support MCP pick up
+phone-signed tasks.
 
-> Status: **M0.4 (v0.1.4-m04), pre-release.** Juno coordinates: it asks your agents, waits, and merges
-> their answers; `@all` asks everyone the same question and shows where they agree; and now your agents can
-> **talk it over**.
+> Status: **v0.1.5, pre-release.** Juno coordinates: it asks your agents, waits, and merges their answers;
+> `@all` asks everyone the same question and shows where they agree; your agents can **talk it over**; and the
+> phone can now pair with the Atall relay (C1).
 
-## M0.5 fixes (branch m05)
+## New in v0.1.5: M0.5 fixes
 
 - **An agent's status text is never its answer.** "Looks like your signal dropped…", "Let me check", "One sec", typing
   placeholders and "message not delivered" are recognised (`NonAnswers` in text-agents). They don't close the agent's
@@ -88,7 +89,7 @@ phone, and has no server.
   back to an older one. A draft opens only when no live reply button exists; each fallback's reason is logged
   on the device (`adb logcat -s TextAgents:D`, no message text).
 
-## In progress: C1 (the relay, branch `c1-app`)
+## New in v0.1.5: C1, the phone ⇄ relay link
 
 - **Settings → Agents → Connected agents.** **Connect relay** asks once for your owner code and pairs this phone with
   the Atall relay using a P-256 key that never leaves the Android Keystore. Then it lists the agents connected to the
@@ -97,7 +98,7 @@ phone, and has no server.
 - **Debugging → Send test task to all.** Posts a phone-signed test task and shows each agent's events as they arrive,
   with a check when the relay's countersignature verifies. Not wired into Juno yet (that's C2).
 - Every phone request is signed (`METHOD\nPATH\nTS\nbase64url(sha256(body))`); every event's `relay_sig` is checked
-  against the relay key from pairing. See `new-product/c1-contract.md`.
+  against the relay key from pairing. See `connector/C1-CONTRACT.md`.
 
 ## What it does (M0)
 
