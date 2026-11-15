@@ -233,7 +233,8 @@ class ConnectorPump(
       task.peerId, "relay:$cursor", text, at, task.cid, status = kind, via = Via.CONNECTOR, verified = true,
     )
     return when (e.type) {
-      RelayEvent.PROGRESS -> status("progress", if (p["claimed"].bool()) "On it" else p.str("message") ?: "Working on it")
+      // Only progress with something to say. The claim ("grok started working on #ref") and empty updates add nothing.
+      RelayEvent.PROGRESS -> if (p["claimed"].bool()) null else p.str("message")?.trim()?.takeIf { it.isNotEmpty() }?.let { status("progress", it) }
       RelayEvent.QUESTION -> status("question", "Asks: " + (p.str("text") ?: "a question"))
       RelayEvent.APPROVAL_REQUEST -> status("approval", "Wants your OK: " + (p.str("action") ?: "an action"))
       RelayEvent.RESULT -> {
@@ -258,8 +259,8 @@ class ConnectorPump(
     return SourcedClaim(text, (o["confidence"] as? JsonPrimitive)?.doubleOrNull, o.str("kind"), sources)
   }
 
-  private fun JsonObject.str(k: String) = (this[k] as? JsonPrimitive)?.takeUnless { it is JsonNull }?.contentOrNull
   private fun kotlinx.serialization.json.JsonElement?.bool() = (this as? JsonPrimitive)?.contentOrNull == "true"
+  private fun JsonObject.str(k: String) = (this[k] as? JsonPrimitive)?.takeUnless { it is JsonNull }?.contentOrNull
 }
 
 /**

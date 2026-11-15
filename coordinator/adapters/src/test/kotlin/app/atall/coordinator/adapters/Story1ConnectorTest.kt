@@ -144,7 +144,8 @@ class Story1ConnectorTest {
     val grokAsk = mid.asks.first { it.agentId == "a-grok" }
     assertEquals(AskStatus.PENDING, grokAsk.status)
     assertTrue(grokAsk.replies.isEmpty())
-    assertEquals(listOf("On it", "Checking OpenTable for 7-8pm"), grokAsk.statusNotes.map { it.text })
+    // The claims are not notes (nothing to say); real progress is.
+    assertEquals(listOf("Checking OpenTable for 7-8pm"), grokAsk.statusNotes.map { it.text })
 
     // ---- the phone is backgrounded and the process dies mid-run.
     drive1.cancel()

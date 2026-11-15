@@ -516,7 +516,7 @@ class JunoBridge(
             for (p in replies) {
                 val id = "in:${p.messageId}"
                 put(ThreadMessage(id, thread.get(id)?.at ?: at(p.at), a.agentId, p.text, attribution = Attribution.JUNO,
-                    askId = a.id, sourceId = p.messageId, detail = replyNote(p.certainty, p.late), via = p.provenance,
+                    askId = a.id, sourceId = p.messageId, detail = replyNote(p.certainty, p.late), via = p.provenance.takeIf { it == app.atall.coordinator.Via.CONNECTOR },
                     suggest = PeerLines.suggestions(p.text, a.agentId, registry.all())))
             }
         }

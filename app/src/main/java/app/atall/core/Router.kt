@@ -217,7 +217,7 @@ class Router(
             if (runCatching { coordinator().onPeerMessage(p.toPeer(), m) }.getOrDefault(false)) return
             if (inbox().onUnsolicited(p.toPeer(), m) == InboxDecision.HOLD) return
         }
-        showPeer(p.id, m.id, m.text, m.sentAt, attribution, via = if (attribution == Attribution.DIRECT) Via.TEXT else null)
+        showPeer(p.id, m.id, m.text, m.sentAt, attribution)
     }
 
     /**
@@ -232,7 +232,7 @@ class Router(
                 kind = MessageKind.NOTICE, peerId = p.id, sourceId = m.messageId))
             return
         }
-        showPeer(p.id, m.messageId, m.text, m.at, Attribution.DIRECT, via = if (m.via == Via.CONNECTOR && m.verified) Via.CONNECTOR else Via.TEXT)
+        showPeer(p.id, m.messageId, m.text, m.at, Attribution.DIRECT, via = if (m.via == Via.CONNECTOR && m.verified) Via.CONNECTOR else null)
     }
 
     /** Catch up from a peer's durable log (the live flow doesn't replay). Lines from before the agent was added are skipped. */

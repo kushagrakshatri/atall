@@ -5,21 +5,22 @@ phone, and `@mention` any other agent you use to ask it directly. Atall is open 
 phone. The optional Atall relay (`connector/`, a Supabase Edge Function) lets agents that support MCP pick up
 phone-signed tasks.
 
-> Status: **v0.1.6-c2, pre-release (branch c2).** Juno coordinates: it asks your agents, waits, and merges their
+> Status: **v0.1.6-c2.1, pre-release (branch c2).** Juno coordinates: it asks your agents, waits, and merges their
 > answers; `@all` asks everyone the same question and shows where they agree; your agents can **talk it over**; and
 > Juno now reaches agents connected to the Atall relay over the connector (C2), falling back to texts only when it
 > can't.
 
-## New in v0.1.6-c2: C2, Juno on the connector
+## New in v0.1.6-c2.1: C2, Juno on the connector
 
 - **Connector first.** When the phone is paired and an agent has a live connection on the relay, Juno's asks,
   `@all` and direct `@mentions` go to it as phone-signed task cards (addressed to that agent only, asking for
   claims). Agents that aren't connected, or a relay that can't be reached, use the text route as before.
 - **Answers with claims.** A result is the whole answer at once (no quiet window). Its claims, with confidence and
-  sources, are stored on the run and given to the merge and the Agreement Map. Progress, questions and approval
-  requests show as muted status lines; they never count as an answer, and each agent keeps its own timeout.
-- **Provenance.** Every agent answer shows **Verified** (came over the connector; the relay's countersignature for
-  that agent's connection checked out) or **Via text**. Events that don't verify are dropped.
+  sources, are stored on the run and given to the merge and the Agreement Map. Progress messages, questions and
+  approval requests show as muted status lines (a bare claim shows nothing); they never count as an answer, and each
+  agent keeps its own timeout.
+- **Provenance.** An answer that came over the connector with a countersignature that checked out for that agent's
+  connection shows **✓ Verified**. Texted answers show no badge. Events that don't verify are dropped.
 - **Connected agents join the thread.** Agents the relay lists that you haven't added (e.g. Grok, Duet) appear in
   your agents as "Over the Atall connector". While Juno waits on them, a silent notification keeps Atall running.
 - **Debugging → Run Story 1.** "@Juno ask @Grok and @Duet: Plan Saturday dinner for four, no pork or beef." over

@@ -144,19 +144,19 @@ class ConnectorBridgeTest {
         // Progress over the connector is a status line, not an answer; then the verified results land.
         val grokCid = r.connector.cards[0].second
         val duetCid = r.connector.cards[1].second
-        r.bridge.juno.ingest(PeerSignal.Message(r.grok.id, "relay:7", "On it", T0, grokCid, status = "progress", via = Via.CONNECTOR, verified = true))
+        r.bridge.juno.ingest(PeerSignal.Message(r.grok.id, "relay:7", "Checking OpenTable", T0, grokCid, status = "progress", via = Via.CONNECTOR, verified = true))
         r.bridge.juno.ingest(result(r.grok.id, grokCid, "Sakoon has a table for 4 at 7:30."))
         r.bridge.juno.ingest(result(r.duet.id, duetCid, "Sakoon or Rooh, both veg-friendly."))
         settle()
 
         val lines = r.thread.all()
-        assertTrue(lines.any { it.kind == MessageKind.NOTICE && it.text == "Grok: On it" })
+        assertTrue(lines.any { it.kind == MessageKind.NOTICE && it.text == "Grok: Checking OpenTable" })
         val grokLine = lines.single { it.author == r.grok.id }
         val duetLine = lines.single { it.author == r.duet.id }
         val novaLine = lines.single { it.author == r.nova.id }
         assertEquals(Via.CONNECTOR, grokLine.via); assertEquals("Verified", provenanceLabel(grokLine))
         assertEquals(Via.CONNECTOR, duetLine.via)
-        assertEquals(Via.TEXT, novaLine.via); assertEquals("Via text", provenanceLabel(novaLine))
+        assertNull("texted answers get no badge", novaLine.via); assertNull(provenanceLabel(novaLine))
         assertEquals("Sakoon at 7:30.", lines.last().text)
         val done = r.bridge.juno.state(runId)!!
         assertEquals(1, done.asks.first { it.agentId == r.grok.id }.claims.size)
@@ -173,7 +173,7 @@ class ConnectorBridgeTest {
         settle(1_000)
         r.bridge.juno.ingest(result(r.duet.id, r.connector.cards.single().second, "Try Sakoon.", verified = false))
         settle()
-        assertEquals(Via.TEXT, r.thread.all().single { it.author == r.duet.id }.via)
+        assertNull(r.thread.all().single { it.author == r.duet.id }.via)
     }
 
     @Test fun notConnectedMeansTextAndAConnectorOnlyAgentIsUnreachable() = runTest {
@@ -190,7 +190,7 @@ class ConnectorBridgeTest {
         settle()
         assertTrue(r.connector.cards.isEmpty())
         assertEquals(1, r.agents.getValue(r.grok.id).sent.size)
-        assertEquals(Via.TEXT, r.thread.all().single { it.author == r.grok.id }.via)
+        assertNull(r.thread.all().single { it.author == r.grok.id }.via)
     }
 
     @Test fun relayDownFallsBackToTextExceptInAConnectorOnlyRun() = runTest {
@@ -228,7 +228,7 @@ class ConnectorBridgeTest {
         assertTrue(goal.contains("what's a good veg place"))
         val user = r.thread.all().first()
         assertEquals(SendStatus.SENT, user.status)
-        r.router.onConnectorReply(r.duet.id, PeerSignal.Message(r.duet.id, "relay:3", "On it", T0, cid, status = "progress", via = Via.CONNECTOR, verified = true))
+        r.router.onConnectorReply(r.duet.id, PeerSignal.Message(r.duet.id, "relay:3", "Checking menus", T0, cid, status = "progress", via = Via.CONNECTOR, verified = true))
         r.router.onConnectorReply(r.duet.id, PeerSignal.Message(r.duet.id, "relay:res:1", "Try Sakoon.", T0 + 5, cid, via = Via.CONNECTOR, verified = true, final = true))
         r.router.onConnectorReply(r.duet.id, PeerSignal.Message(r.duet.id, "relay:res:1", "Try Sakoon.", T0 + 5, cid, via = Via.CONNECTOR, verified = true, final = true))
         val lines = r.thread.all()
@@ -236,7 +236,7 @@ class ConnectorBridgeTest {
         val answer = lines.single { it.author == r.duet.id }
         assertEquals(Attribution.DIRECT, answer.attribution)
         assertEquals(Via.CONNECTOR, answer.via)
-        assertTrue(lines.any { it.text == "Duet: On it" && it.kind == MessageKind.NOTICE })
+        assertTrue(lines.any { it.text == "Duet: Checking menus" && it.kind == MessageKind.NOTICE })
     }
 
     @Test fun routingRulesMatchNamesAndAddOnlyMissingAgents() {

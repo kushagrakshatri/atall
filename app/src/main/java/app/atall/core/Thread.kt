@@ -93,8 +93,8 @@ data class ThreadMessage(
     /** Agent lines: other agents it @mentioned ("Ask Hark about this?"): peer ids. Nothing is sent until the user does. */
     val suggest: List<String> = emptyList(),
     /**
-     * Agent answers (to Juno or a direct mention): how it came. CONNECTOR = over the Atall connector with a verified
-     * relay countersignature for that agent's connection; TEXT = a text. Null on other lines and lines before C2.
+     * Agent answers (to Juno or a direct mention): CONNECTOR when it came over the Atall connector with a verified
+     * relay countersignature for that agent's connection (the "Verified" badge). Null on everything else.
      */
     val via: app.atall.coordinator.Via? = null,
 ) {
