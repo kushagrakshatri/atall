@@ -1,0 +1,49 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src https://ggmvzyyuksewkgbokrhe.supabase.co; base-uri 'none'; form-action 'none'"><meta name="referrer" content="no-referrer"><title>Atall dev</title><style>
+body{font:16px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:#f6f5f2;color:#1c1b19}
+main{max-width:520px;margin:6vh auto;padding:28px;background:#fff;border-radius:14px;box-shadow:0 1px 3px #0002}
+h1{font-size:22px;margin:0 0 6px}p{margin:8px 0}.muted{color:#666;font-size:14px}
+label{display:block;margin:16px 0 6px;font-weight:600}
+input,select{width:100%;box-sizing:border-box;padding:10px;border:1px solid #ccc;border-radius:8px;font:inherit}
+.row{display:flex;gap:10px;margin-top:22px}button{flex:1;padding:12px;border-radius:8px;border:0;font:inherit;font-weight:600;cursor:pointer}
+.ok{background:#1c1b19;color:#fff}.no{background:#e9e7e2}
+.warn{background:#fff4d6;border:1px solid #f0d58a;padding:10px;border-radius:8px;font-size:14px}
+.err{background:#fde3e1;border:1px solid #f2a39b;padding:10px;border-radius:8px}
+code{background:#f0eee9;padding:1px 5px;border-radius:4px;word-break:break-all}</style></head><body><main><style>main{max-width:860px}table{border-collapse:collapse;width:100%;font-size:14px}td,th{border-bottom:1px solid #eee;padding:6px;text-align:left;vertical-align:top}
+.card{border:1px solid #e4e1da;border-radius:10px;padding:12px;margin:10px 0}.res{background:#f7f6f3;border-radius:8px;padding:8px;margin:6px 0}textarea{width:100%;box-sizing:border-box;min-height:60px;padding:8px;border:1px solid #ccc;border-radius:8px;font:inherit}
+.pill{display:inline-block;padding:1px 8px;border-radius:99px;background:#eee;font-size:12px;margin-left:6px}button.small{padding:4px 10px;flex:none;border-radius:6px;border:1px solid #ccc;background:#fff;cursor:pointer}</style>
+<h1>Atall connector · dev</h1>
+<p class="muted">C0 test console. Create a task, then watch agents read it and post results.</p>
+<div id="login"><label for="tok">Admin token</label><input id="tok" type="password"><div class="row"><button class="ok" id="save">Open</button></div></div>
+<div id="app" hidden>
+<h2>New task</h2>
+<label>Title</label><input id="t-title" value="Atall write test">
+<label>Goal</label><textarea id="t-goal">Call atall_post_result for this task with status done, a one-sentence summary saying which assistant you are, and one claim with a source URL.</textarea>
+<label>To (agent ids, comma separated, or @all)</label><input id="t-to" value="@all">
+<div class="row"><button class="ok" id="create">Create task</button><button class="no" id="reset">Clear tasks, results, pings</button></div>
+<p id="msg" class="muted"></p>
+<h2>Write-test pings</h2><table id="pings"></table>
+<h2>Presence</h2><table id="presence"></table>
+<h2>Tasks and results</h2><div id="tasks"></div>
+<h2>Connections</h2><table id="conns"></table>
+</div>
+<script>
+const API="https://ggmvzyyuksewkgbokrhe.supabase.co/functions/v1/atall";const $=s=>document.querySelector(s);let tok=sessionStorage.getItem("atall_admin")||"";
+function el(tag,text,attrs){const e=document.createElement(tag);if(text!=null)e.textContent=String(text);if(attrs)for(const k in attrs)e.setAttribute(k,attrs[k]);return e}
+function link(u,label){try{const x=new URL(u);if(x.protocol==="https:"||x.protocol==="http:"){const a=el("a",label||u,{href:x.href,target:"_blank",rel:"noopener noreferrer"});return a}}catch{}return el("span",u)}
+function row(cells,th){const tr=el("tr");cells.forEach(c=>{const td=el(th?"th":"td");if(c instanceof Node)td.append(c);else td.textContent=c==null?"":String(c);tr.append(td)});return tr}
+async function api(path,opts={}){const r=await fetch(API+path,{...opts,headers:{"Authorization":"Bearer "+tok,"Content-Type":"application/json"}});if(r.status===401){sessionStorage.removeItem("atall_admin");tok="";show();throw new Error("unauthorized")}return r.json()}
+function show(){$("#login").hidden=!!tok;$("#app").hidden=!tok}
+async function refresh(){if(!tok)return;const s=await api("/admin/state");
+const p=$("#pings");p.replaceChildren(row(["When","Agent","Connection","Note"],true));s.pings.forEach(x=>p.append(row([new Date(x.at).toLocaleString(),x.agent_id,x.client_name,x.note])));
+const pr=$("#presence");pr.replaceChildren(row(["Agent","Last seen","Last call","Client"],true));s.presence.forEach(x=>pr.append(row([x.agent_id,new Date(x.last_seen).toLocaleString(),x.last_tool,x.client_name])));
+const ts=$("#tasks");ts.replaceChildren();s.tasks.forEach(t=>{const c=el("div",null,{class:"card"});const h=el("div");h.append(el("b","#"+t.ref+" "+t.title),el("span",t.state,{class:"pill"}),el("span","to "+t.to.join(", "),{class:"pill"}));c.append(h,el("div",t.goal,{class:"muted"}));
+ if(!t.results.length)c.append(el("p","No results yet.",{class:"muted"}));
+ t.results.forEach(r=>{const d=el("div",null,{class:"res"});d.append(el("b",r.agent_id+" · "+r.status),el("span",new Date(r.recorded_at).toLocaleString(),{class:"pill"}),el("p",r.summary));
+  if(r.claims.length){const ul=el("ul");r.claims.forEach(cl=>{const li=el("li",cl.text+(cl.confidence!=null?" ("+cl.confidence+")":""));(cl.sources||[]).forEach(src=>{li.append(" ",link(src.url,src.title||"source"))});ul.append(li)});d.append(ul)}
+  (r.artifacts||[]).forEach(a=>d.append(link(a.url,a.name)));c.append(d)});ts.append(c)});
+const cn=$("#conns");cn.replaceChildren(row(["Agent","Client","Kind","Created","Status",""],true));s.connections.forEach(x=>{const b=el("button","Revoke",{class:"small"});b.onclick=async()=>{await api("/admin/connections/"+x.conn_id+"/revoke",{method:"POST"});refresh()};cn.append(row([x.agent_id,x.client_name,x.kind,new Date(x.created_at).toLocaleString(),x.revoked?"revoked":"active",x.revoked?"":b]))});}
+$("#save").onclick=()=>{tok=$("#tok").value.trim();sessionStorage.setItem("atall_admin",tok);show();refresh().catch(()=>{})};
+$("#create").onclick=async()=>{const t=await api("/admin/tasks",{method:"POST",body:JSON.stringify({title:$("#t-title").value,goal:$("#t-goal").value,to:$("#t-to").value})});$("#msg").textContent=t.error?t.error:"Created #"+t.ref+" ("+t.task_id+")";refresh()};
+$("#reset").onclick=async()=>{if(confirm("Clear all tasks, results, pings and presence?")){await api("/admin/reset",{method:"POST"});refresh()}};
+show();refresh().catch(()=>{});setInterval(()=>refresh().catch(()=>{}),4000);
+</script></main></body></html>
