@@ -55,8 +55,8 @@ class Graph(private val context: Context) {
     val debugLog = app.atall.core.DebugLog(File(dataDir, "debug-log.jsonl"))
     val telemetry = SentryTelemetry(context) { prefs.sendMessageText }
 
-    /** The Atall relay (C1): pairing, connected agents, the debug test task. Not wired into Juno yet (C2). */
-    val relay = Relay(context, scope, debugLog)
+    /** The Atall relay: pairing, connected agents, the debug test task, and (C2) the connector Juno asks agents over. */
+    val relay = Relay(context, scope, debugLog, dataDir, registry)
 
     val rcs = RcsChannel(context)
     val adapters: Map<ChannelType, ChannelAdapter> = mapOf(ChannelType.RCS to rcs)
@@ -79,13 +79,14 @@ class Graph(private val context: Context) {
         scores = JsonLinesScoreLog(File(dataDir.apply { mkdirs() }, "scores.jsonl")),
         scope = scope, userName = ::userName,
         onTalkDone = { runId, text -> talkNotifier.talkDone(runId, text) },
-        log = debugLog, telemetry = telemetry,
+        log = debugLog, telemetry = telemetry, connector = relay.access,
     )
 
     val router = Router(
         thread = thread, registry = registry, peers = peers,
         coordinator = { coordinator }, responses = { chatGpt.responsesOrNull() },
         model = { prefs.model }, inbox = { inbox }, juno = { juno }, userName = ::userName,
+        connector = { relay.access },
     )
 
     /**
@@ -114,6 +115,10 @@ class Graph(private val context: Context) {
         scope.launch { rcs.hub.events.collect { if (it is RequestClosed) runCatching { router.onRequestClosed(it) } } }
         sync()
         juno.start()
+        // C2: agents connected on the relay join the roster; their answers come back through one events loop.
+        relay.onAgentsChanged = { syncConnectorAgents() }
+        juno.onRunStarted = { runId, msg -> if (msg.text == story1Pending) { story1Pending = null; relay.markConnectorOnly(runId); debugLog.add("connector", "story1", runId, "connector only") } }
+        relay.start(toJuno = { juno.juno.ingest(it) }, toDirect = { id, m -> router.onConnectorReply(id, m) })
         chatGpt.refresh()
         // The listener may deliver before our collectors subscribe; the durable log covers the gap.
         scope.launch { delay(1_500); backfill() }
@@ -144,6 +149,38 @@ class Graph(private val context: Context) {
         _agents.value = all
     }
 
+    /** Agents connected on the relay with no agent in the registry yet are added (over the connector only). */
+    @Synchronized
+    fun syncConnectorAgents() {
+        val ids = relay.directory.agents?.map { it.agentId } ?: return
+        // An agent the user removed stays removed (it isn't added back on the next refresh).
+        val missing = app.atall.core.ConnectorRouting.missing(registry.all(), ids.filter { it.lowercase() !in prefs.removedConnectorAgents })
+        for ((relayId, name) in missing) {
+            val p = registry.addConnector(name, relayId)
+            debugLog.add("connector", "agent.added", null, "${p.name} ($relayId)")
+        }
+        _agents.value = registry.all()
+    }
+
+    @Volatile private var story1Pending: String? = null
+
+    /**
+     * Debug → Run Story 1 (C2 exit test): "@Juno ask @Grok and @Duet: Plan Saturday dinner for four, no pork or beef."
+     * over the connector only. Returns null when it was sent, else a short line saying what's missing.
+     */
+    suspend fun runStory1(): String? {
+        if (!relay.client.paired) return "Connect the relay first."
+        if (chatGpt.responsesOrNull() == null) return "Sign in with ChatGPT first."
+        val byRelay = registry.all().filter { !it.paused }.associateBy { relay.access.relayIdFor(it) }
+        val grok = byRelay["grok"] ?: return "Grok isn't connected."
+        val duet = byRelay["duet"] ?: return "Duet isn't connected."
+        val text = app.atall.core.ConnectorRouting.story1(grok.name, duet.name)
+        story1Pending = text
+        debugLog.add("connector", "story1.send", null, "grok=${grok.id} duet=${duet.id}")
+        router.send(text)
+        return null
+    }
+
     fun backfill() = scope.launch {
         for (p in registry.all()) {
             val a = peers.agent(p.id) ?: continue
@@ -169,6 +206,9 @@ class Graph(private val context: Context) {
     /** Listening · Can reply now · Needs a tap · Paused · Not available yet. */
     fun statusOf(p: AgentProfile): String = when {
         p.paused -> "Paused"
+        // C2: reachable over the Atall connector (paired, and the agent has a live connection).
+        relay.access.relayIdFor(p) != null -> "Connected"
+        p.channel == ChannelType.CONNECTOR -> "Not connected"
         !p.channel.implemented -> "Not available yet"
         p.channel == ChannelType.RCS -> {
             val s = runCatching { rcs.liveStatus(p.id) }.getOrNull()
@@ -189,7 +229,10 @@ class Graph(private val context: Context) {
     }
 
     fun updateAgent(p: AgentProfile) { registry.update(p); sync() }
-    fun removeAgent(id: String) { adapters.values.forEach { it.unregister(id) }; registry.remove(id); sync() }
+    fun removeAgent(id: String) {
+        registry.get(id)?.takeIf { it.channel == ChannelType.CONNECTOR }?.relayId?.let { prefs.removedConnectorAgents = prefs.removedConnectorAgents + it.lowercase() }
+        adapters.values.forEach { it.unregister(id) }; registry.remove(id); sync()
+    }
 
     companion object { private const val TAG = "Atall" }
 }
@@ -211,6 +254,10 @@ class Prefs(context: Context) {
     var sendMessageText: Boolean
         get() = sp.getBoolean("send_message_text", true)
         set(v) { sp.edit().putBoolean("send_message_text", v).apply() }
+    /** Relay ids of connector-only agents the user removed from Settings → Agents (never re-added automatically). */
+    var removedConnectorAgents: Set<String>
+        get() = sp.getStringSet("removed_connector_agents", emptySet()) ?: emptySet()
+        set(v) { sp.edit().putStringSet("removed_connector_agents", v).apply() }
     /** Hidden Settings → "Debug: Sentry DSN": used only when the build has no DSN. Stored on the phone only. */
     var sentryDsn: String
         get() = sp.getString("sentry_dsn", "") ?: ""

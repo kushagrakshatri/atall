@@ -92,6 +92,11 @@ data class ThreadMessage(
     val yourCall: Boolean = false,
     /** Agent lines: other agents it @mentioned ("Ask Hark about this?"): peer ids. Nothing is sent until the user does. */
     val suggest: List<String> = emptyList(),
+    /**
+     * Agent answers (to Juno or a direct mention): how it came. CONNECTOR = over the Atall connector with a verified
+     * relay countersignature for that agent's connection; TEXT = a text. Null on other lines and lines before C2.
+     */
+    val via: app.atall.coordinator.Via? = null,
 ) {
     /** The attribution to render; lines from before 0.1.1 only have [direct]. */
     val shownAttribution: Attribution?

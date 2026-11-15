@@ -4,6 +4,9 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <!-- One notification when a talk's answer lands (Android 13+ asks the first time a talk starts). -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- C2: keep running while Juno waits on agents over the Atall connector (one silent notification). -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
 
     <queries>
         <!-- Custom Tabs for Sign in with ChatGPT (Android 11+ package visibility). -->
@@ -46,5 +49,9 @@
                 <data android:scheme="atall-signin" android:host="signin" />
             </intent-filter>
         </activity>
+        <service
+            android:name=".ConnectorService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
     </application>
 </manifest>

@@ -303,7 +303,15 @@ private fun AgentTurn(peer: PeerUi?, m: ThreadMessage, header: Boolean, extra: @
                 Text(text, style = AppTheme.type.body, color = c.ink)
             }
             else if (m.streaming) Dot(c.ink3)
-            m.detail?.takeIf { m.kind == MessageKind.TEXT && it.isNotBlank() }?.let { Text(it, Modifier.padding(top = 2.dp), style = AppTheme.type.caption, color = c.ink3) }
+            val note = m.detail?.takeIf { m.kind == MessageKind.TEXT && it.isNotBlank() }
+            val badge = provenanceLabel(m)
+            if (note != null || badge != null) {
+                Row(Modifier.padding(top = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+                    // Provenance (C2): a check for an answer that came over the connector with a verified countersignature.
+                    if (m.via == app.atall.coordinator.Via.CONNECTOR) { Icon(Glyph.Check, c.success, Modifier.size(12.dp), size = 12.dp); Spacer(Modifier.width(3.dp)) }
+                    Text(listOfNotNull(badge, note).joinToString(" · "), style = AppTheme.type.caption, color = c.ink3)
+                }
+            }
             extra()
         }
     }

@@ -43,6 +43,8 @@ data class RelayParams(
     val test: TestTaskUi? = null,
     val onSendTest: () -> Unit = {},
     val onCloseTest: () -> Unit = {},
+    /** Debug → Run Story 1 (C2): null when sent, else what's missing. */
+    val onStory1: suspend () -> String? = { null },
 )
 
 /** "Connected agents": Connect relay (asks once for the owner code), then each agent with last seen, last tool and Revoke. */
@@ -148,6 +150,16 @@ internal fun TestTaskRow(p: RelayParams) {
         }
     }
     p.test?.let { TestTaskDialog(it, p.onCloseTest) }
+    // C2 exit test on the phone: Story 1 with Grok and Duet over the connector only.
+    val scope = rememberCoroutineScope()
+    var story by remember { mutableStateOf<String?>(null) }
+    HorizontalDivider(color = c.hairline)
+    Row(Modifier.fillMaxWidth().clickable { scope.launch { story = p.onStory1() ?: "Sent. It's in your thread." } }.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f)) {
+            Text("Run Story 1", style = AppTheme.type.body, color = c.ink)
+            Text(story ?: "Dinner plan from Grok and Duet, over Atall only", style = AppTheme.type.caption, color = c.ink3)
+        }
+    }
 }
 
 @Composable

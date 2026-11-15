@@ -199,6 +199,7 @@ class MainActivity : ComponentActivity() {
         return app.atall.ui.RelayParams(
             ui = ui, onConnect = { code -> r.pair(code) }, onRevoke = { r.revoke(it) },
             test = test, onSendTest = { r.sendTestTask() }, onCloseTest = { r.closeTest() },
+            onStory1 = { graph.runStory1() },
         )
     }
 

@@ -234,8 +234,13 @@ fun AgentDetailScreen(
             SectionLabel("Reach")
             Card {
                 Column(Modifier.padding(14.dp)) {
-                    Text(if (peer.channel == app.atall.api.ChannelType.RCS) "Texts from ${peer.address}" else "${Copy.channelLabel(peer.channel)} · ${peer.address}", style = AppTheme.type.body, color = c.ink)
-                    Text("Read from your notifications", style = AppTheme.type.caption, color = c.ink3)
+                    val connector = peer.channel == app.atall.api.ChannelType.CONNECTOR
+                    Text(when {
+                        peer.channel == app.atall.api.ChannelType.RCS -> "Texts from ${peer.address}"
+                        connector -> "Over the Atall connector"
+                        else -> "${Copy.channelLabel(peer.channel)} · ${peer.address}"
+                    }, style = AppTheme.type.body, color = c.ink)
+                    Text(if (connector) "Signed tasks, verified answers" else "Read from your notifications", style = AppTheme.type.caption, color = c.ink3)
                 }
                 HorizontalDivider(color = c.hairline)
                 Row(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {

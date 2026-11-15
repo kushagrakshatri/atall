@@ -72,8 +72,8 @@ interface Peer {
 }
 
 sealed interface PeerSend {
-  /** Handed to the transport. Not proof of delivery. */
-  data class Sent(val at: Long) : PeerSend
+  /** Handed to the transport. Not proof of delivery. [via]: which transport took it (the Atall connector or a text). */
+  data class Sent(val at: Long, val via: Via = Via.TEXT) : PeerSend
 
   /** Messages was opened with the text typed in; nothing goes until the user taps Send there. */
   data class Drafted(val at: Long) : PeerSend
@@ -88,6 +88,29 @@ sealed interface PeerSend {
 
   data class Failed(val reason: String) : PeerSend
 }
+
+/**
+ * How an ask went out and how a reply came back. [CONNECTOR]: a signed task card on the Atall relay, the answer an
+ * event countersigned by the relay for that agent's own connection. [TEXT]: a text through Google Messages.
+ */
+@Serializable
+enum class Via { CONNECTOR, TEXT }
+
+/** One source an agent cited for a claim (protocol.md §5.3). */
+@Serializable
+data class ClaimSource(val url: String, val title: String? = null)
+
+/**
+ * One claim from an agent's structured result over the connector: the text, its confidence (0..1) and sources. Kept on
+ * the reply (the run's event log) so the merge and the Agreement Map work from them, not only from prose.
+ */
+@Serializable
+data class SourcedClaim(
+  val text: String,
+  val confidence: Double? = null,
+  val kind: String? = null,
+  val sources: List<ClaimSource> = emptyList(),
+)
 
 /** How sure the transport is that a reply belongs to an ask (text-agents' Confidence). */
 @Serializable
@@ -122,6 +145,17 @@ sealed interface PeerSignal {
      * counts as a reply, so the ask keeps waiting until its soft timeout. Null for an ordinary message.
      */
     val status: String? = null,
+    /** Which transport brought it. */
+    val via: Via = Via.TEXT,
+    /** CONNECTOR only: the relay's countersignature over this event checked out with the paired relay key. */
+    val verified: Boolean = false,
+    /**
+     * The whole answer in one message (a connector result): the ask is answered at once, with no quiet window for more
+     * fragments. Texts are never final; their parts are joined until the quiet window passes.
+     */
+    val final: Boolean = false,
+    /** CONNECTOR results: the agent's claims with confidence and sources. */
+    val claims: List<SourcedClaim> = emptyList(),
   ) : PeerSignal
 
   /** The transport closed a request. */

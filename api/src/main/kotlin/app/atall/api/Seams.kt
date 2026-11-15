@@ -19,6 +19,11 @@ enum class ChannelType(
     WHATSAPP(false),
     /** An agent app's own notifications (it posts, we reply through its action). */
     APP_NOTIFICATIONS(false),
+    /**
+     * Only over the Atall connector (an AI app that connected Atall as a custom connector, e.g. Grok or Claude Duet).
+     * Added by the app when the relay lists the agent; not offered in the add-agent form.
+     */
+    CONNECTOR(true),
 }
 
 /** A registered peer agent, as other modules see it. Never the main agent. */

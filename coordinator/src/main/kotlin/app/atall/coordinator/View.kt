@@ -107,6 +107,10 @@ data class StripLine(
   /** The transport wasn't sure the reply belongs to this ask (user typed in that chat). */
   val uncertain: Boolean,
   val late: Boolean,
+  /** Provenance of the reply: a verified connector answer or a text; null with no reply yet. */
+  val via: Via? = null,
+  /** Structured claims that came with it (connector). */
+  val claims: Int = 0,
 )
 
 /** design-system.md §7.3. */
@@ -268,7 +272,8 @@ object Views {
     }
     val lines = asks.map { a ->
       StripLine(a.id, a.agentId, roster.nameOf(a.agentId), a.text, a.replyText.takeIf { it.isNotBlank() }?.let(::preview),
-        duration(a, now), statusOf(a, runDone), a.uncertain, a.late)
+        duration(a, now), statusOf(a, runDone), a.uncertain, a.late,
+        via = if (a.replies.isEmpty()) null else if (a.verified) Via.CONNECTOR else Via.TEXT, claims = a.claims.size)
     }
     val live = !runDone && agents.any { it.status in setOf(AgentStatus.ASKING, AgentStatus.NEEDS_TAP, AgentStatus.NEEDS_APPROVAL) }
     val replied = agents.filter { it.status == AgentStatus.REPLIED }

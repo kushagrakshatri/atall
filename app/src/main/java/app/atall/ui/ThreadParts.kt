@@ -54,6 +54,16 @@ fun attributionLabel(peer: PeerUi?, m: ThreadMessage): String? {
     }
 }
 
+/**
+ * The provenance badge on an agent's answer (C2): "Verified" when it came over the Atall connector with a relay
+ * countersignature that checked out for that agent's connection, "Via text" when it came as a text. Nothing elsewhere.
+ */
+fun provenanceLabel(m: ThreadMessage): String? = when (m.via) {
+    app.atall.coordinator.Via.CONNECTOR -> "Verified"
+    app.atall.coordinator.Via.TEXT -> "Via text"
+    null -> null
+}
+
 /** Juno's and agents' text with its Markdown rendered: bold, italics, inline code, bullet and numbered lists. */
 internal fun markdownText(text: String, codeBackground: Color): AnnotatedString = buildAnnotatedString {
     Markdown.parse(text).forEachIndexed { i, line ->
