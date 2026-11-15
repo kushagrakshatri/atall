@@ -2,6 +2,7 @@ package app.atall.core
 
 import app.atall.agents.text.AgentMessage
 import app.atall.agents.text.Confidence
+import app.atall.agents.text.NonAnswers
 import app.atall.agents.text.Reaction
 import app.atall.agents.text.Reactions
 import app.atall.agents.text.RequestClosed
@@ -345,6 +346,9 @@ class JunoBridge(
         juno.ingest(PeerSignal.Message(
             agentId = peerId, messageId = m.id, text = m.text, at = m.sentAt, correlationId = ask.id, certainty = certainty,
             part = m.correlation?.part ?: 0, late = m.correlation?.late == true, userInterjected = m.correlation?.userInterjected == true,
+            // The agent's own status text ("signal dropped", "let me check") is never its answer (also for lines
+            // replayed from the log, which carry no flag: classified again from the text).
+            status = (m.nonAnswer ?: NonAnswers.classify(m.text))?.name?.lowercase(),
         ))
         project(PeerLines.runIdOf(ask.id))
         return true
@@ -468,6 +472,12 @@ class JunoBridge(
                 peerId = a.agentId, askId = a.id, correlationId = a.id, reactions = chips,
                 detail = statusWord(a.copy(replies = replies), st, chips)))
             projectNeeds(a, ::put, ::at)
+            // The agent's status texts: one small muted line each, under its sub-task, never a reply.
+            for (p in a.statusNotes) {
+                val id = "status:${p.messageId}"
+                put(ThreadMessage(id, thread.get(id)?.at ?: at(p.at), Main.AUTHOR, PeerLines.statusLine(roster().nameOf(a.agentId), p.text),
+                    kind = MessageKind.NOTICE, peerId = a.agentId, askId = a.id, sourceId = p.messageId))
+            }
             for (p in replies) {
                 val id = "in:${p.messageId}"
                 put(ThreadMessage(id, thread.get(id)?.at ?: at(p.at), a.agentId, p.text, attribution = Attribution.JUNO,

@@ -90,6 +90,11 @@ data class AskState(
   val softDeadline: Long? = null,
   val hardDeadline: Long? = null,
   val replies: List<ReplyPart> = emptyList(),
+  /**
+   * The agent's own status texts about this ask ("Looks like your signal dropped", "Let me check"): shown as a muted
+   * line, never an answer. They don't change [status]; the ask keeps waiting until its soft timeout.
+   */
+  val statusNotes: List<ReplyPart> = emptyList(),
   val lastReplyAt: Long = 0,
   val settledAt: Long? = null,
   val gateReason: String? = null,

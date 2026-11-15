@@ -66,7 +66,8 @@ class JunoTest {
 
   /** Soft timeout: Juno answers with what it has; Nova's late reply becomes a follow-up. Hard timeout -> didn't answer. */
   @Test fun timeoutsPartialMergeAndLateFollowUp() = runTest {
-    val h = Harness(this)
+    // m05: a wait never ends before a pending agent's soft timeout, so this story's 60 s soft timeout is set explicitly.
+    val h = Harness(this, config = JunoConfig(textSoftTimeoutMs = 60_000))
     h.scout.behavior = { Behavior.Reply(listOf(Part(5_000, "Sunday looks dry."))) }
     h.nova.behavior = { Behavior.Silent }
     var waitOut: String? = null

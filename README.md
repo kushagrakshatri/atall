@@ -8,6 +8,16 @@ phone, and has no server.
 > their answers; `@all` asks everyone the same question and shows where they agree; and now your agents can
 > **talk it over**.
 
+## M0.5 fixes (branch m05)
+
+- **An agent's status text is never its answer.** "Looks like your signal dropped…", "Let me check", "One sec", typing
+  placeholders and "message not delivered" are recognised (`NonAnswers` in text-agents). They don't close the agent's
+  slot: the agent keeps waiting until its soft timeout and the thread shows the text as a small muted line under its
+  sub-task (or under your @mention).
+- **A cleared notification doesn't drop an agent.** When Messages cancels an agent's notification itself (you opened or
+  read the chat), the agent's request stays open for its whole reply window and its saved Reply button stays usable.
+  Juno's wait no longer ends before a pending agent's soft timeout, even if the model asked for a shorter wait.
+
 ## New in M0.4 (v0.1.4-m04): fixes from the first device test
 
 - **`@all` always finishes.** Every model call now has a 90-second limit; a merge step that stalls or fails falls back

@@ -11,6 +11,7 @@ import app.atall.coordinator.PeerSignal
 import app.atall.agents.text.Agent
 import app.atall.agents.text.AgentMessage
 import app.atall.agents.text.Confidence
+import app.atall.agents.text.NonAnswers
 import app.atall.agents.text.Reactions
 import app.atall.agents.text.HubEvent
 import app.atall.agents.text.RequestClosed
@@ -83,5 +84,6 @@ object TextAgentPump {
     part = m.correlation?.part ?: 0,
     late = m.correlation?.late == true,
     userInterjected = m.correlation?.userInterjected == true,
+    status = (m.nonAnswer ?: NonAnswers.classify(m.text))?.name?.lowercase(),
   )
 }

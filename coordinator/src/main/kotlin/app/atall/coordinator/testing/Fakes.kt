@@ -67,6 +67,8 @@ data class Part(
   val userInterjected: Boolean = false,
   /** False: the transport couldn't attribute it (arrives uncorrelated). */
   val correlated: Boolean = true,
+  /** The agent's own status text (not an answer), as the transport would classify it ("connection", "holding"). */
+  val status: String? = null,
 )
 
 sealed interface Behavior {
@@ -140,7 +142,7 @@ class FakePeer(
     scope.launch {
       parts.forEachIndexed { i, p ->
         delay(p.afterMs)
-        sink(PeerSignal.Message(id, "$id-m${seq++}", p.text, clock(), if (p.correlated) cid else null, p.certainty, i, p.late, p.userInterjected))
+        sink(PeerSignal.Message(id, "$id-m${seq++}", p.text, clock(), if (p.correlated) cid else null, p.certainty, i, p.late, p.userInterjected, p.status))
       }
     }
   }

@@ -277,7 +277,16 @@ class Juno(
             updates += RunUpdate.Unsolicited(signal.agentId, signal.text, signal.at)
             return@withLock
           }
-          if (ask.replies.any { it.messageId == signal.messageId }) return@withLock
+          if (ask.replies.any { it.messageId == signal.messageId } || ask.statusNotes.any { it.messageId == signal.messageId }) return@withLock
+          if (signal.status != null) {
+            // m05: an agent's status text (Hark's "Looks like your signal dropped…" on the 2026-11-14 run was merged as
+            // its answer) is a note on the ask, never a reply: the slot stays open until the soft timeout.
+            trace.event(s.runId, "reply.status", "${ask.id} ${roster.nameOf(ask.agentId)} ${signal.status} (not an answer; ask stays ${ask.status})", signal.text)
+            val note = ReplyPart(signal.messageId, signal.text, signal.at, signal.certainty, signal.late || ask.status.settled, signal.userInterjected)
+            putL(s.replaceAsk(ask.copy(statusNotes = ask.statusNotes + note, sentAt = ask.sentAt ?: now)))
+            updates += RunUpdate.Changed(s.runId)
+            return@withLock
+          }
           val late = signal.late || ask.status.settled
           val part = ReplyPart(signal.messageId, signal.text, signal.at, signal.certainty, late, signal.userInterjected)
           if (ask.replies.isEmpty()) events += ScoreEvent.FirstReply(ask.agentId, now, ask.id, now - (ask.sentAt ?: ask.createdAt), signal.certainty, late)
@@ -688,6 +697,7 @@ class Juno(
             if (a.late) add("Arrived late.")
             if (a.status == AskStatus.REPLYING) add("May still be sending more.")
             if (a.status == AskStatus.LIKELY_MISSED) add("The reply was probably shown inside Messages where Atall can't read it.")
+            a.statusNotes.lastOrNull()?.let { add("Only sent a status text so far, not an answer: \"${it.text.take(160)}\".") }
           }
           if (notes.isNotEmpty()) put("note", notes.joinToString(" "))
         })
@@ -784,7 +794,10 @@ class Juno(
       else if (p.output != null || (p.kind != PendingKind.WAIT && p.kind != PendingKind.CHALLENGE_WAIT)) p
       else {
         val all = p.askIds.mapNotNull { s.ask(it) }
-        val done = all.all { it.status.settled } || (p.until != null && now >= p.until) || (s.mode == RunMode.COORDINATE && s.interjections.isNotEmpty())
+        // m05: a wait's own time (the model's max_seconds) never ends it while an agent it waits on is still within
+        // its soft timeout with nothing in yet: on 2026-11-14 a 120 s wait dropped kDot 60 s early.
+        val timeUp = p.until != null && now >= p.until && (p.kind != PendingKind.WAIT || all.none { holdsSlot(it, now) })
+        val done = all.all { it.status.settled } || timeUp || (s.mode == RunMode.COORDINATE && s.interjections.isNotEmpty())
         if (done) p.copy(output = if (s.mode == RunMode.COORDINATE) waitOutput(s, p.askIds, now, p.startedAt) else "done") else p
       }
     }
@@ -824,10 +837,22 @@ class Juno(
   private fun resolvePending(s: RunState, askId: String, output: String): RunState =
     recompute(s.copy(pending = s.pending.map { if (it.kind == PendingKind.APPROVAL && askId in it.askIds && it.output == null) it.copy(output = output) else it }))
 
+  /**
+   * An ask that keeps its agent's slot open past a wait's own deadline: sent, nothing but status texts in, and still
+   * within its soft timeout; or mid-answer (its quiet window settles it). A notification event (APP_CANCEL) or a
+   * status text never shortens this.
+   */
+  private fun holdsSlot(a: AskState, now: Long): Boolean =
+    a.status == AskStatus.REPLYING ||
+      ((a.status == AskStatus.PENDING || a.status == AskStatus.DRAFTED) && a.replies.isEmpty() && a.softDeadline != null && now < a.softDeadline)
+
   private fun nextWake(s: RunState): Long {
     val now = clock()
     val times = buildList {
-      s.pending.filter { it.output == null }.mapNotNull { it.until }.forEach { add(it) }
+      // A WAIT whose own time passed but is held open by a slow agent wakes at that agent's soft timeout instead.
+      s.pending.filter { it.output == null }.filter { it.kind != PendingKind.WAIT || (it.until ?: 0) > now }.mapNotNull { it.until }.forEach { add(it) }
+      s.pending.filter { it.output == null && it.kind == PendingKind.WAIT }.flatMap { it.askIds }.mapNotNull { s.ask(it) }
+        .filter { holdsSlot(it, now) }.forEach { add(it.softDeadline!!) }
       s.room?.takeIf { it.stage == RoomStage.ROUND_OPEN }?.let { add(it.startedAt + config.talk.maxMs) }
       s.asks.forEach { a ->
         if (a.status == AskStatus.REPLYING) add(a.lastReplyAt + config.quietWindowMs)

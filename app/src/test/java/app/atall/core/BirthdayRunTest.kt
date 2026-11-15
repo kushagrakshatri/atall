@@ -49,6 +49,8 @@ class BirthdayRunTest {
 
     companion object {
         const val QUESTION = "@all what should I get Mugdha for her birthday"
+        /** Hark's text from Sentry run r6cca6eef (2026-11-14 15:59 PST), word for word. */
+        const val SIGNAL_DROPPED = "Looks like your signal dropped. Feel free to keep texting, and I'll pick everything up once you're back online."
         const val JUNO_BLIND = "Get Mugdha a small gift tied to something she loves, a handwritten birthday note, and a plan to spend time together.\n\n" +
             "If she’s mentioned something she wants, choose that over a surprise.\nIf you don’t know her wishlist, pick a book, treat, or hobby item you’ve seen her enjoy.\n" +
             "In the note, include one specific memory and something you appreciate about her.\nFor the outing, choose something that fits your relationship: coffee, dinner, a workshop, or a show.\n" +
@@ -261,5 +263,66 @@ class BirthdayRunTest {
         assertTrue(r.log.entries().any { it.event == "reply" && it.text?.contains("WHOOP") == true })
         assertTrue(r.telemetry.crumbs.size >= r.log.entries().size)
         assertTrue(r.telemetry.events.any { it.first == "Run DONE" && it.third == runId })
+    }
+
+    /**
+     * m05 bug 1 (Sentry run r6cca6eef, same pattern on the @all birthday test): Hark's "signal dropped" text is an
+     * agent status, not an answer. It shows as a small muted line under Hark's sub-task, Hark keeps its slot, and the
+     * merge uses Hark's real answer when it lands.
+     */
+    @Test fun harksSignalDroppedTextIsAStatusLineNotItsAnswer() = runTest {
+        val r = Rig(this)
+        var mergeInput = ""
+        r.llm.on("blind") { _, _ -> FakeLlm.text(JUNO_BLIND) }
+        r.llm.on("claims") { req, _ -> FakeLlm.text(realisticClaims(req)) }
+        r.llm.on("verdict") { _, _ -> FakeLlm.text("Split.") }
+        r.llm.on("merge") { req, _ -> mergeInput = FakeLlm.userTexts(req).single(); FakeLlm.text("Upgrade her WHOOP.\n\nWhat's your budget?") }
+        r.llm.on("room") { _, _ -> FakeLlm.text("") }
+        r.router.send(QUESTION)
+        advanceTimeBy(6_000); runCurrent()
+        r.agents.getValue(r.hark.id).push(SIGNAL_DROPPED, r.corr(r.hark))
+        advanceTimeBy(4_000); runCurrent()
+        r.agents.getValue(r.kdot.id).push(KDOT, r.corr(r.kdot))
+        // Long past the 20 s quiet window that used to settle Hark's "answer": the run is still waiting on Hark.
+        advanceTimeBy(60_000); runCurrent()
+        val runId = r.lines().first().runId!!
+        val st = r.bridge.juno.state(runId)!!
+        assertEquals(Phase.WAITING, st.phase)
+        val harkAsk = st.asks.single { it.agentId == r.hark.id }
+        assertEquals(app.atall.coordinator.AskStatus.PENDING, harkAsk.status)
+        assertTrue(harkAsk.replies.isEmpty())
+        // The thread: a muted status line, never an agent reply.
+        val status = r.lines().single { it.kind == MessageKind.NOTICE && it.peerId == r.hark.id && !it.hidden }
+        assertTrue(status.text, status.text.startsWith("Hark: Looks like your signal dropped"))
+        assertFalse(r.lines().any { it.author == r.hark.id && it.text.contains("signal dropped") })
+        assertTrue(r.log.entries().any { it.event == "reply.status" })
+        // Hark's real answer, 90 s in, is the one merged.
+        r.agents.getValue(r.hark.id).push(HARK, r.corr(r.hark))
+        advanceTimeBy(60_000); runCurrent()
+        assertTrue(mergeInput, mergeInput.contains("WHOOP"))
+        assertFalse(mergeInput, mergeInput.contains("signal dropped"))
+        assertTrue(r.lines().any { it.id.startsWith("answer:") && it.text.contains("WHOOP") })
+    }
+
+    /** Hark never answers after its status text: the @all merges at the soft timeout without it, and nothing quotes it. */
+    @Test fun statusTextAloneNeverReachesTheMerge() = runTest {
+        val r = Rig(this)
+        var mergeInput = ""
+        r.llm.on("blind") { _, _ -> FakeLlm.text(JUNO_BLIND) }
+        r.llm.on("claims") { req, _ -> FakeLlm.text(realisticClaims(req)) }
+        r.llm.on("verdict") { _, _ -> FakeLlm.text("Only kDot answered.") }
+        r.llm.on("merge") { req, _ -> mergeInput = FakeLlm.userTexts(req).single(); FakeLlm.text("Plan an experience together.") }
+        r.llm.on("room") { _, _ -> FakeLlm.text("") }
+        r.router.send(QUESTION)
+        advanceTimeBy(6_000); runCurrent()
+        r.agents.getValue(r.hark.id).push(SIGNAL_DROPPED, r.corr(r.hark))
+        advanceTimeBy(4_000); runCurrent()
+        r.agents.getValue(r.kdot.id).push(KDOT, r.corr(r.kdot))
+        advanceTimeBy(150_000); runCurrent()
+        assertEquals("", mergeInput) // still collecting before the 180 s soft timeout
+        advanceTimeBy(60_000); runCurrent()
+        assertTrue(mergeInput.isNotEmpty())
+        assertFalse(mergeInput, mergeInput.contains("signal dropped"))
+        assertFalse(r.lines().any { !it.hidden && it.author == r.hark.id })
     }
 }

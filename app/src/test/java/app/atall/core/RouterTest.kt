@@ -87,6 +87,27 @@ class RouterTest {
         assertEquals(1, thread.all().count { it.text == "pong" })
     }
 
+    /** m05: an agent's status text on a direct @mention is a muted line, never its answer; the answer still lands as one. */
+    @Test fun directStatusTextIsAMutedLineNotAnAnswer() = runTest {
+        val r = router()
+        val hark = registry.add("Hark", ChannelType.RCS, "+14085550103")
+        val fake = FakeAgent(AgentId(hark.id), "Hark") { emptyList() }
+        agents[hark.id] = fake
+        r.send("@Hark resolve the costs")
+        val cid = fake.sent.single().first
+        val corr = app.atall.agents.text.Correlation(cid, app.atall.agents.text.Confidence.HIGH, app.atall.agents.text.CorrelationReason.ONLY_OPEN_REQUEST, 0)
+        r.onPeerMessage(hark.id, AgentMessage("s1", AgentId(hark.id), "Looks like your signal dropped. Feel free to keep texting, and I'll pick everything up once you're back online.",
+            System.currentTimeMillis(), System.currentTimeMillis(), corr))
+        val status = thread.all().last()
+        assertEquals(MessageKind.NOTICE, status.kind)
+        assertTrue(status.text, status.text.startsWith("Hark: Looks like your signal dropped"))
+        assertTrue(thread.all().none { it.author == hark.id })
+        r.onPeerMessage(hark.id, AgentMessage("a1", AgentId(hark.id), "Van is $812 with fees.", System.currentTimeMillis(), System.currentTimeMillis(), corr))
+        val answer = thread.all().single { it.sourceId == "a1" }
+        assertEquals(hark.id, answer.author)
+        assertEquals(Attribution.DIRECT, answer.attribution)
+    }
+
     @Test fun noLiveActionBecomesTapToSend() = runTest {
         val r = router()
         val p = registry.add("Scout", ChannelType.RCS, "+14085550102")
