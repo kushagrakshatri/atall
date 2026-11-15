@@ -55,6 +55,9 @@ class Graph(private val context: Context) {
     val debugLog = app.atall.core.DebugLog(File(dataDir, "debug-log.jsonl"))
     val telemetry = SentryTelemetry(context) { prefs.sendMessageText }
 
+    /** The Atall relay (C1): pairing, connected agents, the debug test task. Not wired into Juno yet (C2). */
+    val relay = Relay(context, scope, debugLog)
+
     val rcs = RcsChannel(context)
     val adapters: Map<ChannelType, ChannelAdapter> = mapOf(ChannelType.RCS to rcs)
 

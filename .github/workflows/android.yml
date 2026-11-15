@@ -25,8 +25,8 @@ jobs:
         with:
           packages: "platforms;android-37.0 platforms;android-36 build-tools;36.0.0 platform-tools"
       - uses: gradle/actions/setup-gradle@v4
-      - name: Unit tests (app, text-agents, chatgpt-auth, coordinator, inbox)
-        run: ./gradlew --console=plain -Porg.gradle.jvmargs="-Xmx3g -XX:MaxMetaspaceSize=1g" :app:testDebugUnitTest :text-agents:core:test :chatgpt-auth:test :coordinator:test :inbox:test
+      - name: Unit tests (app, text-agents, chatgpt-auth, coordinator, inbox, relay-client)
+        run: ./gradlew --console=plain -Porg.gradle.jvmargs="-Xmx3g -XX:MaxMetaspaceSize=1g" :app:testDebugUnitTest :text-agents:core:test :chatgpt-auth:test :coordinator:test :inbox:test :relay-client:test
       - name: Debug + release APKs (release is unsigned in CI)
         env:
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
@@ -45,3 +45,4 @@ jobs:
             chatgpt-auth/build/reports/tests/
             coordinator/build/reports/tests/
             inbox/build/reports/tests/
+            relay-client/build/reports/tests/

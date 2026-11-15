@@ -88,6 +88,17 @@ phone, and has no server.
   back to an older one. A draft opens only when no live reply button exists; each fallback's reason is logged
   on the device (`adb logcat -s TextAgents:D`, no message text).
 
+## In progress: C1 (the relay, branch `c1-app`)
+
+- **Settings → Agents → Connected agents.** **Connect relay** asks once for your owner code and pairs this phone with
+  the Atall relay using a P-256 key that never leaves the Android Keystore. Then it lists the agents connected to the
+  relay (kDot, Grok, Hark, Claude Duet, Meta Muse) with when each was last seen and what it last did, and a
+  **Revoke** button (with a confirm) that cuts that agent off right away.
+- **Debugging → Send test task to all.** Posts a phone-signed test task and shows each agent's events as they arrive,
+  with a check when the relay's countersignature verifies. Not wired into Juno yet (that's C2).
+- Every phone request is signed (`METHOD\nPATH\nTS\nbase64url(sha256(body))`); every event's `relay_sig` is checked
+  against the relay key from pairing. See `new-product/c1-contract.md`.
+
 ## What it does (M0)
 
 - **One thread, saved on the phone.** Your messages, Juno's answers and agent replies, in order, kept across restarts.
@@ -127,6 +138,8 @@ Kotlin + Jetpack Compose (Material 3), no NDK, no Play Services, no Firebase.
 | `:coordinator` | Pure-Kotlin Juno: routing, the plan → ask → wait → merge tool loop, approval gate, `@all` Agreement Map, scoreboard |
 | `:coordinator:adapters` | Glue: Responses client → Juno's model, text-agents → Juno's peers, text-agents → inbox |
 | `:inbox` | Pure-Kotlin Agent Inbox (dedupe, triage, digest, code redaction); built and tested, not wired into the thread yet |
+| `:relay-client` | Pure-Kotlin client for the Atall relay (C1): pairing, request signing, canonical JSON, relay countersignature checks, events poller with cursor + ack, tasks, answers, agents, revoke |
+| `:relay-client:android` | The relay device key (P-256, non-exportable, Android Keystore) and the paired-state store |
 
 In the app, `core/JunoBridge.kt` runs Juno against the thread: it starts runs, feeds agent replies and transport
 closures in, and projects each run into thread lines (`RUN`, `SUBTASK`, replies, approvals, the answer or the
@@ -152,7 +165,7 @@ Seams for work in progress:
 ## Build
 
 ```bash
-./gradlew :app:testDebugUnitTest :text-agents:core:test :chatgpt-auth:test :coordinator:test :inbox:test assembleRelease
+./gradlew :app:testDebugUnitTest :text-agents:core:test :chatgpt-auth:test :coordinator:test :inbox:test :relay-client:test assembleRelease
 ```
 
 JDK 17, Android SDK platform 37. Release signing reads a properties file kept outside the repo

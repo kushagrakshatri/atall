@@ -52,11 +52,11 @@ fun TopBar(title: String, onBack: () -> Unit) {
 }
 
 @Composable
-private fun SectionLabel(text: String) =
+internal fun SectionLabel(text: String) =
     Text(text, Modifier.padding(start = 4.dp, top = 24.dp, bottom = 8.dp), style = AppTheme.type.label, color = AppTheme.colors.ink3)
 
 @Composable
-private fun Card(content: @Composable () -> Unit) {
+internal fun Card(content: @Composable () -> Unit) {
     Column(Modifier.fillMaxWidth().clip(AppTheme.radii.card).background(AppTheme.colors.surface).hairlineBorder(AppTheme.radii.card, strong = false)) { content() }
 }
 
@@ -80,6 +80,7 @@ fun AgentsScreen(
     /** "Your name": what agents and Juno call you. Prefilled with the ChatGPT first name until you change it. */
     userName: String = "", onUserNameChange: (String) -> Unit = {},
     debug: DebugUi = DebugUi(),
+    relay: RelayParams = RelayParams(),
 ) {
     val c = AppTheme.colors
     Column(Modifier.fillMaxSize().background(c.bg).statusBarsPadding().navigationBarsPadding().imePadding()) {
@@ -125,6 +126,7 @@ fun AgentsScreen(
                     }
                 }
             }
+            RelaySection(relay)
             SectionLabel("Your name")
             Field(
                 "Your name", userName, onUserNameChange,
@@ -172,6 +174,7 @@ fun AgentsScreen(
                         Text(debug.copiedNote ?: "The last 500 lines, ready to paste", style = AppTheme.type.caption, color = c.ink3)
                     }
                 }
+                if (relay.ui.paired) TestTaskRow(relay)
             }
             SectionLabel("About")
             var taps by remember { mutableStateOf(0) }
