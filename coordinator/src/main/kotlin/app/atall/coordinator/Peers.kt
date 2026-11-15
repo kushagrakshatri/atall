@@ -116,6 +116,12 @@ sealed interface PeerSignal {
     val part: Int = 0,
     val late: Boolean = false,
     val userInterjected: Boolean = false,
+    /**
+     * The agent's own status text, not an answer (connection/signal error, "let me check", typing, delivery failure),
+     * as classified by the transport (text-agents' NonAnswers). Recorded on the ask as a status note; it never
+     * counts as a reply, so the ask keeps waiting until its soft timeout. Null for an ordinary message.
+     */
+    val status: String? = null,
   ) : PeerSignal
 
   /** The transport closed a request. */

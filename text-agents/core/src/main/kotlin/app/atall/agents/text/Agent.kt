@@ -50,6 +50,12 @@ data class AgentMessage(
   val historical: Boolean = false,
   /** Set when the line is a tapback ("👍 to “…”"): show it as a reaction chip, not as text. Never correlated. */
   val reaction: Reaction? = null,
+  /**
+   * Set when the line is the agent's own status text, not an answer (a "signal dropped" error, "let me check", a
+   * delivery failure; see [NonAnswers]). It still carries the [correlation] of the request it is about, but the
+   * request stays unanswered: show it as a muted status line and keep waiting for the real reply.
+   */
+  val nonAnswer: NonAnswers.Kind? = null,
 )
 
 @Serializable

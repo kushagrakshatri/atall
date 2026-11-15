@@ -54,7 +54,8 @@ class TextAgentHub(
    */
   private val diagnostics: (String) -> Unit = {},
 ) {
-  private class Live(val handle: ReplyHandle, val key: String, var capturedAt: Long, val source: String?, var removedAt: Long = 0)
+  private class Live(val handle: ReplyHandle, val key: String, var capturedAt: Long, val source: String?, var removedAt: Long = 0,
+                     var removedReason: RemovalReason? = null)
   /** What the listener last saw for an agent's conversation; diagnostics only. */
   private class Seen(var at: Long = 0, var hadReply: Boolean = false, var actions: Int = 0, var source: String? = null)
   private data class Recent(val text: String, val at: Long)
@@ -153,7 +154,14 @@ class TextAgentHub(
 
   private fun diag(line: String) { runCatching { diagnostics(line) } }
 
-  private fun usable(l: Live, now: Long) = l.removedAt == 0L || now - l.removedAt <= config.actionGraceMs
+  /**
+   * Whether a held reply action may be fired. A notification Messages cancelled itself (APP_CANCEL: the chat was
+   * opened or read) does not take its reply action with it (Route C: the PendingIntent keeps working after the
+   * notification clears), so APP_CANCEL never starts the grace clock; a real failure shows up as CANCELED/ERROR from
+   * fire() and falls back to an older action or a draft. Other removals (swiped away, ...) get [TextAgentConfig.actionGraceMs].
+   */
+  private fun usable(l: Live, now: Long) =
+    l.removedAt == 0L || l.removedReason == RemovalReason.APP_CANCEL || now - l.removedAt <= config.actionGraceMs
 
   private companion object { const val MAX_HANDLES = 3 }
 
@@ -177,9 +185,11 @@ class TextAgentHub(
   fun onRemoved(key: String, reason: RemovalReason) = synchronized(lock) {
     val now = clock.now()
     var id: AgentId? = null
-    for ((agent, q) in live) for (l in q) if (l.key == key && l.removedAt == 0L) { l.removedAt = now; id = agent }
+    for ((agent, q) in live) for (l in q) if (l.key == key && l.removedAt == 0L) { l.removedAt = now; l.removedReason = reason; id = agent }
     if (id == null) return@synchronized
-    diag("removed agent=$id reason=$reason")
+    // m05: APP_CANCEL is not "agent gone". The open requests stay open until their own reply window, and the
+    // held reply action stays usable (see [usable]); the only effect is the opened-chat hint below.
+    diag("removed agent=$id reason=$reason (requests stay open, action kept)")
     val opened = reason == RemovalReason.APP_CANCEL || reason == RemovalReason.CLICK
     val ownReply = lastOwnReplyAt[id]?.let { now - it <= config.ownReplyCancelGuardMs } ?: false
     if (opened && !ownReply) {
@@ -236,20 +246,25 @@ class TextAgentHub(
     }
     var correlation: Correlation? = null
     var changed = false
+    // The agent's own status text ("Looks like your signal dropped", "Let me check"): tied to the request it is about,
+    // but not an answer, so the request stays unanswered and keeps its reply window.
+    val nonAnswer = NonAnswers.classify(line.text)
     if (!historical) {
       val candidates = requests.filter {
         it.agentId == id && (it.closedAt == 0L || now - it.closedAt <= config.lateMatchMs)
       }
       Correlator.decide(candidates, line.text, line.time, meta["user:$id"] ?: 0, config.correlation)?.let { d ->
         correlation = d.correlation.copy(late = d.request.closedAt > 0)
-        val i = requests.indexOfFirst { it.correlationId == d.request.correlationId }
-        requests[i] = Correlator.attributed(requests[i], line.time)
-        changed = true
+        if (nonAnswer == null) {
+          val i = requests.indexOfFirst { it.correlationId == d.request.correlationId }
+          requests[i] = Correlator.attributed(requests[i], line.time)
+          changed = true
+        } else diag("status agent=$id kind=$nonAnswer request stays open")
       }
     }
     store.append(LogEntry(line.id, id, Direction.IN, line.text, line.time, correlation = correlation))
     remember(recentIn, id, line.text, if (line.timeReliable) line.time else now)
-    handleFor(id).emit(AgentMessage(line.id, id, line.text, line.time, now, correlation, historical))
+    handleFor(id).emit(AgentMessage(line.id, id, line.text, line.time, now, correlation, historical, nonAnswer = nonAnswer))
     return changed
   }
 

@@ -22,6 +22,17 @@ object PeerLines {
     private val JUNO_CID = Regex("^r[^~\\s]+~a\\d+$")
 
     /**
+     * The muted one-liner for an agent's status text (not an answer): "Hark: Looks like your signal dropped. …".
+     * One line, trimmed; the agent keeps its slot and the thread keeps waiting for the real reply.
+     */
+    fun statusLine(name: String, text: String): String {
+        val one = text.replace(Regex("\\s+"), " ").trim()
+        return "$name: " + if (one.length > STATUS_MAX) one.take(STATUS_MAX - 1).trimEnd() + "…" else one
+    }
+
+    const val STATUS_MAX = 120
+
+    /**
      * Attribution of a line from [peerId] that is not one of Juno's asks.
      * - correlated to a direct send: DIRECT.
      * - not correlated, but the user's newest message to this agent was a direct @mention within [INFER_WINDOW_MS]

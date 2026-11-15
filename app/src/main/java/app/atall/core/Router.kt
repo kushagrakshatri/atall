@@ -4,6 +4,7 @@ import app.atall.agents.text.AgentMessage
 import app.atall.agents.text.Direction
 import app.atall.agents.text.FailReason
 import app.atall.agents.text.LogEntry
+import app.atall.agents.text.NonAnswers
 import app.atall.agents.text.Reaction
 import app.atall.agents.text.Reactions
 import app.atall.agents.text.RequestClosed
@@ -181,6 +182,13 @@ class Router(
         if (runCatching { juno()?.claim(p.id, m) }.getOrNull() == true) { dropStaleHints(p.id); return }
         val cid = m.correlation?.correlationId
         val attribution = PeerLines.attribution(p.id, cid, m.sentAt, thread.chronological())
+        // The agent's own status text on a direct @mention ("signal dropped", "let me check"): a muted line, not its
+        // answer. The request stays open at the transport and the "may have answered" hint stays until the answer.
+        if (attribution == Attribution.DIRECT && (m.nonAnswer ?: NonAnswers.classify(m.text)) != null) {
+            thread.upsert(ThreadMessage("status:${m.id}", maxOf(m.sentAt, now()), Main.AUTHOR, PeerLines.statusLine(p.name, m.text),
+                kind = MessageKind.NOTICE, peerId = p.id, sourceId = m.id))
+            return
+        }
         if (attribution == Attribution.UNPROMPTED) {
             if (runCatching { coordinator().onPeerMessage(p.toPeer(), m) }.getOrDefault(false)) return
             if (inbox().onUnsolicited(p.toPeer(), m) == InboxDecision.HOLD) return
