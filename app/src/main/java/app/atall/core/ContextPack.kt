@@ -90,6 +90,11 @@ object ContextPack {
          * recent-turns budget.
          */
         val tail: Boolean = false,
+        /**
+         * DELEGATED: who wrote each part of [need], when it mixes authors (a repair ask restates the user's own question
+         * next to other agents' words). Replaces the single Juno-rewrite segment for the send gate; the text is unchanged.
+         */
+        val parts: List<Segment>? = null,
     )
 
     /** Every text from Atall starts with this; a tapback quoting it reacts to one of our texts. */
@@ -143,7 +148,8 @@ object ContextPack {
             }
             val ctx = i.context?.let { prose(it) }?.ifBlank { null }
             val text = (listOf(head) + listOfNotNull(need.ifBlank { null }, ctx) + tail).joinToString("\n")
-            return Packed(text, listOf(atall(head)) + listOfNotNull(need.ifBlank { null }?.let { Segment(it, prov) }, ctx?.let(atall)) + tail.map(atall))
+            val needSegs = if (i.parts != null && !i.approved && need.isNotBlank()) i.parts else listOfNotNull(need.ifBlank { null }?.let { Segment(it, prov) })
+            return Packed(text, listOf(atall(head)) + needSegs + listOfNotNull(ctx?.let(atall)) + tail.map(atall))
         }
 
         val request = squash(stripMentions(Markdown.plain(i.request), i.recipientName, i.names.values))

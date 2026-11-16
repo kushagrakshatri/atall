@@ -25,6 +25,11 @@ data class AgentProfile(
    * In a talk, nothing it says is passed to another agent until the user taps "Share with X?".
    */
   val sensitive: Boolean = false,
+  /**
+   * Editor: how fast this agent usually answers before the score log has measured it (a prior from its channel: an agent
+   * on the connector woken by a webhook or an event is fast, a texting or scheduled one is slow). Null: no prior.
+   */
+  val expectedReplyMs: Long? = null,
 ) {
   init { require(id.isNotBlank() && name.isNotBlank()) { "agent needs an id and a name" } }
   val handles: List<String> get() = listOf(name) + aliases

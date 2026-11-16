@@ -50,6 +50,7 @@ fun attributionLabel(peer: PeerUi?, m: ThreadMessage): String? {
         Attribution.DIRECT -> "replied directly"
         Attribution.JUNO -> "answered ${Main.NAME}"
         Attribution.UNPROMPTED -> "messaged you"
+        Attribution.RELAY -> "answered ${m.relayFrom ?: "another agent"}"
         null -> null
     }
 }

@@ -13,6 +13,11 @@ enum class RunMode {
   ALL,
   /** "Talk it over": blind first answers, then up to two reveal rounds relayed by Juno, then Juno wraps up. */
   ROOM,
+  /**
+   * An agent's reply to the user's direct @mention named another agent: Juno relays the question with no tap (within the
+   * mention caps). No merge and no answer of Juno's: each relayed reply shows as that agent's own line.
+   */
+  RELAY,
 }
 
 @Serializable
@@ -145,6 +150,11 @@ data class AskState(
   val mentionDepth: Int = 0,
   /** MENTION relays: the agent whose answer @mentioned this one. */
   val mentionFrom: String? = null,
+  /**
+   * The user's own words quoted inside [text] (a repair ask restates Kush's question). The send gate reads them as his
+   * verbatim words, so a read-only check never stalls on his "book" or "buy"; everything else in the ask is still checked.
+   */
+  val userQuote: String? = null,
 ) {
   val replyText: String get() = replies.joinToString("\n") { it.text }
   /** Every structured claim the agent sent for this ask. */

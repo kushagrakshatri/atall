@@ -28,6 +28,9 @@ interface ConnectorAccess {
     /** C3.1: [p] is connected but set to Full text, so its asks go by text (never a card). */
     fun byFullText(p: AgentProfile): Boolean = false
 
+    /** How [p] is woken for a task card (webhook, event, its own schedule, …), or null when not on the connector. */
+    fun wakeKind(p: AgentProfile): WakeKind? = null
+
     companion object {
         val NONE = object : ConnectorAccess {
             override fun relayIdFor(p: AgentProfile): String? = null
@@ -49,6 +52,24 @@ class FullTextRouting(private val base: ConnectorAccess, private val config: (re
     override fun connectorOnly(runId: String): Boolean = base.connectorOnly(runId)
     override fun linkedRelayId(p: AgentProfile): String? = base.linkedRelayId(p)
     override fun byFullText(p: AgentProfile): Boolean = base.linkedRelayId(p)?.let(::fullText) == true
+    override fun wakeKind(p: AgentProfile): WakeKind? = base.linkedRelayId(p)?.let { config(it).kind }
+}
+
+/**
+ * How fast an agent usually answers, before the score log has measured it (fresh install). On the connector and woken by
+ * a webhook or an event (Grok, kDot): fast. By text (RCS, Full text), on its own schedule (Duet, Muse), or only after a
+ * tap: slow, so Juno never holds the answer for it; its answer folds in as a review. The score log replaces this as soon
+ * as the agent has answered once.
+ */
+object LatencyPriors {
+    const val FAST_MS = 60_000L
+    const val SLOW_MS = 30 * 60_000L
+
+    fun forAgent(onConnector: Boolean, wake: WakeKind?): Long = when {
+        !onConnector -> SLOW_MS
+        wake == null || wake == WakeKind.WEBHOOK || wake == WakeKind.EVENTS -> FAST_MS
+        else -> SLOW_MS
+    }
 }
 
 /** Pure rules: name matching between the user's agents and relay ids, per-agent connector timeouts. */

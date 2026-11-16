@@ -164,8 +164,16 @@ class JunoBridge(
         val relayId = connector.relayIdFor(p)
         val t = relayId?.let { ConnectorRouting.timeouts(it) }
         JunoAgent(p.id, p.name, AgentKind.TEXT, aliases = p.aliases, paused = p.paused || (!textRoute(p) && relayId == null),
-            sensitive = p.sharesPrivately, softTimeoutMs = t?.softMs, hardTimeoutMs = t?.hardMs)
+            sensitive = p.sharesPrivately, softTimeoutMs = t?.softMs, hardTimeoutMs = t?.hardMs,
+            // Editor: fast or slow by channel until the score log has measured the agent (fresh install).
+            expectedReplyMs = if (editorFlow) LatencyPriors.forAgent(relayId != null, connector.wakeKind(p)) else null)
     })
+
+    /**
+     * The collab flow for every message: unaddressed ones get Juno's first take and only the agents worth asking, two or
+     * more @mentions ask just those, and an agent's reply to a direct @mention that names another agent is relayed.
+     */
+    val editorFlow: Boolean get() = editorUi && juno.config.editor
 
     private fun textRoute(p: AgentProfile) = p.channel.implemented && p.channel != ChannelType.CONNECTOR
 
@@ -263,6 +271,8 @@ class JunoBridge(
             recent = recent, context = follow?.context,
             names = registry.all().associate { it.id to it.name }, others = if (kind == ContextPack.Kind.ROOM) emptyList() else others,
             approved = ask?.approved == true, quoted = ask?.quoted.orEmpty(),
+            // A repair restates Kush's question: his words count as his for the send gate; the agents' words are checked.
+            parts = if (ask?.purpose == AskPurpose.REPAIR && ask.userQuote != null) app.atall.coordinator.AskSegments.of(ask) else null,
             // Every ask Juno sends ends with the self-filled tail (collab plan step 1).
             tail = editorUi && ask != null,
         ))
@@ -284,9 +294,14 @@ class JunoBridge(
         val follow = FollowUp.expand(msg.text, recent, userName(), registry.all().map { it.name })
         fun asked(text: String) = follow?.full ?: text
         val runId = when (route) {
-            is Route.All -> juno.startAll(asked(route.text), r.activePeers)
+            is Route.All -> if (route.peerIds.isEmpty()) juno.startAll(asked(route.text), r.activePeers)
+                else juno.startAll(asked(route.text), route.peerIds.mapNotNull { r.byId(it) }.filter { !it.paused }, app.atall.coordinator.EditorScope.SOME)
             is Route.Talk -> juno.startTalk(asked(route.text), route.peerIds.mapNotNull { r.byId(it) }.filter { !it.paused }.ifEmpty { r.activePeers })
-            is Route.ToMain -> juno.startCoordinated(
+            is Route.ToMain -> if (editorFlow) juno.startEditor(
+                asked(route.text),
+                mustAsk = route.mentionedPeers.mapNotNull { r.byId(it) }.filter { !it.paused },
+                context = recent.map { JunoLine(displayName(it.author), it.text) },
+            ) else juno.startCoordinated(
                 if (route.mentionedPeers.isNotEmpty()) asked(route.text) else route.text,
                 mustAsk = route.mentionedPeers.mapNotNull { r.byId(it) }.filter { !it.paused },
                 context = recent.map { JunoLine(displayName(it.author), it.text) },
@@ -518,6 +533,26 @@ class JunoBridge(
         return true
     }
 
+    /**
+     * Kush @mentioned [peerId] directly and its reply ([text]) @mentions other agents: each question goes to them with no
+     * tap, inside the mention caps (per direct message [directId]); their answers show as their own lines. Returns the
+     * agents it went to; for the rest (a cap, buy/book words, unreachable) the "Ask X about this?" chip stays.
+     */
+    suspend fun relayDirect(peerId: String, directId: String, text: String): Set<String> {
+        if (!editorFlow) return emptySet()
+        val body = app.atall.coordinator.AskTail.strip(text)
+        val out = mutableSetOf<String>()
+        for (target in PeerLines.suggestions(body, peerId, registry.all())) {
+            val name = registry.get(target)?.name ?: continue
+            val runId = safe { juno.relayFromDirect(directId, peerId, target, app.atall.coordinator.Relay.quoteFor(body, name)) } ?: continue
+            out += target
+            liveRuns += runId
+            projectSafely(runId)
+            if (autoDrive) scope.launch { drive(runId) }
+        }
+        return out
+    }
+
     /** The newest unsettled ask to [peerId] in a live run that was sent before [at]: where a stray reply belongs. */
     private suspend fun openAskFor(peerId: String, at: Long): AskState? = liveRuns.mapNotNull { safe { juno.state(it) } }
         .flatMap { s -> s.asks.filter { a ->
@@ -541,6 +576,7 @@ class JunoBridge(
         fun put(m: ThreadMessage) { thread.upsert(m.copy(runId = runId)); last = maxOf(last, m.at) }
         fun at(t: Long?) = maxOf(t ?: clock(), last + 1)
 
+        if (st.mode == RunMode.RELAY) { projectRelay(st, ::put, ::at); return@withLock }
         val presence = if (editorUi) view.presence else null
         val editor = st.editor != null
         // One avatar row instead of the strip, ask cards and waiting lines (editor and delegating runs).
@@ -664,6 +700,28 @@ class JunoBridge(
                 else -> MessageKind.NOTICE to "${Main.NAME} couldn't answer just now."
             }
             put(ThreadMessage(id, thread.get(id)?.at ?: at(null), Main.AUTHOR, text, kind = kind))
+        }
+    }
+
+    /**
+     * A relay from a direct @mention: no Juno line, no avatar row. Each relayed answer is that agent's own line
+     * ("answered Grok"), with what still needs Kush (a tap, an OK) as usual.
+     */
+    private fun projectRelay(st: RunState, put: (ThreadMessage) -> Unit, at: (Long?) -> Long) {
+        val r = roster()
+        for (a in st.asks.sortedBy { it.createdAt }) {
+            projectNeeds(a, put, at)
+            for (p in a.replies) {
+                val id = "in:${p.messageId}"
+                val parsed = app.atall.coordinator.AskTail.parse(p.text)
+                if (!parsed.hadBody) { thread.get(id)?.let { if (!it.hidden) thread.upsert(it.copy(hidden = true)) }; continue }
+                // A further @mention in this answer was relayed too (or stays a chip when a cap stopped it).
+                val relayedOn = st.asks.filter { it.mentionFrom == a.agentId && it.createdAt >= a.createdAt }.map { it.agentId }.toSet()
+                put(ThreadMessage(id, thread.get(id)?.at ?: at(p.at), a.agentId, parsed.body, attribution = Attribution.RELAY,
+                    relayFrom = a.mentionFrom?.let { r.nameOf(it) }, askId = a.id, sourceId = p.messageId,
+                    detail = replyNote(p.certainty, p.late), via = p.provenance.takeIf { it == app.atall.coordinator.Via.CONNECTOR },
+                    suggest = PeerLines.suggestions(p.text, a.agentId, registry.all()).filter { it !in relayedOn }))
+            }
         }
     }
 

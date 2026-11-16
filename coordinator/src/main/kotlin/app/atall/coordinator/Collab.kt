@@ -352,9 +352,49 @@ object Surplus {
   }
 }
 
+/** Who an editor run asks. */
+@Serializable
+enum class EditorScope {
+  /** `@all`: every active agent. */
+  ALL,
+  /** The user @mentioned two or more agents: only those. */
+  SOME,
+  /** An unaddressed message (or @Juno): Juno's first take decides who, if anyone, is worth asking. */
+  PICK,
+}
+
+/**
+ * Juno's first take on an unaddressed message, and who (if anyone) is worth asking. One model call, so the answer still
+ * shows within seconds. Zero agents is the normal case for chat and for what Juno fully knows.
+ */
+object Pick {
+  fun schema(names: List<String>): JsonObject = Schema.obj(
+    "answer" to Schema.string("Your answer now, in your voice"),
+    "ask" to Schema.array("Agents whose own accounts, memory or tools would change this answer; empty when you can answer fully",
+      if (names.isEmpty()) Schema.string("Agent name") else Schema.string("Agent name", names)),
+  )
+
+  data class Result(val answer: String, val ask: List<String>)
+
+  /** Plain text instead of JSON is the answer with nobody asked. Unknown names are dropped; at most [max]. */
+  fun parse(raw: String?, roster: Roster, max: Int): Result? {
+    val t = raw?.trim().orEmpty()
+    if (t.isEmpty()) return null
+    val o = parseJsonObject(t) ?: return if (t.startsWith("{")) null else Result(t, emptyList())
+    val answer = o.str("answer")?.trim().orEmpty()
+    val ask = o.strings("ask").mapNotNull { roster.resolve(it) }
+      .filter { it.kind != AgentKind.MAIN && !it.paused }.map { it.id }.distinct().take(max)
+    if (answer.isEmpty() && ask.isEmpty()) return null
+    return Result(answer, ask)
+  }
+}
+
 /** Per-run state of the editor (an @all run in [JunoConfig.editor] mode). */
 @Serializable
 data class EditorState(
+  val scope: EditorScope = EditorScope.ALL,
+  /** PICK: Juno's first take decided who to ask (asks are only created then). */
+  val picked: Boolean = false,
   val versions: List<AnswerVersion> = emptyList(),
   /** The one caption under the answer: "First take · others adding", "Updated · Hark knew …". */
   val caption: String? = null,
@@ -427,7 +467,7 @@ data class RunSummary(
       val peers = s.asks.filter { it.agentId != main }
       val repair = e.repairAskId?.let { s.ask(it) }
       return RunSummary(
-        runId = s.runId, mode = s.mode.name,
+        runId = s.runId, mode = if (e.scope == EditorScope.ALL) s.mode.name else e.scope.name,
         agentsAsked = peers.map { it.agentId }.distinct(),
         agentsAnswered = peers.filter { it.replies.isNotEmpty() }.map { it.agentId }.distinct(),
         lateAgents = peers.filter { it.afterMerge && it.replies.isNotEmpty() }.map { it.agentId }.distinct(),

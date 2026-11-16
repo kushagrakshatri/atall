@@ -43,6 +43,8 @@ enum class Attribution {
     JUNO,
     /** Nobody asked: "messaged you". */
     UNPROMPTED,
+    /** Another agent's answer to the user's @mention asked it something; Juno passed the question on: "answered Grok". */
+    RELAY,
 }
 
 /** A tapback an agent put on one of the user's messages ("👍" from Nova). */
@@ -104,6 +106,8 @@ data class ThreadMessage(
     val via: app.atall.coordinator.Via? = null,
     /** Juno's answer: the Your call card's text (one deciding question, or "If X: A" lines); [choices] are its taps. */
     val call: String? = null,
+    /** [Attribution.RELAY] lines: the name of the agent whose question this answers ("answered Grok"). */
+    val relayFrom: String? = null,
 ) {
     /** The attribution to render; lines from before 0.1.1 only have [direct]. */
     val shownAttribution: Attribution?

@@ -17,6 +17,7 @@ import app.atall.coordinator.LlmRequest
 import app.atall.coordinator.PresenceState
 import app.atall.coordinator.PresenceView
 import app.atall.coordinator.ScoreEvent
+import app.atall.coordinator.SendGate
 import app.atall.coordinator.testing.FakeLlm
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.TestScope
@@ -42,14 +43,15 @@ class CollabBridgeTest {
 
     private class Captured(val message: String, val runId: String?, val extras: Map<String, String>)
 
-    private inner class Rig(val scope: TestScope, respond: Map<String, (String) -> List<String>>) {
+    private inner class Rig(val scope: TestScope, respond: Map<String, (String) -> List<String>>, withMuse: Boolean = false, measured: Boolean = true) {
         val clock: () -> Long = { T0 + scope.testScheduler.currentTime }
         val thread = ThreadStore(File(tmp.root, "t-${ids++}.jsonl"))
         val registry = AgentRegistry(File(tmp.root, "a-${ids++}.json"), clock = { 0 })
         val nova = registry.add("Nova", ChannelType.RCS, "+14085550101")
         val scout = registry.add("Scout", ChannelType.RCS, "+14085550102")
         val kdot = registry.add("kDot", ChannelType.RCS, "+14085550103").let { registry.update(it.copy(paused = true)) }
-        val agents: Map<String, FakeAgent> = listOf(nova, scout, kdot).associate { p ->
+        val muse = if (withMuse) registry.add("Muse", ChannelType.RCS, "+14085550104") else null
+        val agents: Map<String, FakeAgent> = listOfNotNull(nova, scout, kdot, muse).associate { p ->
             p.id to FakeAgent(AgentId(p.id), p.name, Clock { clock() }, respond[p.name] ?: { emptyList() })
         }
         val peers = object : PeerDirectory {
@@ -57,7 +59,10 @@ class CollabBridgeTest {
             override fun agent(peerId: String): Agent? = agents[peerId]
         }
         val llm = FakeLlm()
-        val scores = InMemoryScoreLog()
+        // Texting agents are slow by prior until measured (v0.1.9); these rigs model agents already measured fast.
+        val scores = InMemoryScoreLog().also { log -> kotlinx.coroutines.runBlocking {
+            if (measured) listOf(nova, scout).forEach { log.append(ScoreEvent.FirstReply(it.id, T0, "old~a0", 20_000, app.atall.coordinator.Certainty.HIGH, false)) } }
+        }
         val captured = mutableListOf<Captured>()
         val telemetry = object : Telemetry {
             override fun capture(message: String, level: Telemetry.Level, runId: String?, extras: Map<String, String>) { captured += Captured(message, runId, extras) }
@@ -174,26 +179,123 @@ class CollabBridgeTest {
         assertTrue(r.lines().none { it.suggest.isNotEmpty() })
     }
 
-    @Test fun aDelegatingRunAlsoShowsOneAvatarRowAndNoRawTail() = runTest {
+    @Test fun anUnaddressedMessageGetsJunosFirstTakeAndOnlyTheAgentItPicked() = runTest {
         val r = Rig(this, mapOf("Nova" to { _ -> listOf("Nov 26-29 works.\nAngle: calendar\nFrom memory: Kush flies out of SJC") }))
-        r.llm.on("juno") { req, n ->
-            if (n == 0) FakeLlm.tools(FakeLlm.call("ask_agent", """{"agent":"Nova","text":"Which Thanksgiving dates are free?","why":"calendar","money_or_account":false}"""),
-                FakeLlm.call("wait", """{"ask_ids":[],"max_seconds":120}"""))
-            else {
-                val out = FakeLlm.lastToolOutput(req)!!
-                // The tail reaches Juno structured, never inside the reply.
-                assertTrue(out, out.contains("\"reply\":\"Nov 26-29 works.\"") && out.contains("\"from_memory\":[\"Kush flies out of SJC\"]"))
-                FakeLlm.tools(FakeLlm.call("reply", """{"text":"Nov 26-29, flying out of SJC."}"""))
-            }
+        r.llm.on("pick") { req, _ ->
+            assertTrue(req.instructions, req.instructions.contains("Nova") && req.instructions.contains("Scout") && !req.instructions.contains("kDot"))
+            FakeLlm.text("""{"answer":"**Thanksgiving week works.** I'd keep it to four days.","ask":["Nova"]}""")
         }
+        r.llm.on("claims") { req, _ -> FakeLlm.text(claims(req)) }
+        r.llm.on("fold") { _, _ -> FakeLlm.text("""{"kind":"add","answer":"**Nov 26-29, flying out of SJC.** Only Nova knew your airport.","caption":"Nova knew your airport"}""") }
         r.router.send("plan Thanksgiving")
+        settle(1_000)
+        val runId = r.lines().first().runId!!
+        // Seconds in: Juno's take, labelled, with one avatar: the agent it picked. Scout wasn't asked.
+        assertEquals("**Thanksgiving week works.** I'd keep it to four days.", r.lines().single { it.id == "answer:$runId" }.text)
+        assertEquals("First take · others adding", r.lines().single { it.id == "answer:$runId" }.detail)
+        assertTrue(r.sent(r.scout).isEmpty())
+        settle()
+        val l = r.lines()
+        assertTrue(l.none { it.kind == MessageKind.SUBTASK || it.kind == MessageKind.RUN || it.author == r.nova.id })
+        assertTrue(l.none { it.text.contains("Angle:") || it.text.contains("From memory") })
+        val answer = l.single { it.id == "answer:$runId" }
+        assertEquals("**Nov 26-29, flying out of SJC.** Only Nova knew your airport.", answer.text)
+        assertEquals("Updated · Nova knew your airport", answer.detail)
+        assertEquals("Nov 26-29 works.", r.presence(runId).agents.single().text)
+        // Nova got Kush's words with the tail, alone.
+        val toNova = r.sent(r.nova).single()
+        assertTrue(toNova, toNova.contains("plan Thanksgiving") && !toNova.contains("Also asking") && toNova.endsWith(app.atall.coordinator.AskTail.text("Kush")))
+    }
+
+    @Test fun chatIsJustJunosAnswerWithNoAvatarRow() = runTest {
+        val r = Rig(this, emptyMap())
+        r.llm.on("pick") { _, _ -> FakeLlm.text("""{"answer":"Anytime!","ask":[]}""") }
+        r.router.send("thanks juno")
         settle()
         val l = r.lines()
         val runId = l.first().runId!!
-        assertTrue(l.none { it.kind == MessageKind.SUBTASK || it.kind == MessageKind.RUN || it.author == r.nova.id })
-        assertEquals("Nov 26-29, flying out of SJC.", l.single { it.id == "answer:$runId" }.text)
-        assertNull(l.single { it.id == "answer:$runId" }.detail)
-        assertEquals("Nov 26-29 works.", r.presence(runId).agents.single().text)
-        assertFalse(r.sent(r.nova).single().contains("Also asking"))
+        val answer = l.single { it.id == "answer:$runId" }
+        assertEquals("Anytime!", answer.text)
+        assertNull(answer.detail)
+        assertTrue(l.none { it.kind == MessageKind.PRESENCE || it.kind == MessageKind.RUN || it.kind == MessageKind.NOTICE })
+        assertTrue(r.sent(r.nova).isEmpty() && r.sent(r.scout).isEmpty())
+        assertEquals(listOf("pick"), r.llm.requests.map { it.purpose })
+    }
+
+    @Test fun twoMentionsGetOneLivingAnswerFromJustThoseAgents() = runTest {
+        val r = Rig(this, mapOf("Nova" to { _ -> listOf("Rooh at 7.") }, "Scout" to { _ -> listOf("Sakoon at 7:30.") }, "Muse" to { _ -> listOf("Jaks.") }), withMuse = true)
+        r.script()
+        r.router.send("@Nova @Scout dinner Friday?")
+        settle()
+        val l = r.lines()
+        val runId = l.first().runId!!
+        assertEquals(listOf("Nova", "Scout"), r.presence(runId).agents.map { it.name })
+        assertTrue(r.sent(r.muse!!).isEmpty())
+        // One answer from Juno, not two separate direct replies.
+        assertNotNull(l.single { it.id == "answer:$runId" })
+        assertTrue(l.none { it.author == r.nova.id || it.author == r.scout.id })
+        assertEquals(app.atall.coordinator.EditorScope.SOME, r.bridge.juno.state(runId)!!.editor!!.scope)
+        // One agent @mentioned stays a direct message: its own answer, no Juno take.
+        r.router.send("@Nova and Saturday?")
+        settle()
+        val reply = r.lines().last { it.author == r.nova.id }
+        assertEquals("Rooh at 7.", reply.text)
+        assertEquals(Attribution.DIRECT, reply.attribution)
+    }
+
+    @Test fun aDirectReplysMentionIsRelayedAutomaticallyAndAnsweredInItsOwnLine() = runTest {
+        val r = Rig(this, mapOf(
+            "Scout" to { t -> if (t.contains("book it")) listOf("Sure. @Nova book it now.") else listOf("7 pm works. @Nova is Rooh open then?") },
+            "Nova" to { t -> if (t.contains("asked you:")) listOf("Yes, Rooh is open till 10.") else emptyList() },
+        ))
+        r.router.send("@Scout what time works Friday?")
+        settle()
+        val toNova = r.sent(r.nova)
+        assertEquals(1, toNova.size)
+        assertTrue(toNova.single(), toNova.single().contains("Scout, another of Kush's assistants, asked you: \"Nova is Rooh open then?\""))
+        val l = r.lines()
+        // No "Ask Nova about this?" chip on Scout's line; Nova's answer is its own line, "answered Scout".
+        assertTrue(l.single { it.author == r.scout.id }.suggest.isEmpty())
+        val novaLine = l.single { it.author == r.nova.id }
+        assertEquals("Yes, Rooh is open till 10.", novaLine.text)
+        assertEquals(Attribution.RELAY, novaLine.attribution)
+        assertEquals("Scout", novaLine.relayFrom)
+        assertTrue(l.none { it.kind == MessageKind.PRESENCE || it.id.startsWith("answer:") })
+        assertTrue(r.llm.requests.isEmpty())
+        // An order in the reply never relays: the chip stays for Kush.
+        r.router.send("@Scout can you book it?")
+        settle()
+        assertEquals(1, r.sent(r.nova).size)
+        assertEquals(listOf(r.nova.id), r.lines().last { it.author == r.scout.id }.suggest)
+    }
+
+    @Test fun aFreshInstallDoesNotWaitOnTextingAgents() = runTest {
+        // Nothing measured: texting agents are slow by prior, so the answer settles on Juno's take, not at 3 minutes.
+        val r = Rig(this, mapOf("Nova" to { _ -> emptyList() }, "Scout" to { _ -> emptyList() }), measured = false)
+        r.script()
+        r.router.send("@all dinner Friday?")
+        settle(10_000)
+        val runId = r.lines().first().runId!!
+        val st = r.bridge.juno.state(runId)!!
+        assertTrue(st.asks.filter { it.agentId != Main.AUTHOR }.all { it.background })
+        assertEquals(app.atall.coordinator.Phase.DONE, st.phase)
+        assertTrue(r.presence(runId).agents.all { it.state == PresenceState.LATER })
+    }
+
+    @Test fun aRepairQuotingKushsBookWordsPassesTheTransportGateButAgentsOrdersDoNot() {
+        val q = "Book a table for 4: Rooh or Sakoon?"
+        fun repair(pick: String) = app.atall.coordinator.AskState("r1~a3", "scout",
+            "Quick check on: $q\nYour answer: $pick\nSomething another of Kush's assistants knows: Kush is away Friday\nDoes that change your answer? Just answer; don't act on it.",
+            app.atall.coordinator.AskPurpose.REPAIR, status = app.atall.coordinator.AskStatus.SENDING, createdAt = 0, quoted = listOf(pick, "Kush is away Friday"), userQuote = q)
+        fun packed(a: app.atall.coordinator.AskState, parts: Boolean) = ContextPack.packed(ContextPack.Input(
+            kind = ContextPack.Kind.DELEGATED, userName = "Kush", recipientId = "scout", recipientName = "Scout", request = q, need = a.text,
+            parts = if (parts) app.atall.coordinator.AskSegments.of(a) else null, tail = true))
+        val ok = packed(repair("Sakoon on Friday."), parts = true)
+        assertFalse(SendGate.check(ok.segments, "Kush").gated)
+        assertTrue(ok.text.contains("Quick check on: Book a table for 4"))
+        // v0.1.8 checked the whole repair as relayed words, so Kush's "Book" refused it; an agent's own order still is.
+        val whole = repair("Sakoon on Friday.").text
+        assertTrue(SendGate.check(listOf(app.atall.coordinator.Segment(whole, app.atall.coordinator.Provenance.PEER_RELAY)), "Kush").gated)
+        assertTrue(SendGate.check(packed(repair("Book Sakoon now."), parts = true).segments, "Kush").gated)
     }
 }

@@ -184,8 +184,30 @@ class Juno(
     return runId
   }
 
+  /**
+   * Editor (unaddressed message or @Juno): Juno's first take shows at once and decides who, if anyone, is worth asking
+   * (zero for chat and for what Juno fully knows: then it is just the answer). [mustAsk]: agents the user named alongside
+   * Juno; exactly those are asked. Whatever comes back runs through the same living answer, cross-check, Your call and
+   * reviews as @all. Returns the run id; then [drive].
+   */
+  suspend fun startEditor(text: String, mustAsk: List<AgentProfile> = emptyList(), context: List<ThreadLine> = emptyList()): String {
+    val now = clock()
+    val runId = "r" + newId()
+    val ctx = if (context.isEmpty()) emptyList() else listOf(Items.developer(buildString {
+      append("Recent thread, oldest first:\n")
+      context.takeLast(config.maxContextLines).forEach { append(it.author).append(": ").append(it.text.take(600)).append("\n") }
+    }.trim()))
+    val main = AskState("$runId~a0", roster.main.id, text, AskPurpose.BLIND, status = AskStatus.PENDING, createdAt = now, sentAt = now)
+    val wait = PendingCall("all-wait", PendingKind.WAIT, listOf(main.id), until = now + config.allWaitMs, startedAt = now)
+    mutex.withLock {
+      putL(RunState(runId, RunMode.ALL, text, mustAsk.filter { !it.paused && it.kind != AgentKind.MAIN }.map { it.id }.distinct(), now, Phase.WAITING,
+        transcript = ctx, asks = listOf(main), pending = listOf(wait), editor = EditorState(scope = EditorScope.PICK)))
+    }
+    return runId
+  }
+
   /** `@all`: the same [question], blind, to every agent in [agents] (+ Juno itself). Returns the run id; then [drive]. */
-  suspend fun startAll(question: String, agents: List<AgentProfile> = roster.activePeers): String {
+  suspend fun startAll(question: String, agents: List<AgentProfile> = roster.activePeers, scope: EditorScope = EditorScope.ALL): String {
     val now = clock()
     val runId = "r" + newId()
     // Editor: an agent measured as slow is asked in the background (a moon on its avatar); nothing waits on it.
@@ -203,7 +225,7 @@ class Juno(
       }
       val wait = PendingCall("all-wait", PendingKind.WAIT, asks.map { it.id }, until = now + config.allWaitMs, startedAt = now)
       putL(RunState(runId, RunMode.ALL, question, emptyList(), now, Phase.WAITING, asks = asks, pending = listOf(wait),
-        editor = if (config.editor) EditorState() else null))
+        editor = if (config.editor) EditorState(scope = scope) else null))
     }
     return runId
   }
@@ -840,7 +862,8 @@ class Juno(
         // Editor: the answer is already on screen, so the run settles on the fast agents and its own time; a slow
         // (background) agent's answer folds in later as a review.
         val editorWait = s.editor != null && p.callId == "all-wait"
-        val all = if (editorWait) all0.filter { !it.background } else all0
+        // An ask held for Kush's OK never holds the answer up either: it folds in when he says yes and it lands.
+        val all = if (editorWait) all0.filter { !it.background && it.status != AskStatus.AWAITING_APPROVAL } else all0
         // m05: a wait's own time (the model's max_seconds) never ends it while an agent it waits on is still within
         // its soft timeout with nothing in yet: on 2026-11-14 a 120 s wait dropped kDot 60 s early.
         val timeUp = p.until != null && now >= p.until && (p.kind != PendingKind.WAIT || editorWait || all.none { holdsSlot(it, now) })
@@ -850,6 +873,8 @@ class Juno(
     }
     val consumed = s.mode == RunMode.COORDINATE && pend.zip(s.pending).any { (a, b) -> a.output != null && b.output == null && a.kind == PendingKind.WAIT } && s.interjections.isNotEmpty()
     s = recompute(s.copy(pending = pend, interjections = if (consumed) emptyList() else s.interjections))
+    // A relay run is done when every relayed question is answered or over.
+    if (s.mode == RunMode.RELAY && s.phase == Phase.WAITING && s.asks.isNotEmpty() && s.asks.all { it.status.settled }) s = s.copy(phase = Phase.DONE, answeredAt = s.answeredAt ?: now)
     if (s != s0) putL(s)
     events.forEach { scores.append(it) }
     return closes
@@ -862,6 +887,7 @@ class Juno(
       return when (s.mode) {
         RunMode.COORDINATE -> s.copy(transcript = s.transcript + s.pending.map { Items.functionCallOutput(it.callId, it.output!!) }, pending = emptyList(), phase = Phase.PLANNING)
         RunMode.ALL -> s.copy(pending = emptyList(), phase = Phase.MERGING)
+        RunMode.RELAY -> s.copy(pending = emptyList(), phase = Phase.DONE)
         RunMode.ROOM -> {
           // Close the round now, with why (everyone in, its deadline, the user's words, a wrap-up, the 12 minutes).
           val why = s.pending.firstOrNull { it.kind == PendingKind.ROOM_ROUND }?.output
@@ -946,7 +972,7 @@ class Juno(
   private suspend fun lateWork(s: RunState) {
     val late = s.asks.filter { it.afterMerge && it.status == AskStatus.ANSWERED && !it.followedUp && it.replies.isNotEmpty() }
     if (late.isEmpty()) return
-    if (s.mode == RunMode.ROOM) {
+    if (s.mode == RunMode.ROOM || s.mode == RunMode.RELAY) {
       // A talk is over once Juno wrapped up: a late reply stays in the talk's detail, with no new turn or notification.
       mutex.withLock { getL(s.runId)?.let { cur -> putL(cur.copy(asks = cur.asks.map { a -> if (late.any { it.id == a.id }) a.copy(followedUp = true) else a })) } }
       return
@@ -980,7 +1006,9 @@ class Juno(
 
   /** @all and challenge: Juno answers the question (or the challenge) itself, blind, with no tools. */
   private suspend fun answerAsMain(runId: String, ask: AskState) {
-    val editorFirst = ask.purpose == AskPurpose.BLIND && mutex.withLock { getL(runId)?.editor } != null
+    val e0 = mutex.withLock { getL(runId)?.editor }
+    if (ask.purpose == AskPurpose.BLIND && e0?.scope == EditorScope.PICK && !e0.picked) { pickAndAnswer(runId, ask); return }
+    val editorFirst = ask.purpose == AskPurpose.BLIND && e0 != null
     val prompt = if (editorFirst) Prompts.render("juno_first", mapOf("main" to roster.main.name, "userLine" to Prompts.userLine(userNameNow())))
       else Prompts.render("juno_blind", mapOf("main" to roster.main.name))
     val req = LlmRequest("blind", prompt, listOf(Items.user(ask.text)))
@@ -1002,6 +1030,90 @@ class Juno(
       trace.event(runId, "editor.first", if (first.answer != null && s.answer == null) "first take shown after ${(now - s.createdAt) / 1000}s" else "no first take", null)
     }
     if (editorFirst) _updates.tryEmit(RunUpdate.Changed(runId))
+  }
+
+  /**
+   * Editor, unaddressed message: one model call gives Juno's first take and who (if anyone) is worth asking. Nobody: the
+   * take is the whole answer (no caption, no avatar row). Somebody: they get Kush's message blind and the take is labelled
+   * a first take until their answers edit it. Agents Kush named are asked whatever the model says. Anything that would buy,
+   * book or pay waits for Kush's OK before it goes ("Okay to have X do this?"), as before.
+   */
+  private suspend fun pickAndAnswer(runId: String, ask: AskState) {
+    val s0 = mutex.withLock { getL(runId) } ?: return
+    val reachable = roster.activePeers.filter { peerFor(it.id) != null }
+    val named = s0.mustAsk.mapNotNull { roster.byId(it) }.filter { !it.paused && peerFor(it.id) != null }
+    val prompt = Prompts.render("juno_pick", mapOf(
+      "main" to roster.main.name, "userLine" to Prompts.userLine(userNameNow()), "maxAsks" to config.maxAsks.toString(),
+      "roster" to if (reachable.isEmpty()) "- (no other agents are available right now)" else Prompts.rosterBlock(Roster(listOf(roster.main) + reachable)),
+      "named" to if (named.isEmpty()) "" else "The user named ${Views.names(named.map { it.name })}: they will be asked anyway, so leave \"ask\" empty.",
+    ))
+    val req = LlmRequest("pick", prompt, s0.transcript + Items.user(ask.text), jsonSchema = Pick.schema(reachable.map { it.name }), schemaName = "pick")
+    var failure: Exception? = null
+    var raw: String? = null
+    for (attempt in 0..1) {
+      try { raw = model(req).text; failure = null; break } catch (e: CancellationException) { throw e } catch (e: Exception) {
+        failure = e
+        if ((e as? LlmException)?.kind != LlmException.Kind.TRANSIENT) break
+      }
+    }
+    val kind = (failure as? LlmException)?.kind
+    if (kind == LlmException.Kind.SIGN_IN || kind == LlmException.Kind.LIMIT) {
+      // No usable sign-in or out of quota: nothing else would work either ("Sign in again" / the usage line).
+      mutex.withLock { getL(runId)?.let { putL(it.copy(phase = Phase.FAILED, error = failure?.message ?: kind.name, errorKind = kind, pending = emptyList())) } }
+      _updates.tryEmit(RunUpdate.Failed(runId, kind, failure?.message ?: kind.name))
+      return
+    }
+    val pick = Pick.parse(raw, roster, config.maxAsks)
+    // The model failed outright: the real agents still answer (everyone reachable), rather than nobody.
+    val targets = when {
+      named.isNotEmpty() -> named.map { it.id }
+      pick != null -> pick.ask.filter { id -> reachable.any { it.id == id } }
+      else -> reachable.map { it.id }
+    }
+    val medians = latencyMedians(null)
+    val notes = mutableListOf<RunUpdate>()
+    val events = mutableListOf<ScoreEvent>()
+    mutex.withLock {
+      val s = getL(runId) ?: return
+      val e = s.editor ?: return
+      val a = s.ask(ask.id) ?: return
+      val now = clock()
+      val busy = busyAgentsL()
+      val gate = ApprovalGate.check(s.userText, false)
+      var n = s.asks.size
+      val asks = targets.map { id ->
+        val p = roster.byId(id)!!
+        val st = when {
+          gate.gated -> AskStatus.AWAITING_APPROVAL
+          p.kind == AgentKind.TEXT && id in busy -> AskStatus.QUEUED
+          else -> AskStatus.SENDING
+        }
+        val bg = medians[id]?.let { it > config.fastMs } == true
+        AskState("$runId~a${n++}", id, s.userText, AskPurpose.BLIND, status = st, createdAt = now, background = bg, gateReason = gate.reason)
+      }
+      asks.filter { it.status == AskStatus.AWAITING_APPROVAL }.forEach { g ->
+        events += ScoreEvent.NeededUser(g.agentId, now, g.id, "approval")
+        notes += RunUpdate.NeedsUser(runId, NeedsUserLine(NeedsUserKind.APPROVE, Views.approvalLine(g, roster::nameOf), g.agentId, g.id, null, g.text))
+      }
+      val text = pick?.answer?.trim().orEmpty()
+      val main = if (text.isEmpty()) settle(a, AskStatus.FAILED, now, events)
+        else settle(a.copy(replies = listOf(ReplyPart("main-${a.id}", text, now)), lastReplyAt = now), AskStatus.ANSWERED, now, events)
+      // Nobody asked: the answer stands on its own, with no "first take" caption.
+      val caption = if (asks.isEmpty()) null else Combine.FIRST_TAKE
+      val first = text.isNotEmpty() && s.answer == null
+      val e2 = e.copy(picked = true, calls = e.calls + 1, folded = e.folded + a.id,
+        versions = if (first) listOf(AnswerVersion(1, text, caption, now, FoldKind.FIRST)) else e.versions,
+        caption = if (first) caption else e.caption, v1At = if (first) now else e.v1At)
+      val pending = s.pending.map { if (it.callId == "all-wait" && it.output == null) it.copy(askIds = it.askIds + asks.map { x -> x.id }) else it }
+      putL(s.copy(asks = s.asks.map { if (it.id == a.id) main else it } + asks, pending = pending, editor = e2,
+        answer = if (first) text else s.answer, fallback = s.fallback || pick == null))
+      trace.event(runId, "editor.pick", "asked " + (if (asks.isEmpty()) "nobody" else asks.joinToString { roster.nameOf(it.agentId) + if (it.background) " (later)" else "" }) +
+        (if (named.isNotEmpty()) " (named)" else "") + (if (pick == null) " (model failed)" else "") + (if (gate.gated) " · needs OK: ${gate.reason}" else "") +
+        " · first take after ${(now - s.createdAt) / 1000}s", null)
+    }
+    events.forEach { scores.append(it) }
+    notes.forEach { _updates.tryEmit(it) }
+    _updates.tryEmit(RunUpdate.Changed(runId))
   }
 
   private suspend fun merge(runId: String) {
@@ -1208,42 +1320,76 @@ class Juno(
     val made = mutex.withLock {
       val s = getL(runId) ?: return@withLock false
       val from = s.ask(fromAskId) ?: return@withLock false
-      val to = roster.byId(toAgentId) ?: return@withLock false
-      val relays = s.asks.filter { it.purpose == AskPurpose.MENTION }
-      val q = question.trim()
-      val why = when {
-        to.kind == AgentKind.MAIN || to.paused || peerFor(to.id) == null -> "unreachable"
-        to.id == from.agentId -> "self"
-        q.isEmpty() -> "empty"
-        SendGate.relayHit(q, userNameNow()) != null -> "action_words"
-        relays.size >= config.mentionRelaysPerRun -> "run_cap"
-        relays.count { it.agentId == to.id } >= config.mentionRelaysPerAgent -> "agent_cap"
-        from.mentionDepth >= config.mentionMaxDepth -> "depth_cap"
-        relays.any { it.mentionFrom == from.agentId && it.agentId == to.id } -> "duplicate"
-        else -> null
-      }
-      if (why != null) { trace.event(runId, "mention.skip", "${roster.nameOf(from.agentId)} -> ${to.name}: $why", null); return@withLock false }
-      val text = Prompts.render("mention_ask", mapOf("from" to roster.nameOf(from.agentId), "question" to q, "user" to userNameNow().ifBlank { "the user" }))
-      val busy = busyAgentsL()
-      val st = if (to.kind == AgentKind.TEXT && to.id in busy) AskStatus.QUEUED else AskStatus.SENDING
-      val a = AskState("$runId~a${s.asks.size}", to.id, text, AskPurpose.MENTION, status = st, createdAt = clock(),
-        mentionDepth = from.mentionDepth + 1, mentionFrom = from.agentId)
-      putL(s.copy(asks = s.asks + a))
-      trace.event(runId, "mention.relay", "${roster.nameOf(from.agentId)} -> ${to.name} (hop ${a.mentionDepth})", q)
+      val a = mentionAskL(s, from.agentId, from.mentionDepth, toAgentId, question) ?: return@withLock false
+      putL(s.copy(asks = s.asks + a, phase = if (s.mode == RunMode.RELAY) Phase.WAITING else s.phase))
       true
     }
     if (made) { flushSends(runId); _updates.tryEmit(RunUpdate.Changed(runId)) }
     return made
   }
 
-  /** Measured median reply time per agent: the score log (4 weeks), else this run's own first reply. */
+  /**
+   * Kush @mentioned [fromAgentId] directly and its reply @mentions [toAgentId]: relay [question] with no tap ("everything
+   * can be done automatically", Kush 2026-11-16), inside the same caps as a Juno run's mentions, counted per direct
+   * message ([directId], its correlation id). No Juno take and no merge: the answer shows as that agent's own line.
+   * Returns the relay run's id when the question went out (or was queued), null when a cap, the send gate or reach
+   * stopped it (the "Ask X about this?" chip stays then).
+   */
+  suspend fun relayFromDirect(directId: String, fromAgentId: String, toAgentId: String, question: String): String? {
+    val runId = "rd" + UUID.nameUUIDFromBytes(directId.toByteArray()).toString().replace("-", "").take(10)
+    val made = mutex.withLock {
+      val s = getL(runId) ?: RunState(runId, RunMode.RELAY, question.trim(), createdAt = clock(), phase = Phase.WAITING)
+      val a = mentionAskL(s, fromAgentId, 0, toAgentId, question) ?: return@withLock false
+      putL(s.copy(asks = s.asks + a, phase = Phase.WAITING))
+      true
+    }
+    if (!made) return null
+    flushSends(runId)
+    _updates.tryEmit(RunUpdate.Changed(runId))
+    return runId
+  }
+
+  /** [q] without a leading "Nova," aimed at [to]: "Nova book it now" is an order to Nova, checked as one. */
+  private fun addressedTo(q: String, to: AgentProfile): String =
+    to.handles.fold(q) { acc, h -> acc.replace(Regex("^\\s*@?" + Regex.escape(h) + "\\b[\\s,:;-]*", RegexOption.IGNORE_CASE), "") }
+
+  /** One mention relay in run [s], or null (with the reason traced) when a cap, the send gate or reach stops it. */
+  private fun mentionAskL(s: RunState, fromAgentId: String, fromDepth: Int, toAgentId: String, question: String): AskState? {
+    val to = roster.byId(toAgentId) ?: return null
+    val relays = s.asks.filter { it.purpose == AskPurpose.MENTION }
+    val q = question.trim()
+    val why = when {
+      to.kind == AgentKind.MAIN || to.paused || peerFor(to.id) == null -> "unreachable"
+      to.id == fromAgentId -> "self"
+      q.isEmpty() -> "empty"
+      SendGate.relayHit(q, userNameNow()) != null || ApprovalGate.check(addressedTo(q, to), false).gated -> "action_words"
+      relays.size >= config.mentionRelaysPerRun -> "run_cap"
+      relays.count { it.agentId == to.id } >= config.mentionRelaysPerAgent -> "agent_cap"
+      fromDepth >= config.mentionMaxDepth -> "depth_cap"
+      relays.any { it.mentionFrom == fromAgentId && it.agentId == to.id } -> "duplicate"
+      else -> null
+    }
+    if (why != null) { trace.event(s.runId, "mention.skip", "${roster.nameOf(fromAgentId)} -> ${to.name}: $why", null); return null }
+    val text = Prompts.render("mention_ask", mapOf("from" to roster.nameOf(fromAgentId), "question" to q, "user" to userNameNow().ifBlank { "the user" }))
+    val busy = busyAgentsL()
+    val st = if (to.kind == AgentKind.TEXT && to.id in busy) AskStatus.QUEUED else AskStatus.SENDING
+    val a = AskState("${s.runId}~a${s.asks.size}", to.id, text, AskPurpose.MENTION, status = st, createdAt = clock(),
+      mentionDepth = fromDepth + 1, mentionFrom = fromAgentId)
+    trace.event(s.runId, "mention.relay", "${roster.nameOf(fromAgentId)} -> ${to.name} (hop ${a.mentionDepth})", q)
+    return a
+  }
+
+  /** Median reply time per agent: the score log (4 weeks), else this run's own first reply, else the agent's channel prior. */
   private suspend fun latencyMedians(s: RunState?): Map<String, Long?> {
     val now = clock()
     val window = Scoreboard.WEEK_MS * 4
     val hist = try { Scoreboard.compute(scores.since(now - window), now, window).associate { it.agentId to it.medianReplyMs } } catch (e: CancellationException) { throw e } catch (_: Exception) { emptyMap() }
     val run = s?.asks.orEmpty().filter { it.replies.isNotEmpty() && it.sentAt != null && it.agentId != roster.main.id }
       .associate { it.agentId to (it.replies.first().at - it.sentAt!!).coerceAtLeast(0) }
-    return (hist.keys + run.keys).associateWith { hist[it] ?: run[it] }
+    // Until the score log has measured an agent, its channel's prior stands in (a fresh install no longer treats every
+    // agent as fast and waits the full 3 minutes on a texting or scheduled one).
+    val prior = roster.peers.mapNotNull { p -> p.expectedReplyMs?.let { p.id to it } }.toMap()
+    return (hist.keys + run.keys + prior.keys).associateWith { hist[it] ?: run[it] ?: prior[it] }
   }
 
   /** Answered blind asks not folded into the answer yet (Juno's own first take is folded when it is shown). */
@@ -1452,8 +1598,10 @@ class Juno(
       val target = Repair.pick(c.answerAgent, candidates, medians, config.fastMs)
       if (target == null) { trace.event(runId, "editor.repair", "no fast agent free; Juno adjusted the answer itself", null); return }
       val pick = s.asks.lastOrNull { it.agentId == c.answerAgent && it.purpose == AskPurpose.BLIND }?.let { AskTail.strip(it.replyText) }.orEmpty()
-      val yours = if (target == c.answerAgent) "Your answer: ${Relay.trim(pick, 400)}" else "One suggestion so far: ${Relay.trim(pick, 400)}"
-      val text = Prompts.render("repair_ask", mapOf("question" to s.userText.trim(), "yours" to yours, "fact" to c.fact.trim(), "user" to userNameNow().ifBlank { "the user" }))
+      val pickQuote = Relay.trim(pick, 400)
+      val yours = if (target == c.answerAgent) "Your answer: $pickQuote" else "One suggestion so far: $pickQuote"
+      val question = s.userText.trim()
+      val text = Prompts.render("repair_ask", mapOf("question" to question, "yours" to yours, "fact" to c.fact.trim(), "user" to userNameNow().ifBlank { "the user" }))
       val shareFrom = listOf(c.factAgent, c.answerAgent).distinct().filter { it != target && roster.byId(it)?.sensitive == true }
       val busy = busyAgentsL()
       val status = when {
@@ -1461,7 +1609,9 @@ class Juno(
         roster.byId(target)?.kind == AgentKind.TEXT && target in busy -> AskStatus.QUEUED
         else -> AskStatus.SENDING
       }
-      val a = AskState("$runId~a${s.asks.size}", target, text, AskPurpose.REPAIR, status = status, createdAt = clock(), shareFrom = shareFrom, why = "cross-check")
+      // Kush's question is quoted as his own words (the send gate reads them as his); the pick and the fact are agents'.
+      val a = AskState("$runId~a${s.asks.size}", target, text, AskPurpose.REPAIR, status = status, createdAt = clock(), shareFrom = shareFrom, why = "cross-check",
+        quoted = listOf(pickQuote, c.fact.trim()).filter { it.isNotBlank() }, userQuote = question)
       putL(s.copy(asks = s.asks + a, editor = e.copy(repairAskId = a.id)))
       trace.event(runId, "editor.repair", "to ${roster.nameOf(target)}" + if (shareFrom.isNotEmpty()) " (share tap for ${shareFrom.joinToString { roster.nameOf(it) }})" else "", null)
       if (status == AskStatus.AWAITING_APPROVAL) {
@@ -2000,14 +2150,7 @@ class Juno(
   )
 
   /** What the send gate sees for an ask: who wrote which part of it. */
-  private fun segmentsOf(a: AskState): List<Segment> = when (a.purpose) {
-    AskPurpose.BLIND -> listOf(Segment(a.text, Provenance.USER_VERBATIM))
-    AskPurpose.TASK -> listOf(Segment(a.text, if (a.approved) Provenance.USER_APPROVED else Provenance.JUNO_REWRITE))
-    AskPurpose.CHALLENGE -> listOf(Segment(a.text, Provenance.PEER_RELAY))
-    AskPurpose.ROOM -> listOf(Segment(a.text, Provenance.ATALL)) + a.quoted.map { Segment(it, if (a.approved) Provenance.USER_APPROVED else Provenance.PEER_RELAY) }
-    // Repair and mention relays carry other agents' words: checked as relayed text (no buy / book / go-ahead).
-    AskPurpose.REPAIR, AskPurpose.MENTION -> listOf(Segment(a.text, Provenance.PEER_RELAY))
-  }
+  private fun segmentsOf(a: AskState): List<Segment> = AskSegments.of(a)
 
   private fun userNameNow(): String = runCatching { userName() }.getOrDefault("")
 
@@ -2085,4 +2228,29 @@ class Juno(
   }
 
   private fun RunState.replaceAsk(a: AskState) = copy(asks = asks.map { if (it.id == a.id) a else it })
+}
+
+/**
+ * What the send gate sees for an ask: who wrote which part of it. Only the user's own words (or a text they approved
+ * with a tap) may carry buy / book / pay / "go ahead"; Juno's rewrites and other agents' words are checked.
+ */
+object AskSegments {
+  fun of(a: AskState): List<Segment> = when (a.purpose) {
+    AskPurpose.BLIND -> listOf(Segment(a.text, if (a.approved) Provenance.USER_APPROVED else Provenance.USER_VERBATIM))
+    AskPurpose.TASK -> listOf(Segment(a.text, if (a.approved) Provenance.USER_APPROVED else Provenance.JUNO_REWRITE))
+    AskPurpose.CHALLENGE -> listOf(Segment(a.text, Provenance.PEER_RELAY))
+    AskPurpose.ROOM -> listOf(Segment(a.text, Provenance.ATALL)) + a.quoted.map { Segment(it, if (a.approved) Provenance.USER_APPROVED else Provenance.PEER_RELAY) }
+    // A repair restates Kush's question in his own words (read-only: "Quick check on: …"), Atall's fixed framing, and
+    // other agents' words (the pick, the fact). His words are his; the agents' words are still checked as relayed text.
+    AskPurpose.REPAIR -> {
+      val uq = a.userQuote?.takeIf { it.isNotBlank() && a.text.contains(it) }
+      if (uq == null) listOf(Segment(a.text, Provenance.PEER_RELAY))
+      else {
+        val framing = (a.quoted + uq).fold(a.text) { acc, q -> if (q.isBlank()) acc else acc.replace(q, " ") }
+        listOf(Segment(framing, Provenance.PEER_RELAY), Segment(uq, Provenance.USER_VERBATIM)) + a.quoted.map { Segment(it, Provenance.PEER_RELAY) }
+      }
+    }
+    // Mention relays carry another agent's question: checked as relayed text (no buy / book / go-ahead).
+    AskPurpose.MENTION -> listOf(Segment(a.text, Provenance.PEER_RELAY))
+  }
 }

@@ -79,7 +79,9 @@ class Router(
     private suspend fun dispatch(msg: ThreadMessage, attempt: String = "0", talk: Boolean = false) {
         val agents = registry.all().filter { it.channel.implemented }
         when (val route = Mentions.route(msg.text, registry.all(), talk && agents.count { !it.paused } >= 2)) {
-            is Route.Direct -> direct(msg, route, attempt)
+            // Two or more agents @mentioned: Juno's editor flow, restricted to them (one living answer, not N replies).
+            is Route.Direct -> if (route.peerIds.size >= 2 && juno()?.editorFlow == true && juno()?.hasActivePeers() == true && signedIn())
+                coordinate(msg, Route.All(route.text, route.peerIds)) else direct(msg, route, attempt)
             is Route.All -> coordinate(msg, route)
             is Route.Talk -> coordinate(msg, route)
             is Route.ToMain -> coordinate(msg, route)
@@ -219,8 +221,13 @@ class Router(
             if (runCatching { coordinator().onPeerMessage(p.toPeer(), m) }.getOrDefault(false)) return
             if (inbox().onUnsolicited(p.toPeer(), m) == InboxDecision.HOLD) return
         }
-        showPeer(p.id, m.id, m.text, m.sentAt, attribution)
+        // An answer to Kush's own @mention that asks another agent something: passed on with no tap, within caps.
+        val relayed = if (attribution == Attribution.DIRECT) relayDirect(p.id, cid ?: "m:${m.id}", m.text) else emptySet()
+        showPeer(p.id, m.id, m.text, m.sentAt, attribution, relayed = relayed)
     }
+
+    private suspend fun relayDirect(peerId: String, directId: String, text: String): Set<String> =
+        runCatching { juno()?.relayDirect(peerId, directId, text) }.getOrNull().orEmpty()
 
     /**
      * An answer (or a status line) over the connector to a direct @mention. A result shows as the agent's direct reply
@@ -234,7 +241,8 @@ class Router(
                 kind = MessageKind.NOTICE, peerId = p.id, sourceId = m.messageId))
             return
         }
-        showPeer(p.id, m.messageId, m.text, m.at, Attribution.DIRECT, via = if (m.via == Via.CONNECTOR && m.verified) Via.CONNECTOR else null)
+        val relayed = relayDirect(p.id, m.correlationId ?: "m:${m.messageId}", m.text)
+        showPeer(p.id, m.messageId, m.text, m.at, Attribution.DIRECT, via = if (m.via == Via.CONNECTOR && m.verified) Via.CONNECTOR else null, relayed = relayed)
     }
 
     /** Catch up from a peer's durable log (the live flow doesn't replay). Lines from before the agent was added are skipped. */
@@ -273,12 +281,12 @@ class Router(
         if (next !== target) thread.upsert(next)
     }
 
-    private fun showPeer(peerId: String, sourceId: String, text: String, sentAt: Long, attribution: Attribution, via: Via? = null) {
+    private fun showPeer(peerId: String, sourceId: String, text: String, sentAt: Long, attribution: Attribution, via: Via? = null, relayed: Set<String> = emptySet()) {
         val direct = attribution == Attribution.DIRECT
         // A direct answer never shows above the question it answers, even with a skewed timestamp.
         val floor = if (direct) (thread.chronological().lastOrNull { it.author == ThreadMessage.USER }?.at ?: 0) + 1 else 0
         thread.upsert(ThreadMessage("in:$sourceId", maxOf(sentAt, floor), peerId, text, direct = direct, sourceId = sourceId, attribution = attribution,
-            suggest = PeerLines.suggestions(text, peerId, registry.all()), via = via))
+            suggest = PeerLines.suggestions(text, peerId, registry.all()).filter { it !in relayed }, via = via))
         dropStaleHints(peerId)
     }
 

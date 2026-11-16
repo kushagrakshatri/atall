@@ -9,8 +9,11 @@ sealed interface Route {
     data class ToMain(val text: String, val mentionedPeers: List<String>) : Route
     /** Only peers were mentioned: each gets [text] directly, the main agent stays quiet. */
     data class Direct(val peerIds: List<String>, val text: String) : Route
-    /** `@all` / `@everyone`: the same question to every active agent, blind, then the Agreement Map. */
-    data class All(val text: String) : Route
+    /**
+     * `@all` / `@everyone`: the same question to every active agent, blind, then Juno's living answer. With [peerIds]
+     * (the user @mentioned two or more agents), only those agents.
+     */
+    data class All(val text: String, val peerIds: List<String> = emptyList()) : Route
     /**
      * "Talk it over": the agents answer on their own first, then see each other's answers and reply, then Juno wraps
      * up. [peerIds] empty means every active agent.
