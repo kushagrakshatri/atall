@@ -208,7 +208,14 @@ class JunoBridge(
                         is PeerSend.Sent -> "posted"; is PeerSend.Duplicate -> "already posted"; is PeerSend.Failed -> r.reason + if (byText) " (sending by text)" else ""
                         else -> r.javaClass.simpleName
                     })
-                    if (!byText) return r
+                    if (!byText) {
+                        // A webhook agent's ask that failed at the post gets no wake: say so (v0.1.9 Grok never answered).
+                        WakeTelemetry.missingWake(conn.relayAgentId, connector.wakeKind(profile), correlationId, r)?.let {
+                            log.add("wake", "missing.error", runId, "${conn.relayAgentId} ${it.extras["ask"]}: ${it.extras["reason"]}")
+                            telemetry.capture(it.message, Telemetry.Level.WARNING, runId, it.extras)
+                        }
+                        return r
+                    }
                 } else if (only) return PeerSend.Failed("connector_unavailable")
                 return inner!!.send(p.text, correlationId)
             }

@@ -133,7 +133,8 @@ class AndroidWakeSinks(
     override suspend fun webhook(task: ConnectorTask): WakeOutcome {
         val url = settings.saved.webhookUrls[task.relayAgentId.lowercase()]?.takeIf { WakeSetup.webhookUrlOk(it) } ?: return WakeOutcome.UNAVAILABLE
         val key = settings.webhookKey(task.relayAgentId) ?: return WakeOutcome.UNAVAILABLE
-        val taskId = task.taskId ?: return WakeOutcome.UNAVAILABLE
+        // A card known only by its ref (409 on our own ref) is still woken: the routine reads its inbox, the ids are a hint.
+        val taskId = task.taskId
         return withContext(Dispatchers.IO) {
             val req = Request.Builder().url(url).header("Authorization", "Bearer $key")
                 .post(WakeSetup.webhookBody(task.ref, taskId).toRequestBody("application/json".toMediaType())).build()

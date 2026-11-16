@@ -2,6 +2,7 @@ package app.atall.coordinator
 
 import java.util.UUID
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.channels.BufferOverflow
@@ -153,6 +154,12 @@ class Juno(
 
   private val roster: Roster get() = rosterProvider()
   private val mutex = Mutex()
+  /**
+   * Asks being sent right now (guarded by [mutex]). An ask stays SENDING while its send call runs, so without this a
+   * second flush (drive loop + the bridge's sweep, or any other caller) sent it again: v0.1.9 posted every connector
+   * ask twice, and Grok's duplicate got a 409 that failed the ask.
+   */
+  private val inFlight = HashSet<String>()
   private val cache = HashMap<String, RunState>()
   private val driving = HashSet<String>()
   private val version = MutableStateFlow(0L)
@@ -775,7 +782,7 @@ class Juno(
     val gated = mutableListOf<RunUpdate>()
     val toSend = mutex.withLock {
       val s = getL(runId) ?: return@withLock emptyList()
-      val sending = s.asks.filter { it.status == AskStatus.SENDING && it.agentId != roster.main.id }
+      val sending = s.asks.filter { it.status == AskStatus.SENDING && it.agentId != roster.main.id && it.id !in inFlight }
       // The send gate (backstop): only the user's own words may carry buy / book / "go ahead" to an agent.
       val blocked = sending.filter { SendGate.check(segmentsOf(it), userNameNow()).gated }
       if (blocked.isNotEmpty()) {
@@ -784,10 +791,16 @@ class Juno(
         events.forEach { scores.append(it) }
         gated += RunUpdate.Changed(runId)
       }
-      sending - blocked.toSet()
+      (sending - blocked.toSet()).also { l -> l.forEach { inFlight += it.id } }
     }
     gated.forEach { _updates.tryEmit(it) }
     if (toSend.isEmpty()) return
+    try { recordSends(runId, toSend) } finally {
+      withContext(NonCancellable) { mutex.withLock { toSend.forEach { inFlight -= it.id } } }
+    }
+  }
+
+  private suspend fun recordSends(runId: String, toSend: List<AskState>) {
     val results = coroutineScope {
       toSend.map { a ->
         async {

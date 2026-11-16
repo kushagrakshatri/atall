@@ -172,7 +172,13 @@ class WakeDispatcher(
 }
 
 /** What the ladder did on one tick, for the debug log. */
-data class LadderNote(val cid: String, val ref: String, val relayAgentId: String, val step: String)
+data class LadderNote(
+  val cid: String, val ref: String, val relayAgentId: String, val step: String,
+  /** A wake or nudge that reached nobody (every path failed or was unavailable): logged as an error and sent to Sentry. */
+  val failed: Boolean = false,
+  /** The path that was tried first (webhook for Grok), for the error line. */
+  val kind: WakeKind? = null,
+)
 
 /**
  * The §8 fallback ladder over the open connector tasks: `connector (with wake) → nudge → text → tap-to-send`.
@@ -209,7 +215,8 @@ class FallbackLadder(
     val now = clock()
     val outage = relayDownSince != null && now - relayDownSince >= outageMs
     for (t in ledger.live(now)) {
-      if (t.taskId == null || t.fellBackAt != null || skip(t)) continue
+      // Not on the relay yet (the post is in flight or failed): nothing to wake. A 409 for our own ref counts as posted.
+      if (!t.posted || t.fellBackAt != null || skip(t)) continue
       val p = policyFor(t)
       val quietSince = t.activityAt ?: t.postedAt
       val textRoute = hasTextRoute(t.peerId)
@@ -228,7 +235,9 @@ class FallbackLadder(
     ledger.update(t.cid) { it.copy(wakes = attempt, wokeAt = clock()) }
     val r = dispatcher.wake(t, attempt)
     ledger.update(t.cid) { it.copy(wakeVia = "${r.kind?.name?.lowercase() ?: "none"}:${r.outcome.name.lowercase()}") }
-    note(LadderNote(t.cid, t.ref, t.relayAgentId, (if (attempt == 1) "wake " else "nudge ") + r.tried.joinToString(" → ") { "${it.first.name.lowercase()} ${it.second.name.lowercase()}" }.ifEmpty { "none" }))
+    val reached = r.outcome == WakeOutcome.SENT || r.outcome == WakeOutcome.TAP
+    note(LadderNote(t.cid, t.ref, t.relayAgentId, (if (attempt == 1) "wake " else "nudge ") + r.tried.joinToString(" → ") { "${it.first.name.lowercase()} ${it.second.name.lowercase()}" }.ifEmpty { "none" },
+      failed = !reached, kind = r.tried.firstOrNull()?.first))
   }
 
   private suspend fun fallBack(t: ConnectorTask, reason: String) {

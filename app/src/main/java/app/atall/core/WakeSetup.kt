@@ -150,7 +150,8 @@ object WakeSetup {
   }.getOrDefault(false)
 
   /** The webhook body: no content, only the ids (protocol.md §6: "a nudge carries no content"). */
-  fun webhookBody(ref: String, taskId: String): String = """{"ref":"$ref","task_id":"$taskId","source":"atall"}"""
+  fun webhookBody(ref: String, taskId: String?): String =
+    if (taskId == null) """{"ref":"$ref","source":"atall"}""" else """{"ref":"$ref","task_id":"$taskId","source":"atall"}"""
 
   /** "Grok wants your OK" line: the action, and the amount when there is one. */
   fun approvalLine(agent: String, action: String, amount: Double?, currency: String?): String =

@@ -132,6 +132,10 @@ class Graph(private val context: Context) {
         relay.hasTextRoute = { id -> registry.get(id)?.let { p -> !p.paused && p.channel == ChannelType.RCS && peers.agent(p.id) != null } == true }
         relay.fallbackText = { t, why -> juno.sendAskByText(t.cid, why) }
         relay.fullAsk = { cid -> juno.fullAskText(cid) }
+        relay.onWakeProblem = { n, runId ->
+            val webhook = relay.wake.config(n.relayAgentId).kind == app.atall.coordinator.adapters.WakeKind.WEBHOOK
+            app.atall.core.WakeTelemetry.forNote(n, webhook)?.let { telemetry.capture(it.message, app.atall.core.Telemetry.Level.WARNING, runId, it.extras) }
+        }
         relay.onApproval = { r ->
             approvals.onRequest(r)
             val name = r.peerId?.let { registry.get(it)?.name } ?: app.atall.core.RelayCopy.agentName(r.relayAgentId)

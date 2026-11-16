@@ -14,6 +14,7 @@ import app.atall.relay.RelayEvent
 import app.atall.relay.RelayException
 import app.atall.relay.TaskCard
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.ensureActive
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
@@ -53,7 +54,15 @@ data class ConnectorTask(
   /** C3 fallback ladder (protocol.md §8): when the same ask went by text (or a tap) instead, and why. */
   val fellBackAt: Long? = null,
   val fallback: String? = null,
+  /**
+   * The relay answered 409 for our own ref: the card is on the relay (an earlier or concurrent post of this ask went
+   * through) but its task id wasn't returned. Woken and fallen back like a posted task; the pump fills [taskId] in.
+   */
+  val onRelay: Boolean = false,
 ) {
+  /** On the relay (posted, or known to be there): the ladder may wake it and fall back for it. */
+  val posted: Boolean get() = taskId != null || onRelay
+
   /** Waiting on the connector: polled fast. A task that fell back still takes a late result (slow poll). */
   fun open(now: Long) = doneAt == null && fellBackAt == null && now < deadlineAt
   /** Still worth waking or falling back for. */
@@ -78,6 +87,19 @@ class ConnectorLedger(private val file: File? = null, private val keepMs: Long =
   }
 
   fun remove(cid: String) = synchronized(lock) { tasks = tasks.filter { it.cid != cid }; save() }
+
+  /**
+   * Drops this post's own entry for [cid] after a failed post, but never one that is on the relay (another post of
+   * the same ask got a task id, or a 409 showed the card is there): that would orphan the task and skip its wake.
+   */
+  fun dropUnposted(cid: String, ref: String) = synchronized(lock) {
+    val before = tasks.size
+    tasks = tasks.filter { !(it.cid == cid && it.ref == ref && !it.posted) }
+    if (tasks.size != before) save()
+  }
+
+  /** Posts in flight, by ask id: a second send of the same ask while one is posting waits for it (one POST per ask). */
+  internal val posting = java.util.concurrent.ConcurrentHashMap<String, kotlinx.coroutines.CompletableDeferred<PeerSend>>()
 
   fun live(now: Long): List<ConnectorTask> = synchronized(lock) { tasks.filter { it.live(now) } }
 
@@ -132,14 +154,46 @@ class ConnectorAgent(
 ) : CardPeer {
   override suspend fun send(text: String, correlationId: String): PeerSend = sendCard(correlationId, ConnectorText.title(text), text)
 
-  /** Posts the card: [title] is a short line, [goal] the full self-contained text the agent works from. */
+  /**
+   * Posts the card: [title] is a short line, [goal] the full self-contained text the agent works from. Exactly one POST
+   * per ask: a send of the same [correlationId] while one is in flight waits for it and returns [PeerSend.Duplicate]
+   * (v0.1.9 bug: two flushes posted every ask twice; Grok's second post got a 409 and failed the ask, dropping its wake).
+   */
   override suspend fun sendCard(correlationId: String, title: String, goal: String): PeerSend {
+    while (true) {
+      val mine = kotlinx.coroutines.CompletableDeferred<PeerSend>()
+      val other = ledger.posting.putIfAbsent(correlationId, mine)
+      if (other != null) {
+        val r = try { other.await() } catch (e: CancellationException) {
+          // The other post was cancelled, not us: post ourselves.
+          kotlinx.coroutines.currentCoroutineContext().ensureActive()
+          continue
+        } catch (_: Exception) { continue }
+        return when (r) {
+          is PeerSend.Sent -> PeerSend.Duplicate(r.at)
+          else -> r
+        }
+      }
+      try {
+        val r = post(correlationId, title, goal)
+        mine.complete(r)
+        return r
+      } catch (e: Throwable) {
+        mine.completeExceptionally(e)
+        throw e
+      } finally {
+        ledger.posting.remove(correlationId, mine)
+      }
+    }
+  }
+
+  private suspend fun post(correlationId: String, title: String, goal: String): PeerSend {
     val prior = ledger.get(correlationId)
-    if (prior?.taskId != null) return PeerSend.Duplicate(prior.postedAt)
+    if (prior != null && prior.posted) return PeerSend.Duplicate(prior.postedAt)
     val now = clock()
     val ref = prior?.ref ?: TaskCard.newRef()
     val deadline = now + deadlineMs
-    ledger.put(ConnectorTask(correlationId, id, relayAgentId, ref, null, now, deadline))
+    ledger.put(ConnectorTask(correlationId, id, relayAgentId, ref, null, now, deadline, onRelay = prior?.onRelay == true))
     val card = TaskCard(
       ref = ref,
       title = title.ifBlank { "Task from Juno" }.take(200),
@@ -156,16 +210,27 @@ class ConnectorAgent(
       throw e
     } catch (e: RelayException) {
       when {
-        // Our own ref is already a live task: an earlier post of this ask went through (its answer was lost).
-        e.status == 409 && prior != null -> PeerSend.Sent(now, Via.CONNECTOR)
-        e.rateLimited -> { ledger.remove(correlationId); PeerSend.RateLimited(30_000) }
-        e.unauthorized -> { ledger.remove(correlationId); PeerSend.Failed(RELAY_REFUSED) }
+        // 409 "ref … is already used by a live task" for our own ref: the card is on the relay (an earlier post of this
+        // ask went through and its answer was lost, or another post of it won). Sent, never FAILED, and the ledger
+        // entry stays so the pump finds its events and the ladder wakes it.
+        e.status == 409 -> {
+          val cur = ledger.get(correlationId)
+          if (cur?.taskId != null) PeerSend.Duplicate(cur.postedAt)
+          else {
+            if (ledger.update(correlationId) { it.copy(onRelay = true) } == null) {
+              ledger.put(ConnectorTask(correlationId, id, relayAgentId, ref, null, now, deadline, onRelay = true))
+            }
+            PeerSend.Sent(now, Via.CONNECTOR)
+          }
+        }
+        e.rateLimited -> { ledger.dropUnposted(correlationId, ref); PeerSend.RateLimited(30_000) }
+        e.unauthorized -> { ledger.dropUnposted(correlationId, ref); PeerSend.Failed(RELAY_REFUSED) }
         // The relay itself is down (5xx): same as unreachable.
-        e.status >= 500 -> { ledger.remove(correlationId); PeerSend.Failed(RELAY_UNREACHABLE) }
-        else -> { ledger.remove(correlationId); PeerSend.Failed("relay_error_${e.status}") }
+        e.status >= 500 -> { ledger.dropUnposted(correlationId, ref); PeerSend.Failed(RELAY_UNREACHABLE) }
+        else -> { ledger.dropUnposted(correlationId, ref); PeerSend.Failed("relay_error_${e.status}") }
       }
     } catch (_: IOException) {
-      ledger.remove(correlationId)
+      ledger.dropUnposted(correlationId, ref)
       PeerSend.Failed(RELAY_UNREACHABLE)
     }
   }
@@ -248,6 +313,8 @@ class ConnectorPump(
     val task = e.taskId?.let { ledger.byTaskId(it) } ?: ref?.let { ledger.byRef(e.agentId, it) } ?: return log("not ours")
     if (task.relayAgentId != e.agentId) return log("wrong agent")
     if (!e.verified) return log("dropped: countersignature didn't verify")
+    // A card known only by its ref (409 on our own ref): its first verified event gives the task id (for wakes).
+    if (task.taskId == null && e.taskId != null) ledger.update(task.cid) { if (it.taskId == null && it.ref == task.ref) it.copy(taskId = e.taskId) else it }
     ledger.update(task.cid) { it.copy(activityAt = maxOf(it.activityAt ?: 0L, clock())) }
     onActivity(task, e)
     if (e.type == RelayEvent.APPROVAL_REQUEST) ApprovalRequest.from(e, task.peerId, clock())?.let(onApproval)

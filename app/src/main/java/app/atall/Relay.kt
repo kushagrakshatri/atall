@@ -11,6 +11,7 @@ import app.atall.core.RelayCopy
 import app.atall.coordinator.PeerSignal
 import app.atall.api.PeerDirectory
 import app.atall.coordinator.PeerSend
+import app.atall.coordinator.adapters.LadderNote
 import app.atall.coordinator.adapters.ApprovalRequest
 import app.atall.coordinator.adapters.CardPeer
 import app.atall.coordinator.adapters.ConnectorTask
@@ -113,6 +114,8 @@ class Relay(
     /** The whole ask's text for the tap rung. */
     var fullAsk: suspend (cid: String) -> String? = { null }
     var hasTextRoute: (peerId: String) -> Boolean = { false }
+    /** A wake or nudge reached nobody (Graph sends a webhook agent's to Sentry). */
+    var onWakeProblem: (LadderNote, runId: String?) -> Unit = { _, _ -> }
     private val sinks by lazy {
         AndroidWakeSinks(context, wake, client, object : PeerDirectory {
             override fun peers(): List<app.atall.api.PeerInfo> = peerDirectory()?.peers().orEmpty()
@@ -132,7 +135,12 @@ class Relay(
             hasTextRoute = { hasTextRoute(it) },
             byText = { t, why -> fallbackText(t, why) },
             tapFull = { t, _ -> val full = fullAsk(t.cid); full != null && sinks.tap(t, WakeCopy.prompt(t.ref), full) == WakeOutcome.TAP },
-            note = { n -> log.add("wake", n.step.substringBefore(' '), n.cid.substringBefore('~').takeIf { "~" in n.cid }, "#${n.ref} ${n.relayAgentId}: ${n.step}") },
+            note = { n ->
+                val runId = n.cid.substringBefore('~').takeIf { "~" in n.cid }
+                // A wake that reached nobody is an error line (Sentry breadcrumb at ERROR) and, for a webhook agent, an event.
+                log.add("wake", n.step.substringBefore(' ') + if (n.failed) ".error" else "", runId, "#${n.ref} ${n.relayAgentId}: ${n.step}")
+                if (n.failed) runCatching { onWakeProblem(n, runId) }
+            },
             // A paused agent (kDot after his ChatGPT Pro ended) gets no wake, nudge, text or tap for its open cards.
             skip = { t -> registry.get(t.peerId)?.paused != false },
         )

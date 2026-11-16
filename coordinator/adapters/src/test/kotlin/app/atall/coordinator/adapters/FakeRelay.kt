@@ -42,6 +42,11 @@ class FakeRelay(
   private val ids = AtomicInteger()
   val rejected = AtomicInteger()
   @Volatile var down = false
+  /** Like the real relay: a ref already used by a live task is a 409 ("ref … is already used by a live task"). */
+  @Volatile var uniqueRefs = true
+  /** Every POST /phone/tasks seen (accepted or not), and an optional delay before each answers (to race posts). */
+  val posts = AtomicInteger()
+  @Volatile var postDelayMs = 0L
   /** C3: agents with an MCP Events subscription; every /phone/wake call. */
   val subscribed: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
   val wakes = CopyOnWriteArrayList<Pair<String, String>>()
@@ -123,6 +128,10 @@ class FakeRelay(
     return when {
       r.method == "POST" && path == "/phone/tasks" -> {
         val card = Json.parseToJsonElement(body.decodeToString()).jsonObject
+        posts.incrementAndGet()
+        if (postDelayMs > 0) Thread.sleep(postDelayMs)
+        val ref = card["ref"]!!.jsonPrimitive.content
+        if (uniqueRefs && tasks.any { it["ref"]?.jsonPrimitive?.content == ref }) return error(409, "ref $ref is already used by a live task")
         val id = "tsk_${ids.incrementAndGet()}"
         tasks += JsonObject(card + mapOf("task_id" to JsonPrimitive(id), "phone_sig" to JsonPrimitive(sig)))
         json(201, buildJsonObject { put("task_id", id); put("ref", card["ref"]!!.jsonPrimitive.content) })
