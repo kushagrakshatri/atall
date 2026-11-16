@@ -1,6 +1,7 @@
 package app.atall.core
 
 import app.atall.api.ThreadLine
+import app.atall.coordinator.AskTail
 import app.atall.coordinator.Provenance
 import app.atall.coordinator.Relay
 import app.atall.coordinator.SendGate
@@ -83,6 +84,12 @@ object ContextPack {
          * (never budget-trimmed) as quoted context, and replaces the Recent block it already covers.
          */
         val context: String? = null,
+        /**
+         * Juno's asks (not the user's direct @mentions) end with the self-filled tail ([AskTail]): the agent's angle, up
+         * to 3 facts about the user from its own memory, what it can't see, one next step. Never counted against the
+         * recent-turns budget.
+         */
+        val tail: Boolean = false,
     )
 
     /** Every text from Atall starts with this; a tapback quoting it reacts to one of our texts. */
@@ -99,6 +106,13 @@ object ContextPack {
      * the transport refuses a text whose other parts do ([SendGate]).
      */
     fun packed(i: Input): Packed {
+        if (!i.tail || i.kind == Kind.DIRECT) return core(i, 0)
+        val t = AskTail.text(i.userName)
+        val p = core(i, t.length + 1)
+        return Packed(p.text + "\n" + t, p.segments + Segment(t, Provenance.ATALL))
+    }
+
+    private fun core(i: Input, reserve: Int): Packed {
         val user = i.userName.trim().ifBlank { "The user" }
         val head = header(i.userName)
         val tail = buildList {
@@ -112,7 +126,7 @@ object ContextPack {
         if (i.kind == Kind.ROOM) {
             val body = prose(i.need.orEmpty())
             var text = (listOf(head, body)).joinToString("\n")
-            if (text.length > ROOM_MAX_CHARS) text = Relay.trim(text, ROOM_MAX_CHARS)
+            if (text.length > ROOM_MAX_CHARS - reserve) text = Relay.trim(text, ROOM_MAX_CHARS - reserve)
             val prov = if (i.approved) Provenance.USER_APPROVED else Provenance.PEER_RELAY
             return Packed(text, listOf(atall(text)) + i.quoted.map { Segment(it, prov) })
         }

@@ -40,6 +40,7 @@ import java.io.File
  * Juno wired into the thread: Router -> JunoBridge -> coordinator Juno -> (packed) sends to fake texting agents ->
  * their replies back through the Router -> grouped thread lines. FakeLlm scripts the model. Placeholders only.
  */
+// Pinned to the pre-collab projection (editorUi = false, auto talk on): the collab UI is covered by CollabBridgeTest.
 class JunoBridgeTest {
     @get:Rule val tmp = TemporaryFolder()
 
@@ -65,7 +66,7 @@ class JunoBridgeTest {
         }
         val llm = FakeLlm()
         var plainTurns = 0
-        val bridge = JunoBridge(thread, registry, peers, { llm }, InMemoryRunStore(), scope.backgroundScope, userName = { "Kush" }, clock = clock)
+        val bridge = JunoBridge(thread, registry, peers, { llm }, InMemoryRunStore(), scope.backgroundScope, config = app.atall.coordinator.JunoConfig(autoTalk = true), editorUi = false, userName = { "Kush" }, clock = clock)
         val router = Router(thread, registry, peers, { object : Coordinator { override suspend fun onTurn(turn: MainTurn, context: MainContext) { plainTurns++ } } },
             { null }, clock = clock, juno = { bridge }, userName = { "Kush" }, signedIn = { true })
         init {
@@ -357,7 +358,7 @@ class JunoBridgeTest {
             override fun agent(peerId: String): Agent? = null
         }
         var turns = 0
-        val bridge = JunoBridge(r.thread, r.registry, peers, { r.llm }, InMemoryRunStore(), backgroundScope, clock = r.clock)
+        val bridge = JunoBridge(r.thread, r.registry, peers, { r.llm }, InMemoryRunStore(), backgroundScope, config = app.atall.coordinator.JunoConfig(autoTalk = true), editorUi = false, clock = r.clock)
         val router = Router(r.thread, r.registry, peers, { object : Coordinator { override suspend fun onTurn(turn: MainTurn, context: MainContext) { turns++ } } },
             { null }, clock = r.clock, juno = { bridge }, signedIn = { true })
         router.send("hello")

@@ -27,6 +27,11 @@ enum class MessageKind {
     AGREEMENT,
     /** "Talk it over": the live card, then "Where they landed" and the rounds; [ThreadMessage.detail] holds the view as JSON. */
     TALK,
+    /**
+     * One avatar row under Juno's answer (check = in, ring = working, moon = later) instead of ask cards and waiting
+     * lines. [ThreadMessage.detail] holds the PresenceView as JSON; a tap shows each agent's answer and the comparison.
+     */
+    PRESENCE,
 }
 
 /** Why an agent's line is in the thread. Every agent line carries one, so the label is always the same kind. */
@@ -97,6 +102,8 @@ data class ThreadMessage(
      * relay countersignature for that agent's connection (the "Verified" badge). Null on everything else.
      */
     val via: app.atall.coordinator.Via? = null,
+    /** Juno's answer: the Your call card's text (one deciding question, or "If X: A" lines); [choices] are its taps. */
+    val call: String? = null,
 ) {
     /** The attribution to render; lines from before 0.1.1 only have [direct]. */
     val shownAttribution: Attribution?

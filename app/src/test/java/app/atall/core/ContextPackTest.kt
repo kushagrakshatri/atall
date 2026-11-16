@@ -32,6 +32,24 @@ class ContextPackTest {
         assertFalse(text.contains("@"))
     }
 
+    /** Collab step 1: every ask from Juno ends with the self-filled tail; the user's own @mention never does. */
+    @Test fun junosAsksEndWithTheTailAndPassTheGate() {
+        val tail = app.atall.coordinator.AskTail.text("Kush")
+        for (kind in listOf(ContextPack.Kind.DELEGATED, ContextPack.Kind.BLIND, ContextPack.Kind.CHALLENGE, ContextPack.Kind.ROOM)) {
+            val p = ContextPack.packed(ContextPack.Input(kind, "Kush", "p1", "Nova", "Best day for the hike?", need = "Best day for the hike?",
+                names = names, others = listOf("Scout"), tail = true))
+            assertTrue("$kind", p.text.endsWith("\n$tail"))
+            assertTrue("$kind", p.text.contains("From memory: up to 3 things you know about Kush"))
+            assertFalse("$kind", app.atall.coordinator.SendGate.check(p.segments, "Kush").gated)
+        }
+        val direct = ContextPack.pack(ContextPack.Input(ContextPack.Kind.DIRECT, "Kush", "p1", "Nova", "where's the game?", names = names, tail = true))
+        assertFalse(direct.contains("Angle:"))
+        // A long talk relay still fits with its tail.
+        val room = ContextPack.pack(ContextPack.Input(ContextPack.Kind.ROOM, "Kush", "p1", "Nova", "q", need = "x ".repeat(2_000), tail = true))
+        assertTrue("${room.length}", room.length <= ContextPack.ROOM_MAX_CHARS + 1)
+        assertTrue(room.endsWith(tail))
+    }
+
     @Test fun leadingRecipientMentionIsStripped() {
         val text = ContextPack.pack(ContextPack.Input(ContextPack.Kind.DIRECT, "Kush", "p1", "Nova", "@Nova, where's the game?", names = names))
         assertEquals("From Atall (Kush's thread):\nKush: where's the game?", text)

@@ -50,6 +50,7 @@ import java.util.concurrent.CopyOnWriteArrayList
  * Juno's asks and direct @mentions send the whole packed ask by text at once; the text reply is a normal answer for
  * claims, merge and the room (Hark's share tap stays).
  */
+// Pinned to the pre-collab projection (editorUi = false, auto talk on): the collab UI is covered by CollabBridgeTest.
 class FullTextRouteTest {
     @get:Rule val tmp = TemporaryFolder()
     private val T0 = 1_763_000_000_000L
@@ -93,7 +94,7 @@ class FullTextRouteTest {
         // What the app wires (Relay.access): the relay connection, with each agent's saved route on top.
         val access = FullTextRouting(relay) { id -> configs[id] ?: WakeDefaults.forAgent(id) }
         val llm = FakeLlm()
-        val bridge = JunoBridge(thread, registry, peers, { llm }, InMemoryRunStore(), scope.backgroundScope, userName = { "Kush" }, clock = clock, connector = access)
+        val bridge = JunoBridge(thread, registry, peers, { llm }, InMemoryRunStore(), scope.backgroundScope, config = app.atall.coordinator.JunoConfig(autoTalk = true), editorUi = false, userName = { "Kush" }, clock = clock, connector = access)
         val router = Router(thread, registry, peers, { object : Coordinator { override suspend fun onTurn(turn: MainTurn, context: MainContext) {} } },
             { null }, clock = clock, juno = { bridge }, userName = { "Kush" }, signedIn = { true }, connector = { access })
         init {
@@ -121,7 +122,7 @@ class FullTextRouteTest {
         val hark = r.bridge.roster().byId(r.hark.id)!!
         assertFalse(hark.paused)
         assertNull(hark.softTimeoutMs)
-        assertTrue("Hark's answers wait for the share tap in a talk", hark.sensitive)
+        assertFalse("Hark's answers go to peers with no share tap (Kush, 2026-11-16)", hark.sensitive)
     }
 
     /** The v0.1.4 birthday transcript with Hark and kDot both on Full text: no cards, no "Atall #", a normal merge and talk. */
@@ -166,10 +167,9 @@ class FullTextRouteTest {
         val answer = l.single { it.id.startsWith("answer:") && !it.hidden }
         assertTrue(answer.text, answer.text.contains("WHOOP"))
         assertTrue("no verified badge on a texted answer", l.none { it.via == Via.CONNECTOR })
-        // Room mode: the talk starts and Hark's answer waits for the share tap before kDot sees it.
+        // Room mode (pinned legacy config): the talk starts; no share tap by default since 2026-11-16.
         assertTrue(l.any { it.kind == MessageKind.TALK })
-        assertEquals("Share Hark's answer with kDot?", l.single { it.kind == MessageKind.NEEDS_APPROVAL }.text)
-        assertFalse(r.sent(r.kdot).drop(1).any { it.second.contains("WHOOP") })
+        assertTrue(l.none { it.kind == MessageKind.NEEDS_APPROVAL })
         assertTrue(r.relay.cards.isEmpty())
     }
 

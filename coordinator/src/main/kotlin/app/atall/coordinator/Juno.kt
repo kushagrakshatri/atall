@@ -1200,7 +1200,7 @@ class Juno(
   /**
    * An agent's answer (ask [fromAskId]) @mentioned [toAgentId]: relay [question] to it, no tap (Kush, 2026-11-16), inside
    * caps: [JunoConfig.mentionRelaysPerRun] per run, [JunoConfig.mentionRelaysPerAgent] per target, [JunoConfig.mentionMaxDepth]
-   * hops, never to Juno, a paused agent, the asker itself, or an agent already working on this run. Anything that reads as
+   * hops, never to Juno, a paused agent or the asker itself (a texting agent busy with its own ask gets it right after). Anything that reads as
    * buy / book / pay / go-ahead stays a button (the send gate, unchanged). Returns whether it went out.
    */
   suspend fun relayMention(fromAskId: String, toAgentId: String, question: String): Boolean {
@@ -1219,7 +1219,6 @@ class Juno(
         relays.size >= config.mentionRelaysPerRun -> "run_cap"
         relays.count { it.agentId == to.id } >= config.mentionRelaysPerAgent -> "agent_cap"
         from.mentionDepth >= config.mentionMaxDepth -> "depth_cap"
-        s.asks.any { it.agentId == to.id && !it.status.settled } -> "busy_in_run"
         relays.any { it.mentionFrom == from.agentId && it.agentId == to.id } -> "duplicate"
         else -> null
       }

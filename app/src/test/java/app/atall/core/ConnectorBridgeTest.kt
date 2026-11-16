@@ -47,6 +47,7 @@ import java.util.concurrent.CopyOnWriteArrayList
  * C2 in the app: routing (connector when paired + connected, text otherwise), the card that goes out, verified answers
  * projected with the provenance badge, connector-only agents, direct @mentions over the connector.
  */
+// Pinned to the pre-collab projection (editorUi = false, auto talk on): the collab UI is covered by CollabBridgeTest.
 class ConnectorBridgeTest {
     @get:Rule val tmp = TemporaryFolder()
     private val T0 = 1_763_000_000_000L
@@ -93,7 +94,7 @@ class ConnectorBridgeTest {
             override fun agent(peerId: String): Agent? = agents[peerId]
         }
         val llm = FakeLlm()
-        val bridge = JunoBridge(thread, registry, peers, { llm }, InMemoryRunStore(), scope.backgroundScope, userName = { "Kush" }, clock = clock, connector = connector)
+        val bridge = JunoBridge(thread, registry, peers, { llm }, InMemoryRunStore(), scope.backgroundScope, config = app.atall.coordinator.JunoConfig(autoTalk = true), editorUi = false, userName = { "Kush" }, clock = clock, connector = connector)
         val router = Router(thread, registry, peers, { object : Coordinator { override suspend fun onTurn(turn: MainTurn, context: MainContext) {} } },
             { null }, clock = clock, juno = { bridge }, userName = { "Kush" }, signedIn = { true }, connector = { connector })
         init {

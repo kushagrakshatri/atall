@@ -42,6 +42,7 @@ import java.io.File
  * kDot. Hark tapbacks 🥳 first, then answers at 17 s; kDot answers at 10 s; Juno answers blind. On the phone the run
  * stopped at "Collecting answers": no merged answer, no Agreement Map, no talk.
  */
+// Pinned to the pre-collab projection (editorUi = false, auto talk on): the collab UI is covered by CollabBridgeTest.
 class BirthdayRunTest {
     @get:Rule val tmp = TemporaryFolder()
     private val T0 = 1_763_000_000_000L
@@ -110,7 +111,7 @@ class BirthdayRunTest {
             override fun agent(peerId: String): Agent? = agents[peerId]
         }
         val llm = FakeLlm()
-        val bridge = JunoBridge(thread, registry, peers, { llm }, InMemoryRunStore(), scope.backgroundScope, userName = { "Kush" }, clock = clock,
+        val bridge = JunoBridge(thread, registry, peers, { llm }, InMemoryRunStore(), scope.backgroundScope, config = app.atall.coordinator.JunoConfig(autoTalk = true), editorUi = false, userName = { "Kush" }, clock = clock,
             log = log, telemetry = telemetry)
         val router = Router(thread, registry, peers, { object : Coordinator { override suspend fun onTurn(turn: MainTurn, context: MainContext) {} } },
             { null }, clock = clock, juno = { bridge }, userName = { "Kush" }, signedIn = { true })
@@ -189,13 +190,12 @@ class BirthdayRunTest {
         assertTrue(m.disputed.isNotEmpty())
         val d = m.disputed.first()
         assertTrue(d.sides.any { r.kdot.id in it.agentIds } && d.sides.any { r.hark.id in it.agentIds })
-        // The talk starts by itself, and Hark's private detail waits for the share tap before kDot sees it.
+        // The talk starts by itself (pinned legacy config). Since 2026-11-16 there's no share tap by default: Hark's
+        // answer goes to kDot in the reveal with no tap.
         val talk = l.single { it.kind == MessageKind.TALK }
         val tv = Json { ignoreUnknownKeys = true; explicitNulls = false }.decodeFromString(TalkView.serializer(), talk.detail!!)
         assertTrue(tv.label, tv.label.contains("talking it over") || tv.label.contains("talked it over"))
-        val share = l.single { it.kind == MessageKind.NEEDS_APPROVAL }
-        assertEquals("Share Hark's answer with kDot?", share.text)
-        assertFalse(r.agents.getValue(r.kdot.id).sent.drop(1).any { it.second.contains("WHOOP") })
+        assertTrue(l.none { it.kind == MessageKind.NEEDS_APPROVAL })
     }
 
     @Test fun mergeAsksNothingAnAgentAlreadyKnows() = runTest {

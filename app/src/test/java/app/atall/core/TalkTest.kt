@@ -39,6 +39,7 @@ import org.junit.rules.TemporaryFolder
 import java.io.File
 
 /** "Talk it over" in the app: routing, the relay texts agents get, the send gate at the transport, the thread lines. */
+// Pinned to the pre-collab projection (editorUi = false, auto talk on): the collab UI is covered by CollabBridgeTest.
 class TalkTest {
     @get:Rule val tmp = TemporaryFolder()
     private val T0 = 1_763_000_000_000L
@@ -72,7 +73,7 @@ class TalkTest {
         val llm = FakeLlm()
         val scores = InMemoryScoreLog()
         val done = mutableListOf<String>()
-        val bridge = JunoBridge(thread, registry, peers, { llm }, InMemoryRunStore(), scope.backgroundScope, scores = scores, userName = { "Kush" }, clock = clock,
+        val bridge = JunoBridge(thread, registry, peers, { llm }, InMemoryRunStore(), scope.backgroundScope, config = app.atall.coordinator.JunoConfig(autoTalk = true), editorUi = false, scores = scores, userName = { "Kush" }, clock = clock,
             onTalkDone = { runId, _ -> done += runId })
         val router = Router(thread, registry, peers, { object : Coordinator { override suspend fun onTurn(turn: MainTurn, context: MainContext) {} } },
             { null }, clock = clock, juno = { bridge }, userName = { "Kush" }, signedIn = { true })

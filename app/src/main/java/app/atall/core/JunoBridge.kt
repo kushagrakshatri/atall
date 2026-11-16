@@ -40,6 +40,7 @@ import app.atall.coordinator.ScoreEvent
 import app.atall.coordinator.SendGate
 import app.atall.coordinator.TalkTrigger
 import app.atall.coordinator.TalkView
+import app.atall.coordinator.PresenceView
 import app.atall.coordinator.Views
 import app.atall.coordinator.adapters.ConnectorAgent
 import app.atall.coordinator.adapters.ConnectorText
@@ -83,8 +84,9 @@ class JunoBridge(
     private val scores: ScoreLog = InMemoryScoreLog(),
     private val userName: () -> String = { "" },
     private val clock: () -> Long = System::currentTimeMillis,
-    // Juno starts a talk by itself when @all's first answers clash on the thing being decided (plan.md "Triggers").
-    config: JunoConfig = JunoConfig(autoTalk = true),
+    // "Juno as editor" (collab plan): @all answers in seconds and gets better live; a clash becomes a Your call card.
+    // The automatic talk is off; "Talk it over" stays one tap away (composer chip, a disagreement in the details).
+    config: JunoConfig = JunoConfig(editor = true, autoTalk = false),
     /** Off in tests that step the run by hand. */
     private val autoDrive: Boolean = true,
     /** A talk ended with Juno's wrap-up (once per talk): the app's one notification for it. */
@@ -96,6 +98,11 @@ class JunoBridge(
     private val stuckAfterMs: Long = 60_000L,
     /** C2: the Atall connector. Agents it can reach get Juno's asks as signed task cards; the rest go by text. */
     private val connector: ConnectorAccess = ConnectorAccess.NONE,
+    /**
+     * The collab UI (default): every ask ends with the self-filled tail, and runs show one avatar row instead of the
+     * strip, ask cards and agent reply lines. Off only in the tests that pin the pre-collab projection.
+     */
+    private val editorUi: Boolean = true,
 ) {
     /** Called when a run starts for a user message, before anything is sent (the debug Story 1 marks its run here). */
     var onRunStarted: (runId: String, msg: ThreadMessage) -> Unit = { _, _ -> }
@@ -120,6 +127,11 @@ class JunoBridge(
         jobs = listOf(
             scope.launch { juno.updates.collect { u ->
                 if (u is RunUpdate.TalkDone) runCatching { onTalkDone(u.runId, u.text) }
+                // One text-free summary per run (ids, counts, enums): safe for Sentry whatever the text switch says.
+                if (u is RunUpdate.Summary) runCatching {
+                    log.add("juno", "run.summary", u.runId, u.summary.extras().entries.joinToString(" ") { "${it.key}=${it.value}" })
+                    telemetry.capture("Run summary", Telemetry.Level.INFO, u.runId, u.summary.extras())
+                }
                 // A projection that throws must never end this collector (the thread would freeze for every later run).
                 runIdOf(u)?.let { projectSafely(it) }
             } },
@@ -251,6 +263,8 @@ class JunoBridge(
             recent = recent, context = follow?.context,
             names = registry.all().associate { it.id to it.name }, others = if (kind == ContextPack.Kind.ROOM) emptyList() else others,
             approved = ask?.approved == true, quoted = ask?.quoted.orEmpty(),
+            // Every ask Juno sends ends with the self-filled tail (collab plan step 1).
+            tail = editorUi && ask != null,
         ))
     }
 
@@ -261,6 +275,7 @@ class JunoBridge(
      * the Agreement Map). Returns the run id; the run drives itself in [scope].
      */
     suspend fun startRun(msg: ThreadMessage, route: Route): String {
+        freezeAnswers()
         val chrono = thread.chronological()
         val recent = Router.recentBefore(chrono, msg, limit = JunoConfig().maxContextLines)
         val r = roster()
@@ -291,6 +306,7 @@ class JunoBridge(
      * agents) it is folded into the run ("the user added …"). Returns the run id, or null when no run takes it.
      */
     suspend fun takeFollowUp(msg: ThreadMessage): String? {
+        freezeAnswers()
         val now = clock()
         val runs = liveRuns.mapNotNull { safe { juno.state(it) } }
         // A talk that's still going: what the user writes joins it (every agent in it sees it next round).
@@ -347,8 +363,27 @@ class JunoBridge(
     /** "Leave X out" on a talk. */
     suspend fun leaveOut(runId: String, agentId: String) { if (juno.leaveOut(runId, agentId)) { project(runId); if (autoDrive) scope.launch { drive(runId) } } }
 
+    /** Kush replied in the thread: every living answer stops changing under him (late news becomes a new turn). */
+    suspend fun freezeAnswers() {
+        for (id in liveRuns.toList()) if (safe { juno.freeze(id) } == true) project(id)
+    }
+
+    /** Double-tap on Juno's answer: ♥ on, or off again. Logged text-free. */
+    suspend fun heart(messageId: String) {
+        val m = thread.get(messageId) ?: return
+        val runId = m.runId ?: return
+        val had = m.reactions.any { it.by == ThreadMessage.USER && it.emoji == HEART }
+        thread.upsert(m.copy(reactions = if (had) m.reactions.filterNot { it.by == ThreadMessage.USER && it.emoji == HEART } else m.reactions + ReactionChip(HEART, ThreadMessage.USER)))
+        safe { juno.signal(runId, if (had) "heart_removed" else "heart") }
+    }
+
+    /** Long-press → "One of them was better" → the avatar Kush picked. Logged text-free. */
+    suspend fun oneBetter(runId: String, agentId: String) { safe { juno.signal(runId, "one_better", agentId) } }
+
     /** The user tapped one of Juno's choices after a talk: it goes out as their own message, and it's logged. */
     suspend fun choiceTapped(runId: String, choice: String) {
+        safe { juno.freeze(runId) }
+        safe { juno.signal(runId, "acted") }
         val st = safe { juno.state(runId) } ?: return
         val topic = st.room?.focusTopic ?: st.userText.take(80)
         runCatching { scores.append(ScoreEvent.TalkChoice(Main.AUTHOR, clock(), runId, topic, choice)) }
@@ -419,6 +454,15 @@ class JunoBridge(
             // replayed from the log, which carry no flag: classified again from the text).
             status = (m.nonAnswer ?: NonAnswers.classify(m.text))?.name?.lowercase(),
         ))
+        // An agent's answer that @mentions another agent: Juno relays the question with no tap, within caps
+        // (Kush, 2026-11-16). Action words never relay (the send gate); then the "Ask X about this?" button stays.
+        if ((m.nonAnswer ?: NonAnswers.classify(m.text)) == null) {
+            val body = app.atall.coordinator.AskTail.strip(m.text)
+            for (target in PeerLines.suggestions(body, peerId, registry.all())) {
+                val name = registry.get(target)?.name ?: continue
+                safe { juno.relayMention(ask.id, target, app.atall.coordinator.Relay.quoteFor(body, name)) }
+            }
+        }
         project(PeerLines.runIdOf(ask.id))
         return true
     }
@@ -497,10 +541,21 @@ class JunoBridge(
         fun put(m: ThreadMessage) { thread.upsert(m.copy(runId = runId)); last = maxOf(last, m.at) }
         fun at(t: Long?) = maxOf(t ?: clock(), last + 1)
 
-        // The strip: who Juno is asking, then who answered.
-        val strip = view.strip
+        val presence = if (editorUi) view.presence else null
+        val editor = st.editor != null
+        // One avatar row instead of the strip, ask cards and waiting lines (editor and delegating runs).
+        if (presence != null) {
+            for (old in listOf("run:$runId", "map:$runId") + st.asks.flatMap { a -> listOf("ask:${a.id}") + a.replies.map { "in:${it.messageId}" } + a.statusNotes.map { "status:${it.messageId}" } }) {
+                thread.get(old)?.let { if (!it.hidden) thread.upsert(it.copy(hidden = true)) }
+            }
+            val id = "presence:$runId"
+            put(ThreadMessage(id, base + 3, Main.AUTHOR, presence.accessibility, kind = MessageKind.PRESENCE,
+                detail = Json.encodeToString(PresenceView.serializer(), presence), streaming = presence.live))
+        }
+        // Editor runs show their answer from the first seconds, before any agent is in.
+        val strip = if (presence != null) null else view.strip
         val headId = "run:$runId"
-        if (strip != null || !st.phase.terminal) {
+        if (presence == null && (strip != null || (!st.phase.terminal && !editor))) {
             val label = strip?.labelText ?: if (st.mode == RunMode.ALL) "Asking everyone" else "Thinking"
             val existing = thread.get(headId)
             put(ThreadMessage(headId, existing?.at ?: (base + 1), Main.AUTHOR, label, kind = MessageKind.RUN,
@@ -514,6 +569,12 @@ class JunoBridge(
                 detail = Json.encodeToString(TalkView.serializer(), talk), streaming = talk.live))
         }
         for (a in st.asks.sortedBy { it.createdAt }) {
+            if (presence != null) {
+                // Agents' answers live one tap down in the avatar row; only what needs Kush stays in the thread.
+                if (a.agentId != Main.AUTHOR) projectNeeds(a, ::put, ::at)
+                thread.get("blind:${a.id}")?.let { if (!it.hidden) thread.upsert(it.copy(hidden = true)) }
+                continue
+            }
             if (talk != null) {
                 // A talk shows its rounds inside its card; lines an @all projected before it became a talk fold away.
                 for (old in listOf("ask:${a.id}", "blind:${a.id}") + a.replies.map { "in:${it.messageId}" }) {
@@ -549,7 +610,11 @@ class JunoBridge(
             }
             for (p in replies) {
                 val id = "in:${p.messageId}"
-                put(ThreadMessage(id, thread.get(id)?.at ?: at(p.at), a.agentId, p.text, attribution = Attribution.JUNO,
+                // The self-filled tail never shows raw: a part that is only the tail has no line.
+                val parsed = app.atall.coordinator.AskTail.parse(p.text)
+                if (!parsed.hadBody) { thread.get(id)?.let { if (!it.hidden) thread.upsert(it.copy(hidden = true)) }; continue }
+                val shown = parsed.body
+                put(ThreadMessage(id, thread.get(id)?.at ?: at(p.at), a.agentId, shown, attribution = Attribution.JUNO,
                     askId = a.id, sourceId = p.messageId, detail = replyNote(p.certainty, p.late), via = p.provenance.takeIf { it == app.atall.coordinator.Via.CONNECTOR },
                     suggest = PeerLines.suggestions(p.text, a.agentId, registry.all())))
             }
@@ -561,7 +626,7 @@ class JunoBridge(
         }
 
         val map = view.agreement
-        val mapShown = map != null && (st.mode == RunMode.ALL || (st.mode == RunMode.ROOM && st.room?.trigger != TalkTrigger.ASKED))
+        val mapShown = map != null && presence == null && (st.mode == RunMode.ALL || (st.mode == RunMode.ROOM && st.room?.trigger != TalkTrigger.ASKED))
         if (mapShown) {
             val id = "map:$runId"
             put(ThreadMessage(id, thread.get(id)?.at ?: at(null), Main.AUTHOR, map!!.verdict?.line ?: "Waiting for answers",
@@ -574,10 +639,17 @@ class JunoBridge(
             val id = "answer:$runId"
             val room = st.room
             val prev = thread.get(id)
-            // A new answer (a talk's wrap-up replacing the merge, a re-merge) moves below what came before it.
-            val keepAt = prev != null && prev.text == st.answer
-            put(ThreadMessage(id, if (keepAt) prev!!.at else at(st.answeredAt), Main.AUTHOR, st.answer!!,
-                choices = room?.choices.orEmpty(), yourCall = room?.yourCall == true))
+            if (editor && room == null) {
+                // The living answer: edited in place (same spot), one caption saying what changed, Your call under it.
+                val call = view.yourCall
+                put(ThreadMessage(id, prev?.at ?: (base + 2), Main.AUTHOR, st.answer!!, detail = view.caption,
+                    choices = call?.choices.orEmpty(), yourCall = call != null, call = call?.text, reactions = prev?.reactions.orEmpty()))
+            } else {
+                // A new answer (a talk's wrap-up replacing the merge, a re-merge) moves below what came before it.
+                val keepAt = prev != null && prev.text == st.answer
+                put(ThreadMessage(id, if (keepAt) prev!!.at else at(st.answeredAt), Main.AUTHOR, st.answer!!,
+                    choices = room?.choices.orEmpty(), yourCall = room?.yourCall == true, reactions = prev?.reactions.orEmpty()))
+            }
         }
         st.followUps.forEachIndexed { i, f ->
             val id = "follow:$runId:$i"
@@ -647,6 +719,7 @@ class JunoBridge(
         is RunUpdate.MapUpdated -> u.runId
         is RunUpdate.Failed -> u.runId
         is RunUpdate.TalkDone -> u.runId
+        is RunUpdate.Summary -> u.runId
         is RunUpdate.Unsolicited, is RunUpdate.DirectReply -> null
     }
 
@@ -662,6 +735,7 @@ class JunoBridge(
     companion object {
         /** An unaddressed message joins an open run only this soon after the run started. */
         const val FOLLOW_UP_WINDOW_MS = 15 * 60_000L
+        const val HEART = "♥"
         private val OPEN = setOf(AskStatus.PENDING, AskStatus.DRAFTED, AskStatus.NEEDS_TAP, AskStatus.REPLYING, AskStatus.LIKELY_MISSED, AskStatus.TIMED_OUT)
 
         fun stripDetail(s: DelegationStrip?): String? = when {

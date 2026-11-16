@@ -141,6 +141,8 @@ class MainActivity : ComponentActivity() {
                     onChoice = { runId, choice -> g.scope.launch { g.juno.choiceTapped(runId, choice); g.router.send(choice) } },
                     // The fingerprint prompt needs this activity: run in its scope.
                     onAgentApproval = { id, yes -> lifecycleScope.launch { approvalNote = g.decideApproval(id, yes) } },
+                    onHeart = { id -> g.scope.launch { g.juno.heart(id) } },
+                    onOneBetter = { runId, agent -> g.scope.launch { g.juno.oneBetter(runId, agent) } },
                 ),
             )
             Screen.Agents -> {

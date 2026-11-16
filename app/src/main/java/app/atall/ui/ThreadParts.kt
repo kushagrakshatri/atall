@@ -83,9 +83,10 @@ internal fun ReactionChips(chips: List<ReactionChip>, peers: Map<String, PeerUi>
     val c = AppTheme.colors
     Row(Modifier.padding(top = 4.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
         for (r in chips) {
-            val name = peers[r.by]?.name ?: "Agent"
+            // Kush's own ♥ on Juno's answer is just the heart.
+            val name = if (r.by == ThreadMessage.USER) "" else peers[r.by]?.name ?: "Agent"
             Text(
-                "${r.emoji} $name",
+                "${r.emoji} $name".trim(),
                 Modifier.clip(CircleShape).background(c.sunken).padding(horizontal = 8.dp, vertical = 2.dp),
                 style = AppTheme.type.caption, color = c.ink2,
             )

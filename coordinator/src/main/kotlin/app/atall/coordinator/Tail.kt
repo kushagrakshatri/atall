@@ -20,8 +20,11 @@ data class Tail(
   val isEmpty: Boolean get() = angle == null && facts.isEmpty() && cantSee == null && next == null
 }
 
-/** An agent's reply split into the answer (what the thread may show) and its tail (never shown raw). */
-data class TailedReply(val body: String, val tail: Tail)
+/**
+ * An agent's reply split into the answer (what the thread may show) and its tail (never shown raw). [hadBody] is false
+ * when the reply was only a tail (then [body] says it in plain words).
+ */
+data class TailedReply(val body: String, val tail: Tail, val hadBody: Boolean = true)
 
 object AskTail {
   const val MAX_FACTS = 3
@@ -96,7 +99,7 @@ object AskTail {
     val tail = Tail(angle, facts.distinctBy { it.lowercase() }.take(MAX_FACTS), cant, next)
     // A reply that is only a tail: show what it says in plain words, never the labels.
     val shown = body.ifEmpty { listOfNotNull(tail.angle, tail.facts.joinToString("; ").ifEmpty { null }, tail.next).joinToString(". ").ifEmpty { reply.trim() } }
-    return TailedReply(shown, tail)
+    return TailedReply(shown, tail, body.isNotEmpty())
   }
 
   /** The answer part only: what the thread shows. */

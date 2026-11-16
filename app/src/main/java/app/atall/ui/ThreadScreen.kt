@@ -90,6 +90,10 @@ class ThreadActions(
     val onChoice: (String, String) -> Unit = { _, _ -> },
     /** C3: Approve (fingerprint) / Deny on an agent's request (approval id, approve). */
     val onAgentApproval: (String, Boolean) -> Unit = { _, _ -> },
+    /** Double-tap on Juno's answer: ♥ on or off (message id). */
+    val onHeart: (String) -> Unit = {},
+    /** Long-press → "One of them was better" → the agent (run id, agent id). */
+    val onOneBetter: (String, String) -> Unit = { _, _ -> },
 )
 
 private sealed interface Row {
@@ -134,6 +138,12 @@ fun ThreadScreen(state: ThreadUi, actions: ThreadActions, zone: ZoneId = ZoneId.
     val today = LocalDate.now(zone)
     val list = remember(state.messages, today) { rows(state.messages, zone, today) }
     val railRuns = remember(state.messages) { state.messages.filter { it.kind == MessageKind.RUN }.mapNotNull { it.runId }.toSet() }
+    // Who answered each run (for "One of them was better"): from its avatar row.
+    val answeredBy = remember(state.messages) {
+        state.messages.filter { it.kind == MessageKind.PRESENCE && it.runId != null }.associate { m ->
+            m.runId!! to parsePresence(m.detail)?.agents.orEmpty().filter { it.text != null }.map { it.agentId to it.name }
+        }
+    }
     // A talk that's still going: what the user types joins it.
     val liveTalk = remember(state.messages) { state.messages.lastOrNull { it.kind == MessageKind.TALK && it.streaming }?.let { parseTalk(it.detail) } }
     // "Ask Hark about this?" fills the composer; the user sends it (or not).
@@ -158,7 +168,7 @@ fun ThreadScreen(state: ThreadUi, actions: ThreadActions, zone: ZoneId = ZoneId.
                 items(list, key = { it.key }) { row ->
                     when (row) {
                         is Row.Day -> DayDivider(row.label)
-                        is Row.Msg -> MessageRow(row, peersById, names, actions, railRuns, talkActions)
+                        is Row.Msg -> MessageRow(row, peersById, names, actions, railRuns, talkActions, answeredBy)
                     }
                 }
             }
@@ -178,7 +188,8 @@ private fun AppBar(peers: List<PeerUi>, onAgents: () -> Unit) {
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
             Text(Main.NAME, style = AppTheme.type.headline, color = AppTheme.colors.ink)
-            Text(Copy.withPeers(peers), style = AppTheme.type.body2, color = AppTheme.colors.ink2)
+            // Paused agents (kDot) stay out of sight until resumed.
+            Text(Copy.withPeers(peers.filter { !it.paused }), style = AppTheme.type.body2, color = AppTheme.colors.ink2)
         }
         Box(Modifier.size(48.dp).clip(CircleShape).clickable(onClick = onAgents), contentAlignment = Alignment.Center) {
             Icon(Glyph.People, AppTheme.colors.ink)
@@ -238,7 +249,8 @@ private fun DayDivider(label: String) {
 }
 
 @Composable
-private fun MessageRow(row: Row.Msg, peers: Map<String, PeerUi>, names: Map<String, String>, actions: ThreadActions, railRuns: Set<String>, talk: TalkActions) {
+private fun MessageRow(row: Row.Msg, peers: Map<String, PeerUi>, names: Map<String, String>, actions: ThreadActions, railRuns: Set<String>, talk: TalkActions,
+                       answeredBy: Map<String, List<Pair<String, String>>> = emptyMap()) {
     val m = row.m
     val top = if (row.header) AppTheme.spacing.turnGap / 2 else AppTheme.spacing.groupGap
     // Lines of a Juno turn (strip, sub-tasks, agent replies, answer) sit on one rail under it.
@@ -253,6 +265,14 @@ private fun MessageRow(row: Row.Msg, peers: Map<String, PeerUi>, names: Map<Stri
             m.kind == MessageKind.NEEDS_APPROVAL -> Approval(m, peers[m.peerId], actions.onApprove)
             m.kind == MessageKind.AGREEMENT -> AgreementCard(m, peers, actions.onTalkOver)
             m.kind == MessageKind.TALK -> TalkCard(m, peers, talk)
+            m.kind == MessageKind.PRESENCE -> Box(Modifier.padding(start = 34.dp)) { PresenceRow(m, peers, actions.onTalkOver) }
+            m.author == Main.AUTHOR && m.id.startsWith("answer:") && m.runId != null ->
+                AnswerGestures(m, answeredBy[m.runId].orEmpty(), peers, actions.onHeart, actions.onOneBetter) {
+                    AgentTurn(null, m, row.header || child) {
+                        if (m.reactions.isNotEmpty()) ReactionChips(m.reactions, peers)
+                        if (m.call != null) YourCallCard(m, actions.onChoice) else Choices(m, actions.onChoice)
+                    }
+                }
             m.kind == MessageKind.NEEDS_SIGN_IN -> AgentTurn(null, m, row.header) { Spacer(Modifier.height(8.dp)); Chip("Sign in", actions.onSignIn, filled = true) }
             m.kind == MessageKind.NOTICE -> Notice(m.text, indent = !child)
             m.author == Main.AUTHOR -> AgentTurn(null, m, row.header || child) { Choices(m, actions.onChoice) }
