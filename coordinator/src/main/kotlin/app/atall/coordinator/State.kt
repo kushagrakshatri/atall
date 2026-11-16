@@ -33,7 +33,13 @@ enum class Phase {
 }
 
 @Serializable
-enum class AskPurpose { TASK, BLIND, CHALLENGE, ROOM }
+enum class AskPurpose {
+  TASK, BLIND, CHALLENGE, ROOM,
+  /** Editor (P1): the one repair ask after a cross-check found an answer that breaks another agent's fact. Not blind. */
+  REPAIR,
+  /** An agent @mentioned another in its answer: Juno relays the question with no tap (within caps). Not blind. */
+  MENTION,
+}
 
 @Serializable
 enum class AskStatus {
@@ -130,6 +136,15 @@ data class AskState(
   val approved: Boolean = false,
   /** The transport the ask went out on (null before it was sent, and on asks stored before C2). */
   val via: Via? = null,
+  /**
+   * Editor: the agent's measured reply time is slow, so the run never waits on it; its answer folds in as a review
+   * when it lands (the avatar shows a moon until then).
+   */
+  val background: Boolean = false,
+  /** MENTION relays: how many @mention hops led here (1 = an agent's answer mentioned this agent). */
+  val mentionDepth: Int = 0,
+  /** MENTION relays: the agent whose answer @mentioned this one. */
+  val mentionFrom: String? = null,
 ) {
   val replyText: String get() = replies.joinToString("\n") { it.text }
   /** Every structured claim the agent sent for this ask. */
@@ -189,6 +204,8 @@ data class RunState(
   val agreement: AgreementMap? = null,
   /** A talk ("Talk it over"): its entries, rounds and outcome. Set for [RunMode.ROOM]. */
   val room: RoomState? = null,
+  /** "Juno as editor" (@all with [JunoConfig.editor]): versions, claims table, cross-check, Your call, reviews. */
+  val editor: EditorState? = null,
   val version: Long = 0,
 ) {
   fun ask(id: String) = asks.firstOrNull { it.id == id }

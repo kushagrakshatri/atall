@@ -29,7 +29,8 @@ data class AgentProfile(
     val createdAt: Long = 0,
     /**
      * "Ask before sharing its answers with other agents" (in a talk, a "Share with X?" tap). Null: the default, which
-     * is on for agents that read the user's private accounts (Hark, Muse) and off for the rest.
+     * is off for every agent since 2026-11-16 (Kush: "everything can be done automatically"); it used to be on for Hark
+     * and Muse. [AgentRegistry] migrates an older stored "on" for them once. The user can still turn it on per agent.
      */
     val askBeforeSharing: Boolean? = null,
     /**
@@ -43,9 +44,15 @@ data class AgentProfile(
     val sharesPrivately: Boolean get() = askBeforeSharing ?: AgentPrivacy.privateByDefault(name)
 }
 
-/** Which agents' answers count as private by default (risks.md #1): those that answer from the user's own accounts. */
+/**
+ * Which agents' answers count as private by default (risks.md #1). None since 2026-11-16: Kush said "everything can be
+ * done automatically", so agents' facts and content go to peer agents (cross-check, reveals, reviews, @mentions) with
+ * no share tap. Money, bookings, purchases and sends in his name to a third party keep their approval (unchanged).
+ */
 object AgentPrivacy {
-    private val PRIVATE = setOf("hark", "muse")
+    private val PRIVATE = emptySet<String>()
+    /** Agents whose stored "ask before sharing" was migrated off once (their old default was on). */
+    val MIGRATED_OFF = setOf("hark", "muse")
     fun privateByDefault(name: String): Boolean = name.trim().lowercase(Locale.ROOT) in PRIVATE
 }
 
@@ -95,7 +102,7 @@ object AgentValidation {
 /** The user's agents, persisted as one JSON file (atomic rewrite). Source of truth for every channel. */
 class AgentRegistry(private val file: File, private val clock: () -> Long = System::currentTimeMillis) {
     private val lock = Any()
-    private var agents: List<AgentProfile> = load()
+    private var agents: List<AgentProfile> = migrate(load())
 
     fun all(): List<AgentProfile> = synchronized(lock) { agents }
     fun get(id: String): AgentProfile? = synchronized(lock) { agents.firstOrNull { it.id == id } }
@@ -145,6 +152,21 @@ class AgentRegistry(private val file: File, private val clock: () -> Long = Syst
         if (file.isFile) Json.decodeFromString(ListSerializer(AgentProfile.serializer()), file.readText()) else emptyList()
     } catch (_: Exception) {
         emptyList()
+    }
+
+    /**
+     * One-time migration (2026-11-16): an install that stored "ask before sharing" = on for Hark (the old default made
+     * explicit by the agent screen) goes back to the new default (off). Same for Muse. Runs once per install; a later choice sticks.
+     */
+    private fun migrate(list: List<AgentProfile>): List<AgentProfile> {
+        val marker = File(file.absoluteFile.parentFile ?: return list, file.name + ".share-gate-v2")
+        if (marker.exists()) return list
+        val next = list.map { if (it.askBeforeSharing == true && it.name.folded() in AgentPrivacy.MIGRATED_OFF) it.copy(askBeforeSharing = null) else it }
+        runCatching {
+            if (next != list) AtomicFile.write(file, Json.encodeToString(ListSerializer(AgentProfile.serializer()), next))
+            marker.parentFile?.mkdirs(); marker.writeText("1")
+        }
+        return next
     }
 
     private fun save() = AtomicFile.write(file, Json.encodeToString(ListSerializer(AgentProfile.serializer()), agents))

@@ -149,11 +149,14 @@ class TalkTest {
         assertFalse(Mentions.asksToTalk("let's talk tomorrow"))
     }
 
-    @Test fun privateAgentsAnswersNeedTheShareTap() = runTest {
+    /** Off by default since 2026-11-16; an agent the user sets to "ask before sharing" still gets the tap. */
+    @Test fun anAgentSetToAskBeforeSharingNeedsTheShareTap() = runTest {
         val r = Rig(this, listOf("Hark", "Nova"), mapOf(
             "Hark" to { t -> if (relay(t)) listOf("Agree.") else listOf("Rooh: your flight is at 8 am.") },
             "Nova" to { t -> if (relay(t)) listOf("Rooh then.") else listOf("Sakoon at 7:30.") },
         ))
+        assertFalse(r.registry.get(r.id("Hark"))!!.sharesPrivately)
+        r.registry.update(r.registry.get(r.id("Hark"))!!.copy(askBeforeSharing = true))
         assertTrue(r.registry.get(r.id("Hark"))!!.sharesPrivately)
         r.router.send("@Hark @Nova Rooh or Sakoon? talk it over")
         settle()
@@ -217,9 +220,23 @@ class TalkTest {
         assertEquals(emptyList<String>(), PeerLines.suggestions("@Nova hi", r.id("Nova"), r.registry.all()))
     }
 
-    @Test fun privateByDefaultOnlyForAccountReadingAgents() {
-        assertTrue(AgentProfile("h", "Hark").sharesPrivately)
-        assertTrue(AgentProfile("m", "muse").sharesPrivately)
+    @Test fun harkAndMuseShareGateMigratesOffOnce() {
+        val f = File(tmp.root, "mig-${ids++}.json")
+        val old = AgentRegistry(f, clock = { 0 })
+        // An older install whose agent screen stored "on" explicitly for Hark and Muse, and a user's own "on" for Nova.
+        listOf("Hark", "Muse", "Nova").forEach { old.update(old.add(it, ChannelType.RCS, "+1408555019${ids++ % 10}").copy(askBeforeSharing = true)) }
+        File(f.parentFile, f.name + ".share-gate-v2").delete()
+        val migrated = AgentRegistry(f, clock = { 0 })
+        assertEquals(listOf(false, false, true), listOf("Hark", "Muse", "Nova").map { migrated.byName(it)!!.sharesPrivately })
+        // Once only: a choice made after the migration sticks.
+        migrated.update(migrated.byName("Hark")!!.copy(askBeforeSharing = true))
+        assertTrue(AgentRegistry(f, clock = { 0 }).byName("Hark")!!.sharesPrivately)
+    }
+
+    /** 2026-11-16 (Kush): no share taps by default for anyone, Hark and Muse included; still settable per agent. */
+    @Test fun noAgentAsksBeforeSharingByDefault() {
+        assertFalse(AgentProfile("h", "Hark").sharesPrivately)
+        assertFalse(AgentProfile("m", "muse").sharesPrivately)
         assertFalse(AgentProfile("k", "kDot").sharesPrivately)
         assertFalse(AgentProfile("h", "Hark", askBeforeSharing = false).sharesPrivately)
         assertTrue(AgentProfile("k", "kDot", askBeforeSharing = true).sharesPrivately)

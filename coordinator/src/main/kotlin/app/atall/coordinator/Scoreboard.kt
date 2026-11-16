@@ -56,6 +56,17 @@ sealed class ScoreEvent {
   /** What the user picked after a talk (a choice under Juno's wrap-up): ground truth for the per-topic scores later. */
   @Serializable @SerialName("talk_choice")
   data class TalkChoice(override val agentId: String, override val at: Long, val runId: String, val topic: String, val choice: String) : ScoreEvent()
+
+  /** Editor: which parts of a run's answer needed two or more agents (agent ids only, no text). [agentId] is Juno. */
+  @Serializable @SerialName("surplus")
+  data class Surplus(override val agentId: String, override val at: Long, val runId: String, val parts: List<SurplusPart>) : ScoreEvent()
+
+  /**
+   * Kush's feedback on one of Juno's answers: [kind] "heart" | "heart_removed" | "one_better" (then [betterAgent] is the
+   * agent he picked) | "acted". [agentId] is Juno. No text.
+   */
+  @Serializable @SerialName("user_signal")
+  data class UserSignal(override val agentId: String, override val at: Long, val runId: String, val kind: String, val betterAgent: String? = null) : ScoreEvent()
 }
 
 interface ScoreLog {

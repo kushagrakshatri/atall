@@ -23,6 +23,46 @@ data class RunView(
   val errorKind: LlmException.Kind?,
   /** A talk ("Talk it over"): its live rows and controls, then "Where they landed" and the rounds. */
   val talk: TalkView? = null,
+  /** One avatar row under Juno's answer instead of ask cards and waiting lines (editor and delegating runs). */
+  val presence: PresenceView? = null,
+  /** Editor: the one caption under the answer ("First take · others adding", "Updated · Hark knew …"). */
+  val caption: String? = null,
+  /** Editor: a real split as one deciding question or an if/then rule, with its choices. */
+  val yourCall: YourCall? = null,
+  /** Editor: Kush acted on the answer; it isn't edited any more. */
+  val frozen: Boolean = false,
+)
+
+// ------------------------------------------------------------------ the avatar row (fast-coord ux.md §7)
+
+@Serializable
+enum class PresenceState {
+  /** Asked and working: a ring. */
+  WORKING,
+  /** Asked in the background (slow by measured reply time): a moon. Never holds anything up. */
+  LATER,
+  /** Its answer is folded in: a check. */
+  IN,
+  /** Its answer only agreed: a check, no edit. */
+  AGREED,
+  /** Needs Kush (tap to send, an OK). */
+  NEEDS_YOU,
+  /** Didn't answer (shown faded while live; dropped once the run settles). */
+  NO_ANSWER,
+}
+
+/** One avatar. [text] is the agent's answer without its tail (the detail sheet's only per-agent text). */
+@Serializable
+data class PresenceAgent(val agentId: String, val name: String, val state: PresenceState, val text: String? = null, val note: String? = null)
+
+@Serializable
+data class PresenceView(
+  val runId: String,
+  val live: Boolean,
+  val agents: List<PresenceAgent>,
+  /** The comparison, one tap down (its disagreements keep "Talk it over"). */
+  val map: AgreementMap? = null,
+  val accessibility: String = "",
 )
 
 // ------------------------------------------------------------------ "Talk it over" (the UI never says "room")
@@ -162,7 +202,50 @@ object Views {
       }
     }
     val map = s.agreement ?: if (s.mode == RunMode.ALL) collecting(s, roster) else null
-    return RunView(s.runId, s.mode, s.phase, strip, s.answer, folded, needs, s.followUps, map, s.error, s.errorKind, talk(s, roster, now, config))
+    return RunView(s.runId, s.mode, s.phase, strip, s.answer, folded, needs, s.followUps, map, s.error, s.errorKind, talk(s, roster, now, config),
+      presence = presence(s, roster, now), caption = s.editor?.caption, yourCall = s.editor?.yourCall, frozen = s.editor?.frozen == true)
+  }
+
+  /**
+   * The avatar row for an editor run or a delegating run (never a talk). Paused agents are never asked, so never here.
+   * One avatar per agent (its newest ask): check = in, ring = working, moon = background, faded = no answer (live only).
+   */
+  fun presence(s: RunState, roster: Roster, now: Long): PresenceView? {
+    if (s.room != null || s.mode == RunMode.ROOM) return null
+    if (s.editor == null && s.mode != RunMode.COORDINATE) return null
+    val asks = s.asks.filter { it.agentId != roster.main.id && roster.byId(it.agentId)?.paused != true }
+    if (asks.isEmpty()) return null
+    val live = !s.phase.terminal
+    val e = s.editor
+    val agents = asks.groupBy { it.agentId }.mapNotNull { (id, list) ->
+      val withReply = list.lastOrNull { it.replies.isNotEmpty() }
+      val last = list.last()
+      val open = list.any { !it.status.settled }
+      val state = when {
+        list.any { it.status == AskStatus.NEEDS_TAP || it.status == AskStatus.AWAITING_APPROVAL } -> PresenceState.NEEDS_YOU
+        withReply != null && e != null && id in e.agreedOnly && !open -> PresenceState.AGREED
+        withReply != null && !open -> PresenceState.IN
+        open && (last.background || (s.phase.terminal && list.all { it.background || it.purpose == AskPurpose.BLIND })) -> PresenceState.LATER
+        open -> if (withReply != null) PresenceState.IN else PresenceState.WORKING
+        withReply != null -> PresenceState.IN
+        else -> PresenceState.NO_ANSWER
+      }
+      if (state == PresenceState.NO_ANSWER && !live) return@mapNotNull null
+      val note = when {
+        withReply == null -> null
+        e?.reviews?.any { it.agentId == id } == true -> "Review"
+        withReply.purpose == AskPurpose.REPAIR -> "After a cross-check"
+        withReply.purpose == AskPurpose.MENTION -> withReply.mentionFrom?.let { "Answering ${roster.nameOf(it)}" }
+        else -> withReply.sentAt?.let { short(withReply.replies.first().at - it) }
+      }
+      PresenceAgent(id, roster.nameOf(id), state, withReply?.let { AskTail.strip(it.replyText) }, note)
+    }
+    if (agents.isEmpty()) return null
+    val a11y = agents.joinToString(". ") { a -> a.name + ": " + when (a.state) {
+      PresenceState.WORKING -> "working"; PresenceState.LATER -> "later"; PresenceState.IN, PresenceState.AGREED -> "in"
+      PresenceState.NEEDS_YOU -> "needs you"; PresenceState.NO_ANSWER -> "no answer"
+    } } + ". Double-tap for each answer."
+    return PresenceView(s.runId, live, agents, if (s.mode == RunMode.ALL) (s.agreement ?: collecting(s, roster)) else null, a11y)
   }
 
   /** The talk's view, or null when the run isn't one. Copy follows ux.md §11 (no "room", "round 2 of 2", "debate"). */
@@ -237,6 +320,7 @@ object Views {
   fun approvalLine(a: AskState, name: (String) -> String): String = when {
     a.purpose == AskPurpose.ROOM && a.shareFrom.isNotEmpty() -> "Share ${names(a.shareFrom.map(name))}'s answer with ${name(a.agentId)}?"
     a.purpose == AskPurpose.ROOM -> "Okay to pass this on to ${name(a.agentId)}?"
+    a.purpose == AskPurpose.REPAIR && a.shareFrom.isNotEmpty() -> "Share a note from ${names(a.shareFrom.map(name))} with ${name(a.agentId)}?"
     else -> "Okay to have ${name(a.agentId)} do this?"
   }
 
@@ -254,7 +338,7 @@ object Views {
   /** The partial map shown while @all answers are still arriving: participants and raw answers, no claims yet. */
   fun collecting(s: RunState, roster: Roster): AgreementMap = AgreementMap(
     s.userText, MapStatus.COLLECTING, participants(s, roster),
-    raw = s.asks.filter { it.purpose == AskPurpose.BLIND && it.replies.isNotEmpty() }.map { RawAnswer(it.agentId, roster.nameOf(it.agentId), it.replyText, it.uncertain, it.late) },
+    raw = s.asks.filter { it.purpose == AskPurpose.BLIND && it.replies.isNotEmpty() }.map { RawAnswer(it.agentId, roster.nameOf(it.agentId), AskTail.strip(it.replyText), it.uncertain, it.late) },
   )
 
   fun strip(s: RunState, roster: Roster, now: Long, config: JunoConfig): DelegationStrip? {
@@ -271,7 +355,7 @@ object Views {
       StripAgent(id, roster.nameOf(id), statusOf(last, runDone), duration(last, now))
     }
     val lines = asks.map { a ->
-      StripLine(a.id, a.agentId, roster.nameOf(a.agentId), a.text, a.replyText.takeIf { it.isNotBlank() }?.let(::preview),
+      StripLine(a.id, a.agentId, roster.nameOf(a.agentId), a.text, AskTail.strip(a.replyText).takeIf { it.isNotBlank() }?.let(::preview),
         duration(a, now), statusOf(a, runDone), a.uncertain, a.late,
         via = if (a.replies.isEmpty()) null else if (a.verified) Via.CONNECTOR else Via.TEXT, claims = a.claims.size)
     }

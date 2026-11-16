@@ -66,6 +66,18 @@ data class JunoConfig(
   val modelTimeoutMs: Long = 90_000,
   /** @all: after the map, Juno writes one merged answer from every answer (its own folded in). */
   val mergeAnswer: Boolean = true,
+  /**
+   * "Juno as editor" (collab plan): @all shows Juno's first take within seconds, edits it in place as answers land
+   * (claims table with sources, lead with what only one agent knew), runs one cross-check with at most one repair ask,
+   * turns a real split into a Your call card, and folds slow agents' late answers in as reviews. Replaces [autoTalk].
+   */
+  val editor: Boolean = false,
+  /** Editor: an agent whose measured median reply time is at most this is fast (shapes the answer; may get the repair). */
+  val fastMs: Long = 150_000,
+  /** Agent-to-agent @mentions relayed with no tap: per run at most this many, each agent at most twice, two hops deep. */
+  val mentionRelaysPerRun: Int = 6,
+  val mentionRelaysPerAgent: Int = 2,
+  val mentionMaxDepth: Int = 2,
 )
 
 /**
@@ -97,6 +109,8 @@ sealed interface RunUpdate {
   data class Unsolicited(val agentId: String, val text: String, val at: Long) : RunUpdate
   /** A reply to a direct @mention: show it attributed, "replied directly". */
   data class DirectReply(val agentId: String, val text: String, val at: Long, val correlationId: String) : RunUpdate
+  /** Editor: a run's text-free summary (once, when it settles), for telemetry. */
+  data class Summary(val runId: String, val summary: RunSummary) : RunUpdate
 }
 
 sealed interface DriveResult {
@@ -174,6 +188,8 @@ class Juno(
   suspend fun startAll(question: String, agents: List<AgentProfile> = roster.activePeers): String {
     val now = clock()
     val runId = "r" + newId()
+    // Editor: an agent measured as slow is asked in the background (a moon on its avatar); nothing waits on it.
+    val medians = if (config.editor) latencyMedians(null) else emptyMap()
     mutex.withLock {
       val busy = busyAgentsL()
       var n = 0
@@ -181,11 +197,13 @@ class Juno(
         if (config.includeMainInAll) add(AskState("$runId~a${n++}", roster.main.id, question, AskPurpose.BLIND, status = AskStatus.PENDING, createdAt = now, sentAt = now))
         agents.filter { it.kind != AgentKind.MAIN && !it.paused }.forEach { p ->
           val st = if (p.kind == AgentKind.TEXT && p.id in busy) AskStatus.QUEUED else AskStatus.SENDING
-          add(AskState("$runId~a${n++}", p.id, question, AskPurpose.BLIND, status = st, createdAt = now))
+          val bg = config.editor && (medians[p.id]?.let { it > config.fastMs } == true)
+          add(AskState("$runId~a${n++}", p.id, question, AskPurpose.BLIND, status = st, createdAt = now, background = bg))
         }
       }
       val wait = PendingCall("all-wait", PendingKind.WAIT, asks.map { it.id }, until = now + config.allWaitMs, startedAt = now)
-      putL(RunState(runId, RunMode.ALL, question, emptyList(), now, Phase.WAITING, asks = asks, pending = listOf(wait)))
+      putL(RunState(runId, RunMode.ALL, question, emptyList(), now, Phase.WAITING, asks = asks, pending = listOf(wait),
+        editor = if (config.editor) EditorState() else null))
     }
     return runId
   }
@@ -247,6 +265,10 @@ class Juno(
           Phase.WAITING -> {
             val mainAsk = s.asks.firstOrNull { it.agentId == roster.main.id && it.status == AskStatus.PENDING }
             if (mainAsk != null) { answerAsMain(runId, mainAsk); continue }
+            if (s.editor != null && s.mode == RunMode.ALL) {
+              val fresh = editorFresh(s)
+              if (fresh.isNotEmpty()) { steps++; editorFold(runId, fresh); continue }
+            }
             val wake = nextWake(s)
             if (!inline) return DriveResult.Suspended(viewOf(s), wake)
             val ms = (wake - clock()).coerceIn(1, config.maxSleepMs)
@@ -698,7 +720,15 @@ class Juno(
             AskStatus.AWAITING_APPROVAL -> "waiting_for_user_approval"; AskStatus.CANCELLED -> "cancelled"
             else -> "still_working"
           })
-          if (a.replies.isNotEmpty()) put("reply", a.replyText)
+          if (a.replies.isNotEmpty()) {
+            // The self-filled tail comes to Juno structured, never as part of the reply text.
+            val p = AskTail.parse(a.replyText)
+            put("reply", p.body)
+            p.tail.angle?.let { put("angle", it) }
+            if (p.tail.facts.isNotEmpty()) put("from_memory", JsonArray(p.tail.facts.map { JsonPrimitive(it) }))
+            p.tail.cantSee?.let { put("cant_see", it) }
+            p.tail.next?.let { put("could_do_next", it) }
+          }
           // C2: an answer over the connector carries its claims with confidence and sources; use them in the merge.
           if (a.claims.isNotEmpty()) put("claims", Claims.json(a.claims))
           if (a.replies.isNotEmpty()) put("via", if (a.verified) "connector_verified" else "text")
@@ -806,10 +836,14 @@ class Juno(
       if (p.output == null && p.kind == PendingKind.ROOM_ROUND) roomRoundDone(s, p, now)?.let { p.copy(output = it) } ?: p
       else if (p.output != null || (p.kind != PendingKind.WAIT && p.kind != PendingKind.CHALLENGE_WAIT)) p
       else {
-        val all = p.askIds.mapNotNull { s.ask(it) }
+        val all0 = p.askIds.mapNotNull { s.ask(it) }
+        // Editor: the answer is already on screen, so the run settles on the fast agents and its own time; a slow
+        // (background) agent's answer folds in later as a review.
+        val editorWait = s.editor != null && p.callId == "all-wait"
+        val all = if (editorWait) all0.filter { !it.background } else all0
         // m05: a wait's own time (the model's max_seconds) never ends it while an agent it waits on is still within
         // its soft timeout with nothing in yet: on 2026-11-14 a 120 s wait dropped kDot 60 s early.
-        val timeUp = p.until != null && now >= p.until && (p.kind != PendingKind.WAIT || all.none { holdsSlot(it, now) })
+        val timeUp = p.until != null && now >= p.until && (p.kind != PendingKind.WAIT || editorWait || all.none { holdsSlot(it, now) })
         val done = all.all { it.status.settled } || timeUp || (s.mode == RunMode.COORDINATE && s.interjections.isNotEmpty())
         if (done) p.copy(output = if (s.mode == RunMode.COORDINATE) waitOutput(s, p.askIds, now, p.startedAt) else "done") else p
       }
@@ -903,7 +937,7 @@ class Juno(
     val text = if (answered.isEmpty()) "I couldn't finish that one. Want me to try again?"
     else buildString {
       append("Here's what came back:\n")
-      answered.forEach { append("\n").append(roster.nameOf(it.agentId)).append(": ").append(it.replyText.trim()).append("\n") }
+      answered.forEach { append("\n").append(roster.nameOf(it.agentId)).append(": ").append(AskTail.strip(it.replyText).trim()).append("\n") }
       if (missing.isNotEmpty()) append("\n").append(Views.names(missing)).append(if (missing.size == 1) " didn't answer yet." else " didn't answer yet.")
     }.trim()
     return finishL(s.copy(error = s.error ?: why), text, true)
@@ -917,6 +951,12 @@ class Juno(
       mutex.withLock { getL(s.runId)?.let { cur -> putL(cur.copy(asks = cur.asks.map { a -> if (late.any { it.id == a.id }) a.copy(followedUp = true) else a })) } }
       return
     }
+    if (s.mode == RunMode.ALL && s.editor != null) {
+      // Slow agents as reviewers (P8), and the repair reply: fold in; edit only if it changes the answer.
+      mutex.withLock { getL(s.runId)?.let { cur -> putL(cur.copy(asks = cur.asks.map { a -> if (late.any { it.id == a.id }) a.copy(followedUp = true) else a })) } }
+      editorFold(s.runId, late, review = true)
+      return
+    }
     if (s.mode == RunMode.ALL) {
       mutex.withLock { getL(s.runId)?.let { cur -> putL(cur.copy(asks = cur.asks.map { a -> if (late.any { it.id == a.id }) a.copy(followedUp = true) else a }, phase = Phase.MERGING)) } }
       merge(s.runId)
@@ -926,10 +966,10 @@ class Juno(
       val name = roster.nameOf(a.agentId)
       val req = LlmRequest("late", Prompts.render("late_followup", mapOf("main" to roster.main.name)), listOf(
         Items.developer("Your earlier answer:\n${s.answer.orEmpty()}"),
-        Items.user("The user's message: ${s.userText}\n\n$name was asked: ${a.text}\n\n$name's late reply:\n${a.replyText}"),
+        Items.user("The user's message: ${s.userText}\n\n$name was asked: ${a.text}\n\n$name's late reply:\n${AskTail.strip(a.replyText)}"),
       ))
       val text = try { model(req).text.trim().ifEmpty { null } } catch (e: CancellationException) { throw e } catch (_: Exception) { null }
-        ?: "$name's answer is in: ${Views.preview(a.replyText)}"
+        ?: "$name's answer is in: ${Views.preview(AskTail.strip(a.replyText))}"
       mutex.withLock {
         val cur = getL(s.runId) ?: return
         putL(cur.copy(asks = cur.asks.map { if (it.id == a.id) it.copy(followedUp = true) else it }, followUps = cur.followUps + FollowUp(a.agentId, text, clock())))
@@ -940,7 +980,10 @@ class Juno(
 
   /** @all and challenge: Juno answers the question (or the challenge) itself, blind, with no tools. */
   private suspend fun answerAsMain(runId: String, ask: AskState) {
-    val req = LlmRequest("blind", Prompts.render("juno_blind", mapOf("main" to roster.main.name)), listOf(Items.user(ask.text)))
+    val editorFirst = ask.purpose == AskPurpose.BLIND && mutex.withLock { getL(runId)?.editor } != null
+    val prompt = if (editorFirst) Prompts.render("juno_first", mapOf("main" to roster.main.name, "userLine" to Prompts.userLine(userNameNow())))
+      else Prompts.render("juno_blind", mapOf("main" to roster.main.name))
+    val req = LlmRequest("blind", prompt, listOf(Items.user(ask.text)))
     val text = try { model(req).text.trim() } catch (e: CancellationException) { throw e } catch (_: Exception) { "" }
     mutex.withLock {
       val s = getL(runId) ?: return
@@ -949,12 +992,21 @@ class Juno(
       val events = mutableListOf<ScoreEvent>()
       val next = if (text.isEmpty()) settle(a, AskStatus.FAILED, now, events)
       else settle(a.copy(replies = listOf(ReplyPart("main-${a.id}", text, now)), lastReplyAt = now), AskStatus.ANSWERED, now, events)
-      putL(s.replaceAsk(next))
+      val e = s.editor
+      // Editor: Juno's own take is the answer within seconds, labelled, until the agents' answers edit it.
+      val first = if (editorFirst && e != null && text.isNotEmpty() && s.answer == null)
+        s.copy(answer = text, editor = e.copy(versions = listOf(AnswerVersion(1, text, Combine.FIRST_TAKE, now, FoldKind.FIRST)), caption = Combine.FIRST_TAKE,
+          v1At = now, folded = e.folded + a.id, calls = e.calls + 1))
+        else if (e != null) s.copy(editor = e.copy(calls = e.calls + 1, folded = e.folded + a.id)) else s
+      putL(first.replaceAsk(next))
+      trace.event(runId, "editor.first", if (first.answer != null && s.answer == null) "first take shown after ${(now - s.createdAt) / 1000}s" else "no first take", null)
     }
+    if (editorFirst) _updates.tryEmit(RunUpdate.Changed(runId))
   }
 
   private suspend fun merge(runId: String) {
     val s = mutex.withLock { getL(runId) } ?: return
+    if (s.editor != null && s.mode == RunMode.ALL && s.agreement?.disputed?.none { it.challenge == ChallengeState.ASKED } != false) { editorSettle(runId); return }
     val challenged = s.agreement?.disputed?.firstOrNull { it.challenge == ChallengeState.ASKED }
     val map0 = if (challenged != null) resolveChallenge(s, challenged) else compare(s)
     val map = if (challenged != null && map0.asked.isEmpty()) map0.copy(asked = s.agreement?.asked.orEmpty()) else map0
@@ -984,7 +1036,7 @@ class Juno(
       answers.groupBy { it.agentId }.forEach { (agent, asks) ->
         val who = if (agent == roster.main.id) "Your own first take (${roster.main.name}, written without the agents' context)" else roster.nameOf(agent)
         append("\n").append(who).append(":\n")
-        asks.forEach { append(it.replyText.trim()).append("\n") }
+        asks.forEach { append(AskTail.strip(it.replyText).trim()).append("\n") }
         asks.flatMap { it.claims }.takeIf { it.isNotEmpty() }?.let { append("Its claims (with confidence and sources):\n").append(Claims.lines(it)).append("\n") }
       }
       val c = Agreement.Clusters(map.agreed, map.disputed, map.unique)
@@ -1007,7 +1059,7 @@ class Juno(
     val peers = answers.filter { it.agentId != roster.main.id }.distinctBy { it.agentId }
     return buildString {
       map.verdict?.line?.let { append(it).append("\n\n") }
-      peers.forEach { a -> append("**").append(roster.nameOf(a.agentId)).append(":** ").append(Relay.trim(firstSentence(a.replyText), 220)).append("\n") }
+      peers.forEach { a -> append("**").append(roster.nameOf(a.agentId)).append(":** ").append(Relay.trim(firstSentence(AskTail.strip(a.replyText)), 220)).append("\n") }
       combinedQuestion(map)?.let { append("\n").append(it) }
     }.trim().ifEmpty { "Here's what came back. Tap Show every answer to read them." }
   }
@@ -1024,7 +1076,7 @@ class Juno(
 
   private suspend fun compare(s: RunState): AgreementMap {
     val answers = s.asks.filter { it.purpose == AskPurpose.BLIND && it.replies.isNotEmpty() }
-    return compareAnswers(s, answers.map { RawAnswer(it.agentId, roster.nameOf(it.agentId), it.replyText, it.uncertain, it.late) }, verdictCall = true)
+    return compareAnswers(s, answers.map { RawAnswer(it.agentId, roster.nameOf(it.agentId), AskTail.strip(it.replyText), it.uncertain, it.late) }, verdictCall = true)
   }
 
   /** Claims → clusters → verdict over [raw] (the blind answers, or in a talk each agent's latest position). */
@@ -1081,7 +1133,7 @@ class Juno(
         answered.forEach { a ->
           val label = labels.entries.first { it.value == a.agentId }.key
           val orig = d.sides.first { a.agentId in it.agentIds }.value
-          append("\nAgent ").append(label).append(" originally said: ").append(orig).append("\nIts reply: ").append(a.replyText.trim()).append("\n")
+          append("\nAgent ").append(label).append(" originally said: ").append(orig).append("\nIts reply: ").append(AskTail.strip(a.replyText).trim()).append("\n")
         }
       }
       try {
@@ -1125,6 +1177,300 @@ class Juno(
     }
     val answeredCount = s.asks.count { it.purpose == AskPurpose.BLIND && it.replies.isNotEmpty() }
     return withVerdict(map.copy(agreed = agreed, disputed = disputed), answeredCount, false)
+  }
+
+  // ============================================================== "Juno as editor" (collab plan)
+
+  /** Kush tapped something under the answer or replied: the answer is never edited again; late changes become a turn. */
+  suspend fun freeze(runId: String): Boolean = mutex.withLock {
+    val s = getL(runId) ?: return@withLock false
+    val e = s.editor ?: return@withLock false
+    if (e.frozen || s.answer == null) return@withLock false
+    putL(s.copy(editor = e.copy(frozenAt = clock())))
+    trace.event(runId, "editor.freeze", "v${e.versions.size}", null)
+    true
+  }
+
+  /** Kush's feedback on Juno's answer (♥, "One of them was better" + the agent). Logged, text-free. */
+  suspend fun signal(runId: String, kind: String, betterAgent: String? = null) {
+    scores.append(ScoreEvent.UserSignal(roster.main.id, clock(), runId, kind, betterAgent))
+    trace.event(runId, "feedback", kind + (betterAgent?.let { " ${roster.nameOf(it)}" } ?: ""), null)
+  }
+
+  /**
+   * An agent's answer (ask [fromAskId]) @mentioned [toAgentId]: relay [question] to it, no tap (Kush, 2026-11-16), inside
+   * caps: [JunoConfig.mentionRelaysPerRun] per run, [JunoConfig.mentionRelaysPerAgent] per target, [JunoConfig.mentionMaxDepth]
+   * hops, never to Juno, a paused agent, the asker itself, or an agent already working on this run. Anything that reads as
+   * buy / book / pay / go-ahead stays a button (the send gate, unchanged). Returns whether it went out.
+   */
+  suspend fun relayMention(fromAskId: String, toAgentId: String, question: String): Boolean {
+    val runId = runIdOf(fromAskId)
+    val made = mutex.withLock {
+      val s = getL(runId) ?: return@withLock false
+      val from = s.ask(fromAskId) ?: return@withLock false
+      val to = roster.byId(toAgentId) ?: return@withLock false
+      val relays = s.asks.filter { it.purpose == AskPurpose.MENTION }
+      val q = question.trim()
+      val why = when {
+        to.kind == AgentKind.MAIN || to.paused || peerFor(to.id) == null -> "unreachable"
+        to.id == from.agentId -> "self"
+        q.isEmpty() -> "empty"
+        SendGate.relayHit(q, userNameNow()) != null -> "action_words"
+        relays.size >= config.mentionRelaysPerRun -> "run_cap"
+        relays.count { it.agentId == to.id } >= config.mentionRelaysPerAgent -> "agent_cap"
+        from.mentionDepth >= config.mentionMaxDepth -> "depth_cap"
+        s.asks.any { it.agentId == to.id && !it.status.settled } -> "busy_in_run"
+        relays.any { it.mentionFrom == from.agentId && it.agentId == to.id } -> "duplicate"
+        else -> null
+      }
+      if (why != null) { trace.event(runId, "mention.skip", "${roster.nameOf(from.agentId)} -> ${to.name}: $why", null); return@withLock false }
+      val text = Prompts.render("mention_ask", mapOf("from" to roster.nameOf(from.agentId), "question" to q, "user" to userNameNow().ifBlank { "the user" }))
+      val busy = busyAgentsL()
+      val st = if (to.kind == AgentKind.TEXT && to.id in busy) AskStatus.QUEUED else AskStatus.SENDING
+      val a = AskState("$runId~a${s.asks.size}", to.id, text, AskPurpose.MENTION, status = st, createdAt = clock(),
+        mentionDepth = from.mentionDepth + 1, mentionFrom = from.agentId)
+      putL(s.copy(asks = s.asks + a))
+      trace.event(runId, "mention.relay", "${roster.nameOf(from.agentId)} -> ${to.name} (hop ${a.mentionDepth})", q)
+      true
+    }
+    if (made) { flushSends(runId); _updates.tryEmit(RunUpdate.Changed(runId)) }
+    return made
+  }
+
+  /** Measured median reply time per agent: the score log (4 weeks), else this run's own first reply. */
+  private suspend fun latencyMedians(s: RunState?): Map<String, Long?> {
+    val now = clock()
+    val window = Scoreboard.WEEK_MS * 4
+    val hist = try { Scoreboard.compute(scores.since(now - window), now, window).associate { it.agentId to it.medianReplyMs } } catch (e: CancellationException) { throw e } catch (_: Exception) { emptyMap() }
+    val run = s?.asks.orEmpty().filter { it.replies.isNotEmpty() && it.sentAt != null && it.agentId != roster.main.id }
+      .associate { it.agentId to (it.replies.first().at - it.sentAt!!).coerceAtLeast(0) }
+    return (hist.keys + run.keys).associateWith { hist[it] ?: run[it] }
+  }
+
+  /** Answered blind asks not folded into the answer yet (Juno's own first take is folded when it is shown). */
+  private fun editorFresh(s: RunState): List<AskState> {
+    val e = s.editor ?: return emptyList()
+    return s.asks.filter { it.id !in e.folded && it.replies.isNotEmpty() && it.status == AskStatus.ANSWERED && it.agentId != roster.main.id &&
+      (it.purpose == AskPurpose.BLIND || it.purpose == AskPurpose.REPAIR || it.purpose == AskPurpose.MENTION) }
+  }
+
+  private fun tailsOf(s: RunState): List<SourcedTail> = s.asks
+    .filter { it.replies.isNotEmpty() && it.agentId != roster.main.id && it.purpose in setOf(AskPurpose.BLIND, AskPurpose.REPAIR, AskPurpose.MENTION) }
+    .map { SourcedTail(it.agentId, AskTail.parse(it.replyText).tail, it.purpose == AskPurpose.BLIND) }
+
+  private fun blindRaw(s: RunState): List<RawAnswer> = s.asks.filter { it.purpose == AskPurpose.BLIND && it.replies.isNotEmpty() }
+    .map { RawAnswer(it.agentId, roster.nameOf(it.agentId), AskTail.strip(it.replyText), it.uncertain, it.late) }
+
+  /** A model call that never fails the run: null on any error. */
+  private suspend fun quiet(req: LlmRequest): String? =
+    try { model(req).text.trim().ifEmpty { null } } catch (e: CancellationException) { throw e } catch (_: Exception) { null }
+
+  /**
+   * Fold [arrivals] into the answer: compare the blind answers (claims call), build the claims table, and unless every
+   * arrival only agrees (a ✓ on its avatar, no edit), one editor call writes the new answer and its caption. After
+   * Kush acted ([EditorState.frozen]) a fix or change becomes a new short turn instead; anything else is a ✓.
+   */
+  private suspend fun editorFold(runId: String, arrivals: List<AskState>, review: Boolean = false, conflict: Conflict? = null) {
+    val s = mutex.withLock { getL(runId) } ?: return
+    val e = s.editor ?: return
+    val main = roster.main.id
+    val raw = blindRaw(s)
+    val blindIds = arrivals.filter { it.purpose == AskPurpose.BLIND }
+    var calls = 0
+    val map = if (raw.size >= 2 && (blindIds.isNotEmpty() || s.agreement?.status != MapStatus.READY)) { calls++; compareAnswers(s, raw, verdictCall = false) }
+      else s.agreement ?: Views.collecting(s, roster)
+    val table = ClaimsTables.build(map, tailsOf(s))
+    val agreeOnly = if (conflict != null) emptyList() else arrivals.filter { it.purpose == AskPurpose.BLIND && table.onlyAgrees(it.agentId) }
+    val adding = arrivals - agreeOnly.toSet()
+    val names = adding.map { roster.nameOf(it.agentId) }.distinct()
+    var result: FoldResult? = null
+    var usedFallback = false
+    if (adding.isNotEmpty() || conflict != null || s.answer == null) {
+      calls++
+      val input = buildString {
+        append("Question: ").append(s.userText).append("\n\nYour current answer:\n").append(s.answer ?: "(none yet)").append("\n\n")
+        append("Claims table:\n").append(table.lines(roster::nameOf, main).ifEmpty { "(nothing to compare yet)" }).append("\n")
+        if (adding.isNotEmpty()) {
+          append("\nJust arrived:\n")
+          adding.forEach { a ->
+            val p = AskTail.parse(a.replyText)
+            val how = when (a.purpose) {
+              AskPurpose.REPAIR -> "after a cross-check, not independent"
+              AskPurpose.MENTION -> "answering ${a.mentionFrom?.let(roster::nameOf) ?: "another agent"}'s question, not independent"
+              else -> if (a.background || review) "on its own, late: a review" else "on its own, before seeing others"
+            }
+            append(roster.nameOf(a.agentId)).append(" (").append(how).append("):\n").append(p.body).append("\n")
+            p.tail.angle?.let { append("Its angle: ").append(it).append("\n") }
+            p.tail.cantSee?.let { append("It can't see: ").append(it).append("\n") }
+            p.tail.next?.let { append("It could do next: ").append(it).append("\n") }
+          }
+        }
+        if (conflict != null) append("\nCross-check: ").append(roster.nameOf(conflict.answerAgent)).append("'s answer conflicts with something ")
+          .append(roster.nameOf(conflict.factAgent)).append(" knows about the user: ").append(conflict.fact).append(" (").append(conflict.problem).append("). Fix the answer for it.\n")
+        if (e.frozen) append("\nThe user already acted on your answer. Only a fix or a change will be shown, as a short new message.\n")
+      }
+      val out = quiet(LlmRequest("fold", Prompts.render("juno_fold", mapOf("main" to roster.main.name, "userLine" to Prompts.userLine(userNameNow()))),
+        listOf(Items.user(input)), jsonSchema = Fold.schema, schemaName = "fold"))
+      result = out?.let { Fold.parse(it, s.answer) }
+      if (result == null) {
+        usedFallback = true
+        val fb = Combine.fallback(table, roster::nameOf, main, s.answer)
+        result = if (fb.isBlank() || fb == s.answer) null else FoldResult(if (s.answer == null) FoldKind.ADD else FoldKind.ADD, fb, null)
+      }
+    }
+    val now = clock()
+    val notes = mutableListOf<RunUpdate>()
+    mutex.withLock {
+      val cur = getL(runId) ?: return
+      val ce = cur.editor ?: return
+      var answer = cur.answer
+      var followUps = cur.followUps
+      var versions = ce.versions
+      var caption = ce.caption
+      var reviews = ce.reviews
+      val r = result
+      val kind = r?.kind ?: FoldKind.NONE
+      val who = (if (conflict != null) listOf(conflict.answerAgent, conflict.factAgent) else adding.map { it.agentId }).distinct()
+      if (r != null && kind != FoldKind.NONE) {
+        if (ce.frozen) {
+          if (kind == FoldKind.FIX || kind == FoldKind.CHANGE) {
+            val lead = "**${Views.names(names.ifEmpty { who.map(roster::nameOf) })}'s late reply changes this.** "
+            val text = lead + r.answer.removePrefix("Changed:").trim()
+            followUps = followUps + FollowUp(adding.firstOrNull()?.agentId ?: who.first(), text, now)
+            notes += RunUpdate.FollowUpPosted(runId, adding.firstOrNull()?.agentId ?: who.first(), text)
+          }
+        } else {
+          answer = r.answer
+          caption = if (conflict != null && r.caption == null) "Updated · fixed for something ${roster.nameOf(conflict.factAgent)} knew"
+            else Combine.caption(names.ifEmpty { who.map(roster::nameOf) }, r.caption)
+          versions = versions + AnswerVersion(versions.size + 1, r.answer, caption, now, kind, who)
+        }
+      }
+      if (review || arrivals.any { it.background }) {
+        reviews = reviews + arrivals.filter { it.purpose == AskPurpose.BLIND }.map { a ->
+          Review(a.agentId, a.id, if (a in agreeOnly) FoldKind.NONE else kind, now, asTurn = ce.frozen && (kind == FoldKind.FIX || kind == FoldKind.CHANGE))
+        }
+      }
+      val next = ce.copy(
+        versions = versions, caption = caption, folded = (ce.folded + arrivals.map { it.id }).distinct(),
+        agreedOnly = (ce.agreedOnly + agreeOnly.map { it.agentId }).distinct(), table = table, reviews = reviews, calls = ce.calls + calls,
+      )
+      var st = cur.copy(answer = answer, followUps = followUps, agreement = map, editor = next,
+        fallback = cur.fallback || (usedFallback && answer != null && versions.lastOrNull()?.text == answer))
+      if (st.phase == Phase.DONE) st = withSurplusL(st)
+      putL(st)
+      trace.event(runId, "editor.fold", "arrivals=" + arrivals.joinToString { roster.nameOf(it.agentId) } + " agreeOnly=${agreeOnly.size} kind=$kind frozen=${ce.frozen}" +
+        (if (usedFallback) " fallback" else "") + " v${versions.size}", null)
+    }
+    notes.forEach { _updates.tryEmit(it) }
+    _updates.tryEmit(RunUpdate.Changed(runId))
+  }
+
+  /** Recompute the surplus record; log it when it changed (agent ids only). */
+  private suspend fun withSurplusL(s: RunState): RunState {
+    val e = s.editor ?: return s
+    val parts = Surplus.of(s, roster.main.id)
+    if (parts == e.surplus) return s
+    scores.append(ScoreEvent.Surplus(roster.main.id, clock(), s.runId, parts))
+    return s.copy(editor = e.copy(surplus = parts))
+  }
+
+  /**
+   * The fast answers are in (or the wait ended): fold what's left, cross-check answers against the other agents' memory
+   * facts (P1, one repair ask at most), turn a real split into Your call (P3/P4), record the surplus, and finish. Slow
+   * agents still out fold in later as reviews.
+   */
+  private suspend fun editorSettle(runId: String) {
+    val s0 = mutex.withLock { getL(runId) } ?: return
+    val fresh = editorFresh(s0)
+    if (fresh.isNotEmpty() || s0.answer == null) editorFold(runId, fresh)
+
+    // P1 cross-check: every answer against every memory fact another agent gave.
+    var s = mutex.withLock { getL(runId) } ?: return
+    var conflict: Conflict? = null
+    if (s.editor?.crossChecked == false) {
+      val answers = s.asks.filter { it.purpose == AskPurpose.BLIND && it.replies.isNotEmpty() && it.agentId != roster.main.id }
+        .map { it.agentId to AskTail.strip(it.replyText) }
+      val facts = tailsOf(s).filter { it.blind }.flatMap { t -> t.tail.facts.map { t.agentId to it } }
+      val input = CrossCheck.input(s.userText, answers, facts)
+      if (input != null) {
+        conflict = quiet(LlmRequest("cross_check", Prompts.render("cross_check"), listOf(Items.user(input.text)), jsonSchema = CrossCheck.schema, schemaName = "conflicts"))
+          ?.let { CrossCheck.parse(it, input) }
+      }
+      mutex.withLock { getL(runId)?.let { cur -> putL(cur.copy(editor = cur.editor?.copy(crossChecked = true, conflict = conflict, calls = (cur.editor.calls) + if (input != null) 1 else 0))) } }
+      trace.event(runId, "editor.cross_check", if (input == null) "nothing to check" else conflict?.let { "${roster.nameOf(it.answerAgent)} vs a fact from ${roster.nameOf(it.factAgent)}" } ?: "no conflict", null)
+    }
+    if (conflict != null) {
+      // Juno fixes the answer itself now (the tap never blocks it), then asks one fast agent to repair its pick.
+      editorFold(runId, emptyList(), conflict = conflict)
+      createRepairAsk(runId, conflict)
+    }
+
+    // Your call: a real split becomes one deciding question or an if/then rule. Replaces the automatic talk.
+    s = mutex.withLock { getL(runId) } ?: return
+    val d = s.editor?.table?.disputes?.firstOrNull()
+    var call: YourCall? = null
+    if (d != null && s.editor?.yourCall == null) {
+      val out = quiet(LlmRequest("crux", Prompts.render("crux"), listOf(Items.user(Crux.input(s.userText, d, roster::nameOf))), jsonSchema = Crux.schema, schemaName = "crux"))
+      call = Crux.decide(out, d)
+      trace.event(runId, "editor.your_call", call?.kind?.name?.lowercase() ?: "none", null)
+    }
+
+    val summary = mutex.withLock {
+      val cur = getL(runId) ?: return
+      val ce = cur.editor ?: return
+      val now = clock()
+      var st = cur.copy(phase = Phase.DONE, answeredAt = cur.answeredAt ?: now,
+        answer = cur.answer ?: Combine.fallback(ce.table ?: ClaimsTable(), roster::nameOf, roster.main.id, null).ifBlank { "I couldn't get answers in time. Want me to ask again?" },
+        editor = ce.copy(settledAt = ce.settledAt ?: now, yourCall = ce.yourCall ?: call, calls = ce.calls + if (d != null && ce.yourCall == null) 1 else 0))
+      st = withSurplusL(st)
+      val sum = if (st.editor!!.summaryLogged) null else RunSummary.of(st, roster.main.id)
+      if (sum != null) st = st.copy(editor = st.editor!!.copy(summaryLogged = true))
+      putL(st)
+      sum
+    }
+    flushSends(runId)
+    mutex.withLock { getL(runId) }?.agreement?.let { _updates.tryEmit(RunUpdate.MapUpdated(runId, it)) }
+    s = mutex.withLock { getL(runId) } ?: return
+    s.answer?.let { _updates.tryEmit(RunUpdate.Answer(runId, it)) }
+    summary?.let { _updates.tryEmit(RunUpdate.Summary(runId, it)) }
+  }
+
+  /**
+   * The one repair ask (P1) to a fast agent, chosen by measured reply time. It carries the fact (and the pick, when the
+   * fast agent isn't its author); an agent the user set to "ask before sharing" needs the share tap first.
+   */
+  private suspend fun createRepairAsk(runId: String, c: Conflict) {
+    val s0 = mutex.withLock { getL(runId) } ?: return
+    if (s0.editor?.repairAskId != null) return
+    val medians = latencyMedians(s0)
+    val notes = mutableListOf<RunUpdate>()
+    mutex.withLock {
+      val s = getL(runId) ?: return
+      val e = s.editor ?: return
+      val candidates = s.asks.filter { it.purpose == AskPurpose.BLIND && it.replies.isNotEmpty() && it.agentId != roster.main.id }
+        .map { it.agentId }.distinct().filter { a -> roster.byId(a)?.paused == false && peerFor(a) != null && s.asks.none { it.agentId == a && !it.status.settled } }
+      val target = Repair.pick(c.answerAgent, candidates, medians, config.fastMs)
+      if (target == null) { trace.event(runId, "editor.repair", "no fast agent free; Juno adjusted the answer itself", null); return }
+      val pick = s.asks.lastOrNull { it.agentId == c.answerAgent && it.purpose == AskPurpose.BLIND }?.let { AskTail.strip(it.replyText) }.orEmpty()
+      val yours = if (target == c.answerAgent) "Your answer: ${Relay.trim(pick, 400)}" else "One suggestion so far: ${Relay.trim(pick, 400)}"
+      val text = Prompts.render("repair_ask", mapOf("question" to s.userText.trim(), "yours" to yours, "fact" to c.fact.trim(), "user" to userNameNow().ifBlank { "the user" }))
+      val shareFrom = listOf(c.factAgent, c.answerAgent).distinct().filter { it != target && roster.byId(it)?.sensitive == true }
+      val busy = busyAgentsL()
+      val status = when {
+        shareFrom.isNotEmpty() -> AskStatus.AWAITING_APPROVAL
+        roster.byId(target)?.kind == AgentKind.TEXT && target in busy -> AskStatus.QUEUED
+        else -> AskStatus.SENDING
+      }
+      val a = AskState("$runId~a${s.asks.size}", target, text, AskPurpose.REPAIR, status = status, createdAt = clock(), shareFrom = shareFrom, why = "cross-check")
+      putL(s.copy(asks = s.asks + a, editor = e.copy(repairAskId = a.id)))
+      trace.event(runId, "editor.repair", "to ${roster.nameOf(target)}" + if (shareFrom.isNotEmpty()) " (share tap for ${shareFrom.joinToString { roster.nameOf(it) }})" else "", null)
+      if (status == AskStatus.AWAITING_APPROVAL) {
+        scores.append(ScoreEvent.NeededUser(target, clock(), a.id, "approval"))
+        notes += RunUpdate.NeedsUser(runId, NeedsUserLine(NeedsUserKind.APPROVE, Views.approvalLine(a, roster::nameOf), target, a.id, null, text))
+      }
+    }
+    notes.forEach { _updates.tryEmit(it) }
   }
 
   // ============================================================== "Talk it over" (room mode)
@@ -1234,7 +1580,7 @@ class Juno(
       val covered = room.entries.filter { it.askId == a.id }.maxOfOrNull { it.parts } ?: 0
       val parts = a.replies
       if (parts.size <= covered) continue
-      val text = parts.drop(covered).joinToString("\n") { it.text }.trim()
+      val text = AskTail.strip(parts.drop(covered).joinToString("\n") { it.text }.trim())
       if (text.isEmpty()) continue
       val round = a.roomRound ?: 0
       val mentions = if (a.agentId == roster.main.id) emptyList() else Relay.mentions(text, a.agentId, roster)
@@ -1660,6 +2006,8 @@ class Juno(
     AskPurpose.TASK -> listOf(Segment(a.text, if (a.approved) Provenance.USER_APPROVED else Provenance.JUNO_REWRITE))
     AskPurpose.CHALLENGE -> listOf(Segment(a.text, Provenance.PEER_RELAY))
     AskPurpose.ROOM -> listOf(Segment(a.text, Provenance.ATALL)) + a.quoted.map { Segment(it, if (a.approved) Provenance.USER_APPROVED else Provenance.PEER_RELAY) }
+    // Repair and mention relays carry other agents' words: checked as relayed text (no buy / book / go-ahead).
+    AskPurpose.REPAIR, AskPurpose.MENTION -> listOf(Segment(a.text, Provenance.PEER_RELAY))
   }
 
   private fun userNameNow(): String = runCatching { userName() }.getOrDefault("")
