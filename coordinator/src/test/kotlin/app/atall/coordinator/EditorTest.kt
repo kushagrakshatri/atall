@@ -89,10 +89,11 @@ class EditorTest {
     assertTrue(lines.contains("Hark and Grok, not independent"), lines)
     assertTrue(lines.contains("Scout and Nova, each on its own: confirmed"), lines)
 
-    // Without the model: lead with what only one agent knew, then the split, then one line of overlap.
+    // Without the model: what only one agent knew, then one line of overlap, each line credited (a tile in the card),
+    // never "Only Nova knew" or "They agree".
     val fb = Combine.fallback(t, { names.getValue(it) }, "juno", null)
-    assertTrue(fb.startsWith("Only Nova knew: Kush doesn't eat pork; Mission Peak."), fb)
-    assertTrue(fb.lines().last().startsWith("They agree: Saturday is best"), fb)
+    assertEquals("Kush doesn't eat pork; Mission Peak. {Nova}\nSaturday is best. {Scout, Nova}", fb)
+    assertFalse(AnswerWords.leaks(fb), fb)
   }
 
   @Test fun repairGoesToAFastAgentByMeasuredLatency() {
@@ -197,7 +198,7 @@ class EditorTest {
     assertTrue(crossInput.contains("F1 (from the author of answer B): Kush is busy Sunday afternoon (calendar)"), crossInput)
     assertEquals(Conflict("scout", "nova", "Kush is busy Sunday afternoon (calendar)", "Sunday afternoon is busy"), e.conflict)
     assertTrue(foldInputs[1].contains("Cross-check: Scout's answer conflicts with something Nova knows"), foldInputs[1])
-    assertTrue(done.view.answer!!.startsWith("**Saturday morning at Mission Peak.** Only Nova knew"))
+    assertTrue(done.view.answer!!.startsWith("**Saturday morning at Mission Peak.** You're busy Sunday afternoon"), done.view.answer)
     assertTrue(done.view.caption!!.startsWith("Updated · "))
     // One repair ask, to Scout (fast by measured reply time), carrying only the fact; no share tap by default.
     val repair = st.asks.single { it.purpose == AskPurpose.REPAIR }
@@ -208,6 +209,13 @@ class EditorTest {
     assertEquals(CallKind.CONDITIONAL, e.yourCall!!.kind)
     assertEquals("If Sunday afternoon frees up: Sunday hike\nIf you're busy Sunday: Saturday at Mission Peak", e.yourCall!!.text)
     assertNull(st.room)
+    // The card: a real split, so one disagreement line (an agent on a side of it) that opens the Your call sheet.
+    val card = done.view.card!!
+    assertNotNull(card.dissent)
+    assertTrue(st.editor!!.table!!.disputes.single().sides.any { card.dissent!!.agentId in it.agentIds })
+    assertEquals(listOf("If Sunday afternoon frees up", "If you're busy Sunday"), card.sheet!!.options.map { it.condition })
+    assertEquals(listOf("Sunday hike", "Saturday at Mission Peak"), card.sheet!!.options.map { it.pick })
+    assertFalse(card.thinking)
 
     // The repair lands after the run settled: folded in place (not frozen), caption updated.
     advanceTimeBy(30_000); runCurrent(); r.juno.sweep()
@@ -229,7 +237,7 @@ class EditorTest {
     assertEquals("true", extras["conflict"])
   }
 
-  @Test fun frozenAnswerTurnsALateChangeIntoANewTurnAndSlowAgentsAreReviewers() = runTest {
+  @Test fun aLateChangeEditsTheAnswerInPlaceEvenAfterKushActedAndSlowAgentsAreReviewers() = runTest {
     val r = Rig(this, JunoConfig(editor = true, allWaitMs = 60_000))
     // Nova is measured slow (two hours): asked in the background, never waited on.
     r.scores.append(ScoreEvent.FirstReply("nova", 0, "old~a1", 2 * 3_600_000L, Certainty.HIGH, false))
@@ -250,11 +258,15 @@ class EditorTest {
     r.nova.replyNow(r.juno.state(runId)!!.asks.single { it.agentId == "nova" }.id, "Saturday: Sunday is taken.\nFrom memory: Kush has a family lunch Sunday", late = true)
     advanceTimeBy(21_000); r.juno.sweep()
     val st = r.juno.state(runId)!!
-    // Never edited after Kush acted: the change is one short new turn.
-    assertEquals("**Sunday.**", st.answer)
-    assertEquals("**Nova's late reply changes this.** **Saturday.** Nova knew Sunday is taken.", st.followUps.single().text)
+    // The answer card design (C): a late change edits the answer in place, no new message, and none of the system
+    // words ("Changed:", "Nova knew") reach it. The card highlights against the answer before it.
+    assertEquals("**Saturday.** Sunday is taken.", st.answer)
+    assertTrue(st.followUps.isEmpty())
     assertEquals(FoldKind.CHANGE, st.editor!!.reviews.single().kind)
-    assertTrue(st.editor!!.reviews.single().asTurn)
+    assertFalse(st.editor!!.reviews.single().asTurn)
+    val card = Views.build(st, r.roster, 0, JunoConfig(editor = true)).card!!
+    assertEquals("**Sunday.**", card.previous)
+    assertNotNull(card.changedAt)
     assertEquals(PresenceState.IN, Views.presence(st, r.roster, 0)!!.agents.single { it.agentId == "nova" }.state)
   }
 

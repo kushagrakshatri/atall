@@ -1,0 +1,5 @@
+<!-- Hark mark, traced from design-system/mocks/answer-card/src/logos/hark.png. Tinted ink at runtime. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
+    <path android:fillColor="#FF000000" android:pathData="M17.700,20.946 L17.564,20.925 L15.906,18.975 L14.064,17.250 L12.450,16.017 L10.650,14.889 L8.925,14.005 L6.825,13.171 L4.425,12.500 L1.875,12.100 L1.800,12.068 L1.772,11.925 L1.950,11.840 L4.500,11.433 L6.450,10.904 L8.625,10.079 L10.725,9.020 L12.600,7.829 L14.400,6.411 L15.861,5.025 L17.520,3.075 L17.700,2.972 L18.750,3.867 L19.605,4.800 L20.421,5.925 L21.009,6.975 L21.546,8.250 L21.850,9.300 L22.075,10.500 L22.159,11.700 L22.146,12.675 L21.916,14.325 L21.684,15.225 L21.178,16.575 L20.728,17.475 L19.830,18.825 L18.675,20.110 L17.700,20.946Z" />
+</vector>

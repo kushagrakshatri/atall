@@ -123,18 +123,17 @@ object Combine {
    * overlap in one line. Never longer than four short lines.
    */
   fun fallback(table: ClaimsTable, names: (String) -> String, main: String, firstTake: String?): String {
-    val lines = mutableListOf<String>()
+    // Each line credits its agent with a marker (a logo tile in the card); no "Only X knew", no "They agree".
+    val extra = mutableListOf<String>()
     table.onlyOne(main).groupBy { it.sources[0] }.entries.take(2).forEach { (agent, rows) ->
-      lines += "Only ${names(agent)} knew: " + rows.take(2).joinToString("; ") { it.text.trim().trimEnd('.') } + "."
-    }
-    table.disputes.firstOrNull()?.let { d ->
-      val who = Views.names(d.sides.flatMap { it.agentIds }.distinct().map(names))
-      lines += "$who split on ${d.topic}: " + d.sides.take(2).joinToString(" vs ") { it.value } + "."
+      extra += rows.take(2).joinToString("; ") { it.text.trim().trimEnd('.') }.replaceFirstChar { it.uppercaseChar() } + "." + Credits.mark(listOf(names(agent)))
     }
     val conf = table.confirmed()
-    if (conf.isNotEmpty()) lines += "They agree: ${conf[0].text.trim().trimEnd('.')}" + (if (conf.size > 1) ", and ${conf.size - 1} more." else ".")
-    if (lines.isEmpty()) return firstTake?.trim().orEmpty()
-    return lines.joinToString("\n")
+    if (conf.isNotEmpty()) extra += conf[0].text.trim().trimEnd('.').replaceFirstChar { it.uppercaseChar() } + "." +
+      Credits.mark(conf[0].sources.distinct().filter { it != main }.map(names))
+    if (extra.isEmpty()) return firstTake?.trim().orEmpty()
+    val lead = firstTake?.trim()?.lines()?.firstOrNull { it.isNotBlank() }?.trim()
+    return (listOfNotNull(lead) + extra).take(Cards.MAX_LINES).joinToString("\n")
   }
 
   /** "Updated · Hark knew you're busy Saturday". Blank model captions become "{Agent} added to this". */
@@ -154,26 +153,42 @@ enum class FoldKind { FIRST, NONE, ADD, FIX, CHANGE }
 @Serializable
 data class AnswerVersion(val n: Int, val text: String, val caption: String?, val at: Long, val kind: FoldKind, val agents: List<String> = emptyList())
 
-data class FoldResult(val kind: FoldKind, val answer: String, val caption: String?)
+data class FoldResult(
+  val kind: FoldKind,
+  val answer: String,
+  val caption: String?,
+  /** An agent that still sees it differently, by name, and its view in one line; null when nobody really dissents. */
+  val dissentAgent: String? = null,
+  val dissent: String? = null,
+  /** Up to two next steps for the chips under the answer. */
+  val actions: List<String> = emptyList(),
+)
 
 object Fold {
   val schema: JsonObject = Schema.obj(
     "kind" to Schema.string("What the new answers change", listOf("none", "add", "fix", "change")),
     "answer" to Schema.string("The full answer the user reads now"),
     "caption" to Schema.string("At most 6 words on what changed, starting with the agent's name; empty when kind is none"),
+    "dissent_agent" to Schema.string("The agent whose answer still points another way than yours, by name; empty when nobody really disagrees"),
+    "dissent" to Schema.string("That agent's view in one short line, under 14 words, in plain words; empty when dissent_agent is empty"),
+    "actions" to Schema.stringArray("Zero to two next steps the user could tap, 1-4 words each, most useful first"),
   )
 
-  fun parse(raw: String, current: String?): FoldResult? {
+  fun parse(raw: String, current: String?, names: Collection<String> = emptyList()): FoldResult? {
     val o = parseJsonObject(raw)
     if (o == null) {
       // Plain text instead of JSON: take it as the new answer.
       val t = raw.trim().takeIf { it.isNotEmpty() && !it.startsWith("{") } ?: return null
-      return FoldResult(FoldKind.ADD, t, null)
+      return FoldResult(FoldKind.ADD, AnswerWords.clean(t, names), null)
     }
     val kind = when (o.str("kind")?.trim()?.lowercase()) { "none" -> FoldKind.NONE; "fix" -> FoldKind.FIX; "change" -> FoldKind.CHANGE; else -> FoldKind.ADD }
-    val answer = o.str("answer")?.trim().orEmpty().ifEmpty { current.orEmpty() }
+    val answer = o.str("answer")?.trim().orEmpty().let { if (it.isEmpty()) it else AnswerWords.clean(it, names) }.ifEmpty { current.orEmpty() }
     if (answer.isEmpty()) return null
-    return FoldResult(if (kind != FoldKind.NONE && answer == current) FoldKind.NONE else kind, answer, o.str("caption")?.trim()?.ifEmpty { null })
+    val dAgent = o.str("dissent_agent")?.trim()?.removePrefix("@")?.ifEmpty { null }
+    val dLine = o.str("dissent")?.trim()?.let { AnswerWords.clean(it, names) }?.ifEmpty { null }
+    val actions = o.strings("actions").map { it.trim().trimEnd('.') }.filter { it.isNotEmpty() && it.length <= 40 && !AnswerWords.leaks(it) }.distinct().take(2)
+    return FoldResult(if (kind != FoldKind.NONE && answer == current) FoldKind.NONE else kind, answer, o.str("caption")?.trim()?.ifEmpty { null },
+      dAgent?.takeIf { dLine != null }, dLine?.takeIf { dAgent != null }, actions)
   }
 }
 
@@ -417,6 +432,10 @@ data class EditorState(
   val calls: Int = 0,
   val v1At: Long? = null,
   val summaryLogged: Boolean = false,
+  /** The one disagreement line under the answer (only shown when it is real, see [Cards.real]). */
+  val dissent: DissentNote? = null,
+  /** Up to two next steps under the answer (chips). */
+  val actions: List<String> = emptyList(),
 ) {
   val frozen: Boolean get() = frozenAt != null
 }

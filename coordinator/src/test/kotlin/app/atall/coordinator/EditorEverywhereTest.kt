@@ -114,7 +114,8 @@ class EditorEverywhereTest {
     assertEquals("where should we eat Friday?", r.nova.sent.single().second)
     assertIs<DriveResult.Done>(d.await())
     v = r.juno.view(runId)!!
-    assertEquals("Changed: **Rooh at 7.** Only Nova knew you're vegetarian this month.", v.answer)
+    // The system words ("Changed:", "Only Nova knew") never reach the answer Kush reads.
+    assertEquals("**Rooh at 7.** You're vegetarian this month.", v.answer)
     assertEquals("Updated · Nova knew you're vegetarian", v.caption)
   }
 

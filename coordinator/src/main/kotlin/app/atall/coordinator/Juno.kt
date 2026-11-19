@@ -1026,6 +1026,7 @@ class Juno(
       else Prompts.render("juno_blind", mapOf("main" to roster.main.name))
     val req = LlmRequest("blind", prompt, listOf(Items.user(ask.text)))
     val text = try { model(req).text.trim() } catch (e: CancellationException) { throw e } catch (_: Exception) { "" }
+      .let { if (editorFirst && it.isNotEmpty()) AnswerWords.clean(it, roster.activePeers.map { p -> p.name }) else it }
     mutex.withLock {
       val s = getL(runId) ?: return
       val a = s.ask(ask.id) ?: return
@@ -1108,7 +1109,7 @@ class Juno(
         events += ScoreEvent.NeededUser(g.agentId, now, g.id, "approval")
         notes += RunUpdate.NeedsUser(runId, NeedsUserLine(NeedsUserKind.APPROVE, Views.approvalLine(g, roster::nameOf), g.agentId, g.id, null, g.text))
       }
-      val text = pick?.answer?.trim().orEmpty()
+      val text = pick?.answer?.trim().orEmpty().let { if (it.isEmpty()) it else AnswerWords.clean(it, roster.activePeers.map { p -> p.name }) }
       val main = if (text.isEmpty()) settle(a, AskStatus.FAILED, now, events)
         else settle(a.copy(replies = listOf(ReplyPart("main-${a.id}", text, now)), lastReplyAt = now), AskStatus.ANSWERED, now, events)
       // Nobody asked: the answer stands on its own, with no "first take" caption.
@@ -1469,7 +1470,7 @@ class Juno(
       }
       val out = quiet(LlmRequest("fold", Prompts.render("juno_fold", mapOf("main" to roster.main.name, "userLine" to Prompts.userLine(userNameNow()))),
         listOf(Items.user(input)), jsonSchema = Fold.schema, schemaName = "fold"))
-      result = out?.let { Fold.parse(it, s.answer) }
+      result = out?.let { Fold.parse(it, s.answer, roster.activePeers.map { p -> p.name }) }
       if (result == null) {
         usedFallback = true
         val fb = Combine.fallback(table, roster::nameOf, main, s.answer)
@@ -1489,29 +1490,33 @@ class Juno(
       val r = result
       val kind = r?.kind ?: FoldKind.NONE
       val who = (if (conflict != null) listOf(conflict.answerAgent, conflict.factAgent) else adding.map { it.agentId }).distinct()
-      if (r != null && kind != FoldKind.NONE) {
-        if (ce.frozen) {
-          if (kind == FoldKind.FIX || kind == FoldKind.CHANGE) {
-            val lead = "**${Views.names(names.ifEmpty { who.map(roster::nameOf) })}'s late reply changes this.** "
-            val text = lead + r.answer.removePrefix("Changed:").trim()
-            followUps = followUps + FollowUp(adding.firstOrNull()?.agentId ?: who.first(), text, now)
-            notes += RunUpdate.FollowUpPosted(runId, adding.firstOrNull()?.agentId ?: who.first(), text)
-          }
-        } else {
-          answer = r.answer
-          caption = if (conflict != null && r.caption == null) "Updated · fixed for something ${roster.nameOf(conflict.factAgent)} knew"
-            else Combine.caption(names.ifEmpty { who.map(roster::nameOf) }, r.caption)
-          versions = versions + AnswerVersion(versions.size + 1, r.answer, caption, now, kind, who)
-        }
+      var dissent = ce.dissent
+      var actions = ce.actions
+      // Late changes edit the answer in place (the card highlights what changed and says "Changed just now"), even
+      // after Kush acted on it: no new message. After he acted, only a fix or a change is worth an edit.
+      val edit = r != null && kind != FoldKind.NONE && (!ce.frozen || kind == FoldKind.FIX || kind == FoldKind.CHANGE)
+      if (edit) {
+        answer = r!!.answer
+        caption = if (conflict != null && r.caption == null) "Updated · fixed for something ${roster.nameOf(conflict.factAgent)} knew"
+          else Combine.caption(names.ifEmpty { who.map(roster::nameOf) }, r.caption)
+        versions = versions + AnswerVersion(versions.size + 1, r.answer, caption, now, kind, who)
+      }
+      if (r != null && (edit || kind == FoldKind.NONE)) {
+        // The model's dissent line, kept only when the comparison holds a real disagreement with that agent on a side.
+        val dId = r.dissentAgent?.let { roster.resolve(it) }?.id?.takeIf { it != main }
+        dissent = if (dId != null && r.dissent != null) DissentNote(dId, Cards.oneLine(r.dissent)).takeIf { Cards.real(it, table.disputes, main) } ?: dissent
+          else if (edit) null else dissent
+        if (r.actions.isNotEmpty() || edit) actions = r.actions
       }
       if (review || arrivals.any { it.background }) {
         reviews = reviews + arrivals.filter { it.purpose == AskPurpose.BLIND }.map { a ->
-          Review(a.agentId, a.id, if (a in agreeOnly) FoldKind.NONE else kind, now, asTurn = ce.frozen && (kind == FoldKind.FIX || kind == FoldKind.CHANGE))
+          Review(a.agentId, a.id, if (a in agreeOnly) FoldKind.NONE else kind, now)
         }
       }
       val next = ce.copy(
         versions = versions, caption = caption, folded = (ce.folded + arrivals.map { it.id }).distinct(),
         agreedOnly = (ce.agreedOnly + agreeOnly.map { it.agentId }).distinct(), table = table, reviews = reviews, calls = ce.calls + calls,
+        dissent = dissent, actions = actions,
       )
       var st = cur.copy(answer = answer, followUps = followUps, agreement = map, editor = next,
         fallback = cur.fallback || (usedFallback && answer != null && versions.lastOrNull()?.text == answer))
@@ -1580,7 +1585,9 @@ class Juno(
       val now = clock()
       var st = cur.copy(phase = Phase.DONE, answeredAt = cur.answeredAt ?: now,
         answer = cur.answer ?: Combine.fallback(ce.table ?: ClaimsTable(), roster::nameOf, roster.main.id, null).ifBlank { "I couldn't get answers in time. Want me to ask again?" },
-        editor = ce.copy(settledAt = ce.settledAt ?: now, yourCall = ce.yourCall ?: call, calls = ce.calls + if (d != null && ce.yourCall == null) 1 else 0))
+        editor = ce.copy(settledAt = ce.settledAt ?: now, yourCall = ce.yourCall ?: call, calls = ce.calls + if (d != null && ce.yourCall == null) 1 else 0,
+          // A Your call needs its way in: the disagreement line. Without one from the model, the smaller side's agent.
+          dissent = ce.dissent ?: if ((ce.yourCall ?: call) != null) Cards.fallbackDissent(ce.table?.disputes.orEmpty(), roster.main.id) else null))
       st = withSurplusL(st)
       val sum = if (st.editor!!.summaryLogged) null else RunSummary.of(st, roster.main.id)
       if (sum != null) st = st.copy(editor = st.editor!!.copy(summaryLogged = true))

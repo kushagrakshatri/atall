@@ -110,7 +110,9 @@ class CollabBridgeTest {
         // Seconds in: Juno's first take, labelled, and one avatar row. Paused kDot is nowhere.
         val first = r.lines().single { it.id == "answer:$runId" }
         assertEquals("**Sakoon at 7:30.** Quiet and bookable.", first.text)
-        assertEquals("First take · others adding", first.detail)
+        // No caption ("First take · others adding"): the card shows it is still thinking (muted text, tiles working).
+        assertNull(first.detail)
+        assertTrue(app.atall.ui.parseCard(first.card)!!.thinking)
         assertEquals(listOf("Nova", "Scout"), r.presence(runId).agents.map { it.name })
         // Every ask ends with the tail; kDot (paused) got nothing.
         assertTrue(r.sent(r.nova).single().endsWith(app.atall.coordinator.AskTail.text("Kush")))
@@ -124,8 +126,15 @@ class CollabBridgeTest {
         assertTrue(l.none { it.text.contains("Angle:") || it.text.contains("From memory") })
         val answer = l.single { it.id == "answer:$runId" }
         assertEquals(first.at, answer.at) // edited in place
-        assertEquals("Changed: **Rooh at 7.** Only Nova knew you're vegetarian this month.", answer.text)
-        assertEquals("Updated · Nova knew you're vegetarian", answer.detail)
+        // No system words ("Changed:", "Only Nova knew") and no "Updated · …" caption.
+        assertEquals("**Rooh at 7.** You're vegetarian this month.", answer.text)
+        assertNull(answer.detail)
+        val card = app.atall.ui.parseCard(answer.card)!!
+        assertFalse(card.thinking)
+        assertEquals(answer.text, card.plain)
+        // A real split: one disagreement line, which opens Your call.
+        assertNotNull(card.dissent)
+        assertEquals("Quiet dinner or a lively one?", card.sheet!!.title)
         // The split became Your call, not a talk.
         assertEquals("Quiet dinner or a lively one?", answer.call)
         assertEquals(listOf("Quiet", "Lively"), answer.choices)
@@ -186,21 +195,23 @@ class CollabBridgeTest {
             FakeLlm.text("""{"answer":"**Thanksgiving week works.** I'd keep it to four days.","ask":["Nova"]}""")
         }
         r.llm.on("claims") { req, _ -> FakeLlm.text(claims(req)) }
-        r.llm.on("fold") { _, _ -> FakeLlm.text("""{"kind":"add","answer":"**Nov 26-29, flying out of SJC.** Only Nova knew your airport.","caption":"Nova knew your airport"}""") }
+        r.llm.on("fold") { _, _ -> FakeLlm.text("""{"kind":"add","answer":"**Nov 26-29, flying out of SJC.** {Nova}","caption":"Nova knew your airport"}""") }
         r.router.send("plan Thanksgiving")
         settle(1_000)
         val runId = r.lines().first().runId!!
         // Seconds in: Juno's take, labelled, with one avatar: the agent it picked. Scout wasn't asked.
         assertEquals("**Thanksgiving week works.** I'd keep it to four days.", r.lines().single { it.id == "answer:$runId" }.text)
-        assertEquals("First take · others adding", r.lines().single { it.id == "answer:$runId" }.detail)
+        assertNull(r.lines().single { it.id == "answer:$runId" }.detail)
         assertTrue(r.sent(r.scout).isEmpty())
         settle()
         val l = r.lines()
         assertTrue(l.none { it.kind == MessageKind.SUBTASK || it.kind == MessageKind.RUN || it.author == r.nova.id })
         assertTrue(l.none { it.text.contains("Angle:") || it.text.contains("From memory") })
         val answer = l.single { it.id == "answer:$runId" }
-        assertEquals("**Nov 26-29, flying out of SJC.** Only Nova knew your airport.", answer.text)
-        assertEquals("Updated · Nova knew your airport", answer.detail)
+        // The credit marker is a tile on the line, never text.
+        assertEquals("**Nov 26-29, flying out of SJC.**", answer.text)
+        assertNull(answer.detail)
+        assertEquals(listOf(listOf(r.nova.id)), app.atall.ui.parseCard(answer.card)!!.lines.map { it.credits })
         assertEquals("Nov 26-29 works.", r.presence(runId).agents.single().text)
         // Nova got Kush's words with the tail, alone.
         val toNova = r.sent(r.nova).single()

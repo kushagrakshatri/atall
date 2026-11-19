@@ -136,7 +136,13 @@ fun ThreadScreen(state: ThreadUi, actions: ThreadActions, zone: ZoneId = ZoneId.
     val peersById = remember(state.peers) { state.peers.associateBy { it.id } }
     val names = remember(state.peers) { Mentions.nameMap(state.peers.map { app.atall.core.AgentProfile(it.id, it.name) }) }
     val today = LocalDate.now(zone)
-    val list = remember(state.messages, today) { rows(state.messages, zone, today) }
+    // Answers drawn as a card carry their run's avatar row inside them; that row isn't a line of its own.
+    val cardRuns = remember(state.messages) { state.messages.filter { it.card != null && it.runId != null }.mapNotNull { it.runId }.toSet() }
+    val presenceByRun = remember(state.messages) {
+        state.messages.filter { it.kind == MessageKind.PRESENCE && it.runId != null }.mapNotNull { m -> parsePresence(m.detail)?.let { m.runId!! to it } }.toMap()
+    }
+    val shown = remember(state.messages, cardRuns) { state.messages.filterNot { it.kind == MessageKind.PRESENCE && it.runId in cardRuns } }
+    val list = remember(shown, today) { rows(shown, zone, today) }
     val railRuns = remember(state.messages) { state.messages.filter { it.kind == MessageKind.RUN }.mapNotNull { it.runId }.toSet() }
     // Who answered each run (for "One of them was better"): from its avatar row.
     val answeredBy = remember(state.messages) {
@@ -168,7 +174,7 @@ fun ThreadScreen(state: ThreadUi, actions: ThreadActions, zone: ZoneId = ZoneId.
                 items(list, key = { it.key }) { row ->
                     when (row) {
                         is Row.Day -> DayDivider(row.label)
-                        is Row.Msg -> MessageRow(row, peersById, names, actions, railRuns, talkActions, answeredBy)
+                        is Row.Msg -> MessageRow(row, peersById, names, actions, railRuns, talkActions, answeredBy, presenceByRun)
                     }
                 }
             }
@@ -250,7 +256,7 @@ private fun DayDivider(label: String) {
 
 @Composable
 private fun MessageRow(row: Row.Msg, peers: Map<String, PeerUi>, names: Map<String, String>, actions: ThreadActions, railRuns: Set<String>, talk: TalkActions,
-                       answeredBy: Map<String, List<Pair<String, String>>> = emptyMap()) {
+                       answeredBy: Map<String, List<Pair<String, String>>> = emptyMap(), presenceByRun: Map<String, app.atall.coordinator.PresenceView> = emptyMap()) {
     val m = row.m
     val top = if (row.header) AppTheme.spacing.turnGap / 2 else AppTheme.spacing.groupGap
     // Lines of a Juno turn (strip, sub-tasks, agent replies, answer) sit on one rail under it.
@@ -266,6 +272,16 @@ private fun MessageRow(row: Row.Msg, peers: Map<String, PeerUi>, names: Map<Stri
             m.kind == MessageKind.AGREEMENT -> AgreementCard(m, peers, actions.onTalkOver)
             m.kind == MessageKind.TALK -> TalkCard(m, peers, talk)
             m.kind == MessageKind.PRESENCE -> Box(Modifier.padding(start = 34.dp)) { PresenceRow(m, peers, actions.onTalkOver) }
+            m.author == Main.AUTHOR && m.id.startsWith("answer:") && m.runId != null && m.card != null && parseCard(m.card) != null -> {
+                val card = remember(m.card) { parseCard(m.card)!! }
+                val agents = remember(peers, presenceByRun[m.runId]) { CardAgents(peers, presenceByRun[m.runId]) }
+                AnswerGestures(m, answeredBy[m.runId].orEmpty(), peers, actions.onHeart, actions.onOneBetter) {
+                    AgentTurn(null, m, row.header || child, showText = false) {
+                        AnswerCardView(card, agents, onChoice = { actions.onChoice(m.runId!!, it) })
+                        if (m.reactions.isNotEmpty()) ReactionChips(m.reactions, peers)
+                    }
+                }
+            }
             m.author == Main.AUTHOR && m.id.startsWith("answer:") && m.runId != null ->
                 AnswerGestures(m, answeredBy[m.runId].orEmpty(), peers, actions.onHeart, actions.onOneBetter) {
                     AgentTurn(null, m, row.header || child) {
@@ -324,7 +340,7 @@ private fun mentionText(text: String, names: Map<String, String>, peers: Map<Str
 }
 
 @Composable
-private fun AgentTurn(peer: PeerUi?, m: ThreadMessage, header: Boolean, extra: @Composable () -> Unit = {}) {
+private fun AgentTurn(peer: PeerUi?, m: ThreadMessage, header: Boolean, showText: Boolean = true, extra: @Composable () -> Unit = {}) {
     val c = AppTheme.colors
     Row(Modifier.fillMaxWidth().padding(end = 16.dp)) {
         Box(Modifier.width(28.dp)) {
@@ -342,7 +358,8 @@ private fun AgentTurn(peer: PeerUi?, m: ThreadMessage, header: Boolean, extra: @
                 }
                 Spacer(Modifier.height(2.dp))
             }
-            if (m.text.isNotBlank()) {
+            if (!showText) Unit
+            else if (m.text.isNotBlank()) {
                 val text = remember(m.text) { markdownText(m.text, c.sunken) }
                 Text(text, style = AppTheme.type.body, color = c.ink)
             }

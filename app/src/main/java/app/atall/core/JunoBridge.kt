@@ -684,9 +684,13 @@ class JunoBridge(
             val prev = thread.get(id)
             if (editor && room == null) {
                 // The living answer: edited in place (same spot), one caption saying what changed, Your call under it.
+                // The card carries the lines and their credit tiles; the plain text never shows a credit marker, and
+                // there is no caption ("First take", "Updated · …"): the card shows thinking and late changes itself.
                 val call = view.yourCall
-                put(ThreadMessage(id, prev?.at ?: (base + 2), Main.AUTHOR, st.answer!!, detail = view.caption,
-                    choices = call?.choices.orEmpty(), yourCall = call != null, call = call?.text, reactions = prev?.reactions.orEmpty()))
+                val card = view.card
+                put(ThreadMessage(id, prev?.at ?: (base + 2), Main.AUTHOR, card?.plain ?: app.atall.coordinator.Credits.plain(st.answer!!),
+                    choices = call?.choices.orEmpty(), yourCall = call != null, call = call?.text, reactions = prev?.reactions.orEmpty(),
+                    card = card?.let { Json.encodeToString(app.atall.coordinator.AnswerCard.serializer(), it) }))
             } else {
                 // A new answer (a talk's wrap-up replacing the merge, a re-merge) moves below what came before it.
                 val keepAt = prev != null && prev.text == st.answer

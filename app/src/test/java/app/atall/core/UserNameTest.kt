@@ -12,9 +12,14 @@ import org.junit.Test
 class UserNameTest {
     @Test fun settingWinsElseChatGptFirstName() {
         assertEquals("Kush", UserName.effective("  Kush ", "Kushagra"))
-        assertEquals("Kushagra", UserName.effective("", UserName.firstName("Kushagra Kshatri")))
+        // Kush goes by "Kush", never "Kushagra": the ChatGPT first name and an old prefill both become Kush.
+        assertEquals("Kush", UserName.effective("", UserName.firstName("Kushagra Kshatri")))
+        assertEquals("Kush", UserName.effective("Kushagra", "Kushagra"))
         assertEquals("", UserName.effective(" ", ""))
-        assertEquals("Kushagra", UserName.fieldValue("", "Kushagra")) // the Settings field is prefilled
+        assertEquals("Kush", UserName.fieldValue("", "Kushagra")) // the Settings field is prefilled
+        // Still editable: any other name typed in Settings > Agents wins.
+        assertEquals("KK", UserName.effective("KK", "Kushagra"))
+        assertEquals("Priya", UserName.effective("", "Priya"))
         assertEquals("Ana Maria", UserName.normalize("  Ana   Maria "))
         assertEquals(UserName.MAX_CHARS, UserName.normalize("x".repeat(100)).length)
     }

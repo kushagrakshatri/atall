@@ -59,7 +59,7 @@ class ReplayTest {
     val report = Replay(llm, names = mapOf("grok" to "Grok", "hark" to "Hark")).run(corpus())
     assertEquals(mapOf("r2" to "fewer than two recorded agent answers", "r3" to "not an @all run"), report.skipped)
     val c = report.cases.single()
-    assertEquals("**Saturday.** Only Hark knew you're busy Sunday afternoon.", c.replayedAnswer)
+    assertEquals("**Saturday.** You're busy Sunday afternoon.", c.replayedAnswer)
     assertEquals("recorded merge", c.recordedAnswer)
     assertTrue(c.conflict && c.yourCall)
     assertEquals("hark", c.bestSingleAgent)

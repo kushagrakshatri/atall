@@ -108,6 +108,11 @@ data class ThreadMessage(
     val call: String? = null,
     /** [Attribution.RELAY] lines: the name of the agent whose question this answers ("answered Grok"). */
     val relayFrom: String? = null,
+    /**
+     * Juno's answer in an editor run that asked agents: the answer card as JSON (lines with their credit tiles, the
+     * disagreement line and its Your call sheet, actions, a late change to highlight). [text] is its plain text.
+     */
+    val card: String? = null,
 ) {
     /** The attribution to render; lines from before 0.1.1 only have [direct]. */
     val shownAttribution: Attribution?

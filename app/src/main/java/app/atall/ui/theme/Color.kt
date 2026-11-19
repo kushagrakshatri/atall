@@ -65,6 +65,8 @@ data class AppColors(
     val warning: Color,
     val danger: Color,
     val isDark: Boolean,
+    /** A soft wash behind words that just changed in an answer (the late-update highlight). */
+    val highlight: Color = Color(0xFFF6E6BF),
 )
 
 val LightAppColors = AppColors(
@@ -107,6 +109,7 @@ val DarkAppColors = AppColors(
     warning = Palette.WarnDark,
     danger = Palette.DangerDark,
     isDark = true,
+    highlight = Color(0x40F0BE45),
 )
 
 // -----------------------------------------------------------------------------

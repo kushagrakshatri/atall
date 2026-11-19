@@ -29,8 +29,10 @@ data class RunView(
   val caption: String? = null,
   /** Editor: a real split as one deciding question or an if/then rule, with its choices. */
   val yourCall: YourCall? = null,
-  /** Editor: Kush acted on the answer; it isn't edited any more. */
+  /** Editor: Kush acted on the answer (only a late fix or change still edits it, in place). */
   val frozen: Boolean = false,
+  /** Editor: the answer card (lines with credits, the disagreement line, Your call, actions, the late-change highlight). */
+  val card: AnswerCard? = null,
 )
 
 // ------------------------------------------------------------------ the avatar row (fast-coord ux.md §7)
@@ -202,8 +204,10 @@ object Views {
       }
     }
     val map = s.agreement ?: if (s.mode == RunMode.ALL) collecting(s, roster) else null
+    val presence = presence(s, roster, now)
     return RunView(s.runId, s.mode, s.phase, strip, s.answer, folded, needs, s.followUps, map, s.error, s.errorKind, talk(s, roster, now, config),
-      presence = presence(s, roster, now), caption = s.editor?.caption, yourCall = s.editor?.yourCall, frozen = s.editor?.frozen == true)
+      presence = presence, caption = s.editor?.caption, yourCall = s.editor?.yourCall, frozen = s.editor?.frozen == true,
+      card = if (s.room == null && s.mode != RunMode.ROOM) Cards.build(s, roster, presence) else null)
   }
 
   /**
