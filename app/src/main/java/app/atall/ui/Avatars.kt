@@ -20,6 +20,7 @@ import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.ColorMatrix
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -47,18 +48,22 @@ enum class TileState { NORMAL, WORKING, WAITING, NEEDS_YOU }
 private val Greyscale = ColorFilter.colorMatrix(ColorMatrix().apply { setToSaturation(0f) })
 
 private fun logoRes(logo: AgentLogo): Int? = when (logo) {
-    AgentLogo.GROK -> R.drawable.logo_grok
+    AgentLogo.CHATGPT -> R.drawable.app_chatgpt
+    AgentLogo.GROK_BOT -> R.drawable.app_grok_bot
+    AgentLogo.MUSE -> R.drawable.app_muse
+    AgentLogo.CLAUDE_DUET -> R.drawable.app_claude_duet
     AgentLogo.HARK -> R.drawable.logo_hark
-    AgentLogo.META -> R.drawable.logo_meta
-    AgentLogo.CLAUDE -> R.drawable.logo_claude
-    AgentLogo.OPENAI -> R.drawable.logo_openai
     AgentLogo.NONE -> null
 }
 
+/** App icons whose own background is white or near the page colour: they get a hairline in light mode. */
+private fun lightIcon(logo: AgentLogo) = logo == AgentLogo.CHATGPT || logo == AgentLogo.MUSE || logo == AgentLogo.CLAUDE_DUET
+
 /**
- * An agent's real mark on a neutral tile: surface fill, a 1 px hairline, 30% corners. One-colour marks (Grok, Hark,
- * Claude, OpenAI) follow the ink, so they flip in dark mode; Meta AI (Muse) keeps its colours. An agent with no known
- * mark gets a small shape in its hue. Never a letter.
+ * An agent's real app icon as a full-bleed tile: the bitmap fills the rounded tile (30% corners, clipped), never tinted;
+ * a 1 px hairline only in light mode and only for icons whose own background is white or cream. The Hark mark (vector)
+ * sits on a surface tile with a hairline and follows the ink. An agent with no known app gets a small spark in its hue.
+ * Never a letter. Working: an accent ring around the tile. Waiting: faded and greyscale.
  */
 @Composable
 fun AgentTile(logo: AgentLogo, hue: AgentHue, size: Dp, modifier: Modifier = Modifier, state: TileState = TileState.NORMAL) {
@@ -66,27 +71,36 @@ fun AgentTile(logo: AgentLogo, hue: AgentHue, size: Dp, modifier: Modifier = Mod
     val shape = RoundedCornerShape(percent = 30)
     val ring = when (state) { TileState.WORKING -> c.iris; TileState.NEEDS_YOU -> c.warning; else -> null }
     val outer = if (ring != null) Modifier.background(ring.copy(alpha = 0.16f), RoundedCornerShape(percent = 34)).padding((size.value * 0.14f).coerceAtLeast(2f).dp) else Modifier
+    val waiting = state == TileState.WAITING
+    val res = logoRes(logo)
     Box(modifier.then(outer), contentAlignment = Alignment.Center) {
-        Box(
+        if (res != null && logo.bitmap) {
+            // Full bleed: the icon is the tile. The ring (working) or a light-mode hairline (white icons) sits on top.
+            val edge = ring ?: c.hairlineStrong.takeIf { !c.isDark && lightIcon(logo) }
+            Box(Modifier.size(size).alpha(if (waiting) 0.45f else 1f), contentAlignment = Alignment.Center) {
+                Image(
+                    painterResource(res), contentDescription = null, Modifier.size(size).clip(shape),
+                    contentScale = ContentScale.Crop, colorFilter = if (waiting) Greyscale else null,
+                )
+                if (edge != null) Box(Modifier.size(size).border(if (ring != null) 1.25.dp else 1.dp, edge, shape))
+            }
+        } else Box(
             Modifier.size(size).clip(shape).background(c.surface)
                 .border(if (ring != null) 1.25.dp else 1.dp, ring ?: c.hairlineStrong, shape)
-                .alpha(if (state == TileState.WAITING) 0.5f else 1f),
+                .alpha(if (waiting) 0.5f else 1f),
             contentAlignment = Alignment.Center,
         ) {
-            val res = logoRes(logo)
-            val markSize = size * (if (logo == AgentLogo.HARK) 0.66f else 0.64f)
+            val markSize = size * 0.66f
             if (res != null) {
                 val tint = when {
-                    state == TileState.WAITING && logo.tinted -> ColorFilter.tint(c.ink3)
-                    state == TileState.WAITING -> Greyscale
-                    state == TileState.WORKING && logo.tinted -> ColorFilter.tint(c.iris)
-                    logo.tinted -> ColorFilter.tint(c.ink)
-                    else -> null
+                    waiting -> ColorFilter.tint(c.ink3)
+                    state == TileState.WORKING -> ColorFilter.tint(c.iris)
+                    else -> ColorFilter.tint(c.ink)
                 }
                 Image(painterResource(res), contentDescription = null, Modifier.size(markSize), colorFilter = tint)
             } else {
-                val color = if (state == TileState.WAITING) c.ink3 else AppTheme.agent(hue).solid
-                Canvas(Modifier.size(markSize)) {
+                val color = if (waiting) c.ink3 else AppTheme.agent(hue).solid
+                Canvas(Modifier.size(size * 0.64f)) {
                     // A four-point spark: neutral, never a letter.
                     val w = this.size.minDimension; val h = w / 2f
                     val p = Path().apply {
@@ -99,10 +113,10 @@ fun AgentTile(logo: AgentLogo, hue: AgentHue, size: Dp, modifier: Modifier = Mod
     }
 }
 
-/** A peer agent's avatar everywhere in the app: its real mark on a tile ([AgentTile]). */
+/** A peer agent's avatar everywhere in the app: its app icon ([AgentTile]), picked from its app identity, not its name. */
 @Composable
-fun PeerAvatar(name: String, hue: AgentHue, size: Dp, modifier: Modifier = Modifier, dimmed: Boolean = false, relayId: String? = null) =
-    AgentTile(AgentLogo.of(name, relayId), hue, size, modifier, if (dimmed) TileState.WAITING else TileState.NORMAL)
+fun PeerAvatar(logo: AgentLogo, hue: AgentHue, size: Dp, modifier: Modifier = Modifier, dimmed: Boolean = false) =
+    AgentTile(logo, hue, size, modifier, if (dimmed) TileState.WAITING else TileState.NORMAL)
 
 @Composable
 fun AddAvatar(size: Dp, modifier: Modifier = Modifier) {

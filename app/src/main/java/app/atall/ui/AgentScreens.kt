@@ -153,7 +153,7 @@ fun AgentsScreen(
                 peers.forEach { p ->
                     HorizontalDivider(color = c.hairline)
                     Row(Modifier.fillMaxWidth().clickable { onOpen(p.id) }.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
-                        PeerAvatar(p.name, p.hue, 36.dp, dimmed = p.paused || !p.channel.implemented)
+                        PeerAvatar(p.logo, p.hue, 36.dp, dimmed = p.paused || !p.channel.implemented)
                         Spacer(Modifier.width(12.dp))
                         Column(Modifier.weight(1f)) {
                             Text(p.name, style = AppTheme.type.headline, color = c.ink)
@@ -296,7 +296,7 @@ fun AgentDetailScreen(
     Column(Modifier.fillMaxSize().background(c.bg).statusBarsPadding().navigationBarsPadding().imePadding()) {
         TopBar("", onBack)
         Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(horizontal = 16.dp)) {
-            PeerAvatar(form.name.ifBlank { peer.name }, hueOf(form.hue), 72.dp)
+            PeerAvatar(peer.logo, hueOf(form.hue), 72.dp)
             Spacer(Modifier.height(12.dp))
             Text(peer.name, style = AppTheme.type.title, color = c.ink)
             Text("${peer.status} · ${Copy.descriptor(peer.channel)}", style = AppTheme.type.body2, color = c.ink2)

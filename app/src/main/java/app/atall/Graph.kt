@@ -223,7 +223,7 @@ class Graph(private val context: Context) {
             "message text ${if (prefs.sendMessageText) "included" else "left out"}")
 
     fun peerUi(): List<PeerUi> = _agents.value.map { p ->
-        PeerUi(p.id, p.name, hueOf(p.hue), p.channel, p.address, p.paused, statusOf(p))
+        PeerUi(p.id, p.name, hueOf(p.hue), p.channel, p.address, p.paused, statusOf(p), app.atall.core.AgentIcon.of(p, relay.access.linkedRelayId(p)))
     }
 
     /** Listening · Can reply now · Needs a tap · Paused · Not available yet. */

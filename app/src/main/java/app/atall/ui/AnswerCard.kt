@@ -73,7 +73,7 @@ fun parseCard(json: String?): AnswerCard? = json?.let { runCatching { CardJson.d
 internal data class CardAgents(val peers: Map<String, PeerUi>, val presence: PresenceView?) {
     fun name(id: String): String = peers[id]?.name ?: presence?.agents?.firstOrNull { it.agentId == id }?.name ?: "Agent"
     fun hue(id: String): AgentHue = peers[id]?.hue ?: AgentHue.Slate
-    fun logo(id: String): AgentLogo = AgentLogo.of(name(id), id)
+    fun logo(id: String): AgentLogo = peers[id]?.logo ?: AgentLogo.NONE
 }
 
 /** The tiles at the end of a line: a little smaller than the text's cap height plus padding, so they sit in the line. */
@@ -319,6 +319,3 @@ private fun AgentTakeSheet(agents: CardAgents, id: String, a: PresenceAgent?, fa
     }
 }
 
-/** A tile of [size] in a row, for previews and the agent list. */
-@Composable
-internal fun AgentLogoTile(name: String, hue: AgentHue, size: Dp) = AgentTile(AgentLogo.of(name), hue, size)

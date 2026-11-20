@@ -1,6 +1,7 @@
 package app.atall.ui
 
 import app.atall.api.ChannelType
+import app.atall.core.AgentLogo
 import app.atall.core.Main
 import app.atall.ui.theme.AgentHue
 
@@ -13,6 +14,8 @@ data class PeerUi(
     val address: String,
     val paused: Boolean = false,
     val status: String = "Listening",
+    /** Its app icon, from its app identity ([app.atall.core.AgentIcon]), never from [name]. */
+    val logo: AgentLogo = AgentLogo.NONE,
 )
 
 object Copy {

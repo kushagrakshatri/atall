@@ -5,47 +5,44 @@ import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 
-/** Which real mark an agent wears. Never a letter: an agent with no known mark gets a neutral one. */
-enum class AgentLogo {
-    /** xAI's Grok mark, tinted ink. */
-    GROK,
-    /** The Hark mark, tinted ink. */
-    HARK,
-    /** The Meta AI colour ring (Muse), in its own colours. */
-    META,
-    /** Claude's mark (Duet), tinted ink. */
-    CLAUDE,
-    /** OpenAI's mark (kDot / ChatGPT), tinted ink. */
-    OPENAI,
-    /** No known mark: a neutral shape in the agent's hue. */
-    NONE;
+/**
+ * Which app icon an agent wears. Each of Kush's agents is its own product with its own app icon (Grok Bot, Muse from
+ * Meta, Claude Duet), not its parent brand's mark; kDot lives inside ChatGPT, so it wears ChatGPT's icon. Picked from
+ * the agent's app identity (its relay id, or its Play package), never from its display name, so a renamed agent keeps
+ * its icon. Never a letter: an agent with no known app gets a neutral spark.
+ */
+enum class AgentLogo(
+    /** The Play package of the app this agent is (null for Hark, which has no app icon of its own here). */
+    val pkg: String?,
+    /** Its id on the Atall relay. */
+    val relayId: String?,
+) {
+    /** kDot: ChatGPT's app icon (it lives inside ChatGPT). */
+    CHATGPT("com.openai.chatgpt", "kdot"),
+    /** Grok Bot's app icon (a white 3D face on black). */
+    GROK_BOT("ai.x.grok.bot", "grok"),
+    /** Muse from Meta's app icon (a blue brush M on white). */
+    MUSE("com.facebook.aura", "muse"),
+    /** Claude Duet's app icon (a terracotta blob with loops on cream). */
+    CLAUDE_DUET("com.anthropic.aibo", "duet"),
+    /** The Hark mark (vector, tinted ink). */
+    HARK(null, "hark"),
+    /** No known app: a neutral spark in the agent's hue. */
+    NONE(null, null);
 
-    /** Marks drawn in one colour, which follow the ink (and flip in dark mode). */
-    val tinted: Boolean get() = this != META && this != NONE
+    /** A full-bleed app-icon bitmap (never tinted). */
+    val bitmap: Boolean get() = pkg != null
+    /** A one-colour vector mark that follows the ink. */
+    val tinted: Boolean get() = this == HARK
 
     companion object {
-        /** By relay id first (kdot, grok, hark, duet, muse), then by name or the product it runs on. */
-        fun of(name: String, relayId: String? = null): AgentLogo {
-            relayId?.lowercase(Locale.ROOT)?.let { id -> byKey(id)?.let { return it } }
-            val n = name.trim().lowercase(Locale.ROOT).removePrefix("@")
-            byKey(n)?.let { return it }
-            return when {
-                n.contains("grok") -> GROK
-                n.contains("hark") -> HARK
-                n.contains("muse") || n.contains("meta") -> META
-                n.contains("claude") || n.contains("duet") -> CLAUDE
-                n.contains("chatgpt") || n.contains("openai") || n.contains("kdot") || n == "gpt" -> OPENAI
-                else -> NONE
-            }
-        }
+        /** The relay ids of the agents whose app is known. */
+        val KNOWN_RELAY_IDS: List<String> = entries.mapNotNull { it.relayId }
 
-        private fun byKey(k: String): AgentLogo? = when (k) {
-            "grok", "xai" -> GROK
-            "hark" -> HARK
-            "muse", "meta", "metaai", "meta-ai" -> META
-            "duet", "claude", "anthropic" -> CLAUDE
-            "kdot", "chatgpt", "openai", "gpt" -> OPENAI
-            else -> null
+        /** By app identity: a relay id ("grok") or a Play package ("ai.x.grok.bot"). Anything else is [NONE]. */
+        fun of(identity: String?): AgentLogo {
+            val k = identity?.trim()?.lowercase(Locale.ROOT)?.ifEmpty { null } ?: return NONE
+            return entries.firstOrNull { it != NONE && (it.relayId == k || it.pkg == k) } ?: NONE
         }
     }
 }

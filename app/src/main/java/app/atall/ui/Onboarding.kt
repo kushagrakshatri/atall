@@ -184,7 +184,7 @@ fun AddAgentStep(form: AgentFormState, existing: List<AgentProfile>, onAdd: () -
         Row(verticalAlignment = Alignment.CenterVertically) {
             MainAvatar(40.dp)
             Spacer(Modifier.width(6.dp))
-            if (form.name.isNotBlank()) { PeerAvatar(form.name, hueOf(form.hue), 40.dp); Spacer(Modifier.width(6.dp)) }
+            if (form.name.isNotBlank()) { PeerAvatar(form.logo(existing), hueOf(form.hue), 40.dp); Spacer(Modifier.width(6.dp)) }
             AddAvatar(40.dp)
         }
         Spacer(Modifier.height(24.dp))

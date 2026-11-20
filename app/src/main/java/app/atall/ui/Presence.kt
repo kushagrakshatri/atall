@@ -39,6 +39,7 @@ import androidx.compose.ui.unit.dp
 import app.atall.coordinator.AgreementMap
 import app.atall.coordinator.PresenceState
 import app.atall.coordinator.PresenceView
+import app.atall.core.AgentLogo
 import app.atall.core.Main
 import app.atall.core.ThreadMessage
 import app.atall.ui.theme.AgentHue
@@ -120,7 +121,7 @@ internal fun PresenceAvatar(peer: PeerUi?, name: String, state: PresenceState, s
         if (state == PresenceState.WORKING || state == PresenceState.NEEDS_YOU) {
             Canvas(Modifier.size(size + 6.dp)) { drawCircle(if (state == PresenceState.NEEDS_YOU) c.warning else ring, this.size.minDimension / 2f - 1.dp.toPx(), style = Stroke(1.5.dp.toPx())) }
         }
-        PeerAvatar(name, hue, size, dimmed = state == PresenceState.LATER || state == PresenceState.NO_ANSWER)
+        PeerAvatar(peer?.logo ?: AgentLogo.NONE, hue, size, dimmed = state == PresenceState.LATER || state == PresenceState.NO_ANSWER)
         when (state) {
             PresenceState.IN, PresenceState.AGREED -> Box(
                 Modifier.align(Alignment.BottomEnd).size(11.dp).clip(CircleShape).background(c.bg), contentAlignment = Alignment.Center,
@@ -158,7 +159,7 @@ internal fun AnswerGestures(
                     agents.forEach { (id, name) ->
                         Column(Modifier.clip(AppTheme.radii.card).clickable { picking = false; m.runId?.let { onOneBetter(it, id) } }.padding(4.dp),
                             horizontalAlignment = Alignment.CenterHorizontally) {
-                            PeerAvatar(name, peers[id]?.hue ?: AgentHue.Slate, 28.dp)
+                            PeerAvatar(peers[id]?.logo ?: AgentLogo.NONE, peers[id]?.hue ?: AgentHue.Slate, 28.dp)
                             Text(name, style = AppTheme.type.micro, color = c.ink2)
                         }
                     }

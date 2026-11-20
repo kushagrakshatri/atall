@@ -29,6 +29,7 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import app.atall.RelayUi
 import app.atall.TestTaskUi
+import app.atall.core.AgentLogo
 import app.atall.core.RelayCopy
 import app.atall.relay.RelayAgent
 import app.atall.ui.theme.AppTheme
@@ -74,7 +75,7 @@ internal fun RelaySection(p: RelayParams) {
                 if (i > 0) HorizontalDivider(color = c.hairline)
                 val name = RelayCopy.agentName(a.agentId, a.clientName)
                 Row(Modifier.fillMaxWidth().padding(start = 14.dp, end = 10.dp, top = 12.dp, bottom = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-                    PeerAvatar(name, hueOf(a.agentId.hashCode()), 36.dp)
+                    PeerAvatar(AgentLogo.of(a.agentId), hueOf(a.agentId.hashCode()), 36.dp)
                     Spacer(Modifier.width(12.dp))
                     Column(Modifier.weight(1f)) {
                         Text(name, style = AppTheme.type.headline, color = c.ink)

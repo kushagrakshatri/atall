@@ -344,7 +344,7 @@ private fun AgentTurn(peer: PeerUi?, m: ThreadMessage, header: Boolean, showText
     val c = AppTheme.colors
     Row(Modifier.fillMaxWidth().padding(end = 16.dp)) {
         Box(Modifier.width(28.dp)) {
-            if (header) { if (peer == null) MainAvatar(28.dp) else PeerAvatar(peer.name, peer.hue, 28.dp) }
+            if (header) { if (peer == null) MainAvatar(28.dp) else PeerAvatar(peer.logo, peer.hue, 28.dp) }
         }
         Spacer(Modifier.width(AppTheme.spacing.avatarToText))
         Column(Modifier.weight(1f)) {

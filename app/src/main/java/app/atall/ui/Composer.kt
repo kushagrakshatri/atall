@@ -211,7 +211,7 @@ fun MentionPicker(query: String, entries: List<PickerEntry>, onPick: (PickerEntr
                         .background(if (i == 0) c.sunken else c.raised).clickable { onPick(e) }.padding(horizontal = 10.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    if (e.peer == null) MainAvatar(36.dp) else PeerAvatar(e.name, e.peer.hue, 36.dp)
+                    if (e.peer == null) MainAvatar(36.dp) else PeerAvatar(e.peer.logo, e.peer.hue, 36.dp)
                     Spacer(Modifier.width(12.dp))
                     Column {
                         Text(e.name, style = AppTheme.type.headline.copy(fontSize = AppTheme.type.body.fontSize), color = c.ink)

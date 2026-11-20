@@ -33,6 +33,8 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import app.atall.api.ChannelType
+import app.atall.core.AgentIcon
+import app.atall.core.AgentLogo
 import app.atall.core.AgentProfile
 import app.atall.core.AgentValidation
 import app.atall.ui.theme.AgentHue
@@ -50,6 +52,12 @@ class AgentFormState(name: String = "", channel: ChannelType = ChannelType.RCS, 
     fun nameError(existing: List<AgentProfile>) = AgentValidation.nameError(name, existing, editingId)
     fun addressError(existing: List<AgentProfile>) = AgentValidation.addressError(channel, address, existing, editingId)
     fun valid(existing: List<AgentProfile>) = nameError(existing) == null && addressError(existing) == null
+
+    /** The icon this agent will wear: an edited agent keeps its saved identity; a new one is matched like on save. */
+    fun logo(existing: List<AgentProfile>): AgentLogo {
+        val base = existing.firstOrNull { it.id == editingId } ?: AgentProfile(id = "", name = name.trim(), channel = channel, address = address)
+        return AgentIcon.of(base.copy(name = name.trim().ifEmpty { base.name }))
+    }
 }
 
 @Composable
@@ -69,7 +77,7 @@ fun AgentForm(state: AgentFormState, existing: List<AgentProfile>) {
             Modifier.fillMaxWidth().clip(AppTheme.radii.card).background(c.sunken).padding(14.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            PeerAvatar(state.name.ifBlank { "?" }, hueOf(state.hue), 36.dp)
+            PeerAvatar(state.logo(existing), hueOf(state.hue), 36.dp)
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
                 Text(state.name.ifBlank { "Name" }, style = AppTheme.type.headline, color = c.ink)

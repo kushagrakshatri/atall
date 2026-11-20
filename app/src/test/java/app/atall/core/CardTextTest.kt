@@ -48,15 +48,27 @@ class CardTextTest {
         assertEquals("2 * 3 = 6", CardText.plainLine("2 * 3 = 6"))
     }
 
-    @Test fun everyAgentWearsItsRealMarkNeverALetter() {
-        assertEquals(AgentLogo.GROK, AgentLogo.of("Grok"))
-        assertEquals(AgentLogo.HARK, AgentLogo.of("Hark"))
-        assertEquals(AgentLogo.META, AgentLogo.of("Muse"))
-        assertEquals(AgentLogo.CLAUDE, AgentLogo.of("Duet"))
-        assertEquals(AgentLogo.OPENAI, AgentLogo.of("kDot"))
-        // The relay id wins over a renamed agent; unknown agents get the neutral mark.
-        assertEquals(AgentLogo.CLAUDE, AgentLogo.of("Poet", relayId = "duet"))
-        assertEquals(AgentLogo.NONE, AgentLogo.of("Nova"))
-        assertTrue(AgentLogo.GROK.tinted && AgentLogo.HARK.tinted && !AgentLogo.META.tinted)
+    @Test fun eachAgentWearsItsOwnAppIconByIdentity() {
+        // By relay id: the agent's own app, not its parent brand.
+        assertEquals(AgentLogo.GROK_BOT, AgentLogo.of("grok"))
+        assertEquals(AgentLogo.MUSE, AgentLogo.of("muse"))
+        assertEquals(AgentLogo.CLAUDE_DUET, AgentLogo.of("duet"))
+        assertEquals(AgentLogo.CHATGPT, AgentLogo.of("kdot"))
+        assertEquals(AgentLogo.HARK, AgentLogo.of("hark"))
+        // By Play package.
+        assertEquals(AgentLogo.GROK_BOT, AgentLogo.of("ai.x.grok.bot"))
+        assertEquals(AgentLogo.MUSE, AgentLogo.of("com.facebook.aura"))
+        assertEquals(AgentLogo.CLAUDE_DUET, AgentLogo.of("com.anthropic.aibo"))
+        assertEquals(AgentLogo.CHATGPT, AgentLogo.of("com.openai.chatgpt"))
+        assertEquals(AgentLogo.CHATGPT, AgentLogo.of(" KDOT "))
+        // The parent brands' own apps are not these agents; unknown or blank identities get the neutral spark.
+        assertEquals(AgentLogo.NONE, AgentLogo.of("ai.x.grok"))
+        assertEquals(AgentLogo.NONE, AgentLogo.of("com.anthropic.claude"))
+        assertEquals(AgentLogo.NONE, AgentLogo.of("nova"))
+        assertEquals(AgentLogo.NONE, AgentLogo.of(""))
+        assertEquals(AgentLogo.NONE, AgentLogo.of(null))
+        // Bitmaps are never tinted; only the Hark vector follows the ink.
+        assertTrue(AgentLogo.GROK_BOT.bitmap && AgentLogo.MUSE.bitmap && AgentLogo.CLAUDE_DUET.bitmap && AgentLogo.CHATGPT.bitmap)
+        assertTrue(!AgentLogo.HARK.bitmap && AgentLogo.HARK.tinted && !AgentLogo.GROK_BOT.tinted && !AgentLogo.NONE.tinted)
     }
 }
